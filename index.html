@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#121212">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="LE MAÎTRE EN THÉ">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <title>LE MAÎTRE EN THÉ</title>
+  <style>
+    :root{--ink:#080807;--paper:#11100e;--panel:#0d0c0b;--cream:#f1e7d2;--gold:#c6a15a;--gold2:#e4ca8b;--gold3:#80632f;--line:#6d552d;--muted:#b9ab91;--soft:#1a1712;--shadow:0 14px 34px rgba(0,0,0,.42)}
+    *{box-sizing:border-box}
+    html{background:#050505}
+    body{margin:0;background:radial-gradient(circle at 50% 0,#1a1712 0,#080807 38%,#050505 100%);color:var(--cream);font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic",YuGothic,sans-serif;min-height:100vh}
+
+    .hero{min-height:300px;background:#0b0a09 center 44%/cover no-repeat;color:#fff;position:relative;border-bottom:1px solid var(--gold3);overflow:hidden}
+    .hero:before{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,.10),rgba(0,0,0,.18) 42%,rgba(0,0,0,.93) 100%)}
+    .hero:after{content:"";position:absolute;left:18px;right:18px;bottom:12px;height:14px;border-top:1px solid var(--gold);border-bottom:1px solid rgba(198,161,90,.35);opacity:.9}
+    .hero-inner{position:relative;z-index:1;max-width:1180px;margin:auto;padding:150px 22px 34px;display:flex;align-items:flex-end;gap:16px;min-height:300px}
+    .brand-logo{width:70px;height:70px;object-fit:contain;display:none;filter:drop-shadow(0 4px 12px rgba(0,0,0,.45))}
+    .eyebrow{font-family:Georgia,"Times New Roman",serif;font-size:11px;letter-spacing:.28em;color:var(--gold2);text-transform:uppercase}
+    .hero h1{margin:7px 0 0;font:600 34px/1.05 Georgia,"Times New Roman",serif;letter-spacing:.06em;color:#f6e8c4;text-shadow:0 3px 14px rgba(0,0,0,.65)}
+    .subtitle{margin-top:9px;font-size:12px;letter-spacing:.04em;color:#ddd0b8}
+
+    .wrap{max-width:1180px;margin:auto}
+    .filters{background:linear-gradient(180deg,rgba(12,11,9,.985),rgba(8,8,7,.985));padding:18px 18px 20px;position:sticky;top:0;z-index:5;border-bottom:1px solid var(--gold3);box-shadow:0 8px 24px rgba(0,0,0,.34);backdrop-filter:blur(10px)}
+    .toprow{display:grid;grid-template-columns:1fr auto;gap:9px}
+    .search{width:100%;padding:14px 16px;border:1px solid var(--gold);border-radius:9px;background:linear-gradient(180deg,#f7efdd,#e9dcc0);color:#17120b;font-size:14px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.55)}
+    .search::placeholder{color:#76694f}
+    .reset{border:1px solid var(--gold3);color:var(--gold2);background:#15120e;border-radius:9px;padding:0 14px;cursor:pointer}
+    .selects{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}
+    select{width:100%;padding:11px;border:1px solid var(--line);border-radius:8px;background:#14120f;color:var(--cream)}
+
+    .section{margin-top:15px}
+    .section-title{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-family:Georgia,"Times New Roman",serif;font-size:13px;font-weight:700;color:var(--gold2);letter-spacing:.04em}
+    .section-title:after{content:"";height:1px;background:linear-gradient(90deg,var(--gold3),transparent);flex:1}
+    .hint{font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic",sans-serif;font-weight:400;color:#8e826e;font-size:10px}
+    .chips{display:flex;gap:7px;flex-wrap:wrap}
+    .chip{appearance:none;border:1px solid var(--line);background:#11100e;color:#d8cbb4;border-radius:6px;padding:8px 10px;font-size:12px;cursor:pointer;box-shadow:inset 0 0 0 1px rgba(198,161,90,.06)}
+    .chip.on{background:linear-gradient(180deg,#2a2114,#17120d);color:#ffe8ad;border-color:var(--gold)}
+    .chip.detail.on{background:#3b2d16;border-color:var(--gold2);color:#ffe8ad}
+
+    .checks{display:flex;gap:9px;margin-top:14px;flex-wrap:wrap;padding-top:12px;border-top:1px solid #31271a}
+    .checks label{font-size:11px;display:flex;align-items:center;gap:5px;border:1px solid #4f3c20;border-radius:6px;padding:7px 9px;background:#0f0e0c;color:#d6c8ae}
+    .checks input{accent-color:var(--gold)}
+    .meta-row{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-top:12px;color:var(--muted);font-size:11px}
+    .active{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
+
+    .status{max-width:1180px;margin:0 auto;padding:12px 18px 0;color:#8f826e;font-size:11px}
+    .status.error{color:#d58174}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:15px;padding:18px}
+    .card{background:linear-gradient(180deg,#13110e,#0d0c0a);border:1px solid var(--gold3);border-radius:10px;overflow:hidden;box-shadow:var(--shadow);position:relative}
+    .card:before{content:"";position:absolute;inset:6px;border:1px solid rgba(198,161,90,.18);pointer-events:none;border-radius:6px}
+    .visuals{display:grid;grid-template-columns:1fr 1fr;background:#090908;min-height:0;border-bottom:1px solid #3f301a}
+    .visuals.one{grid-template-columns:1fr}
+    .visuals:empty{display:none}
+    .tea-img{width:100%;aspect-ratio:16/10;object-fit:cover;display:block;background:#0b0b0a}
+    .body{padding:16px 16px 18px;position:relative;z-index:1}
+    .ref{display:inline-block;color:#f0d18e;font-family:Georgia,"Times New Roman",serif;font-weight:700;font-size:12px;border:1px solid #745b2c;padding:3px 6px;border-radius:4px;margin-right:5px}
+    .name{font:700 19px/1.25 Georgia,"Times New Roman",serif;color:#f4dfad}
+    .tags{display:flex;gap:5px;flex-wrap:wrap;margin:10px 0}
+    .tag{background:#18140f;border:1px solid #4d3c23;border-radius:5px;padding:4px 7px;font-size:10px;color:#d9cdb5}
+    .tag.detail{background:#2c2213;border-color:#73592d;color:#efd59b}
+    .desc{font-size:12px;line-height:1.75;white-space:pre-line;color:#d2c6b1}
+    .facts{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
+    .fact{font-size:10px;border:1px solid #6b522a;border-radius:4px;padding:4px 6px;color:#e1c98d;background:#15110c}
+    .empty{grid-column:1/-1;padding:58px 20px;text-align:center;color:#8f826e}
+
+    @media(max-width:700px){
+      .hero{
+        height:clamp(230px,31svh,270px);
+        min-height:230px;
+        background-position:center top;
+      }
+
+      .hero:before{
+        background:linear-gradient(180deg,rgba(0,0,0,.06),rgba(0,0,0,.12) 42%,rgba(0,0,0,.9) 100%)
+      }
+
+      .hero:after{
+        left:max(12px,env(safe-area-inset-left));
+        right:max(12px,env(safe-area-inset-right));
+        bottom:9px;
+        height:10px
+      }
+
+      .hero-inner{
+        height:100%;
+        min-height:0;
+        padding:calc(env(safe-area-inset-top) + 14px) max(18px,env(safe-area-inset-right)) 27px max(18px,env(safe-area-inset-left));
+        align-items:flex-end;
+        justify-content:center;
+        text-align:center
+      }
+
+      .hero-inner>div{width:100%}
+      .eyebrow{display:none}
+
+      .hero h1{
+        max-width:100%;
+        margin-inline:auto;
+        font-size:clamp(22px,6.8vw,27px);
+        line-height:1.08;
+        letter-spacing:.035em;
+        text-wrap:balance
+      }
+
+      .subtitle{margin-top:7px;font-size:clamp(10px,2.8vw,11px);letter-spacing:.065em;color:#e7d8b8}
+      .brand-logo{width:58px;height:58px}
+      .filters{position:static;padding:13px 12px 15px}
+      .selects{grid-template-columns:1fr}
+      .grid{padding:12px;grid-template-columns:1fr;gap:12px}
+      .active{display:none}
+      .chip{padding:8px 9px}
+      .card{border-radius:9px}
+      .visuals{grid-template-columns:1fr 1fr}
+    }
+
+    @media(max-width:480px){
+      .hero{
+        height:64vw;
+        min-height:0;
+        max-height:none;
+        background-size:100% auto;
+        background-position:center top
+      }
+    }
+
+    @media(max-width:380px){
+      .hero-inner{padding-bottom:25px}
+      .hero h1{font-size:22px;letter-spacing:.025em}
+      .subtitle{letter-spacing:.04em}
+    }
+
+    @media(max-height:500px) and (orientation:landscape){
+      .hero{height:190px;min-height:190px;background-position:center 34%}
+      .hero-inner{padding-top:calc(env(safe-area-inset-top) + 8px);padding-bottom:23px}
+    }
+  </style>
+</head>
+<body>
+<header id="hero" class="hero">
+  <div class="hero-inner">
+    <img id="logo" class="brand-logo" alt="">
+    <div>
+      <div class="eyebrow">MARIAGE FRÈRES · PARIS 1854</div>
+      <h1 id="title">LE MAÎTRE EN THÉ</h1>
+      <div id="subtitle" class="subtitle"></div>
+    </div>
+  </div>
+</header>
+
+<div class="filters">
+  <div class="wrap">
+    <div class="toprow">
+      <input id="q" class="search" placeholder="T番号・銘柄名・説明文・香味タグから検索">
+      <button id="reset" class="reset" type="button">リセット</button>
+    </div>
+
+    <div class="selects">
+      <select id="tea"><option value="">茶種：すべて</option></select>
+      <select id="origin"><option value="">産地：すべて</option></select>
+      <select id="time"><option value="">時間帯：すべて</option></select>
+    </div>
+
+    <div class="section">
+      <div class="section-title">香り・風味 <span class="hint">複数選択＝AND</span></div>
+      <div id="aromaChips" class="chips"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">香味詳細 <span class="hint">複数選択＝AND</span></div>
+      <div id="detailChips" class="chips"></div>
+    </div>
+
+    <div class="checks">
+      <label><input id="end" type="checkbox" checked>終売を除く</label>
+      <label><input id="milk" type="checkbox">ミルクティー向け</label>
+      <label><input id="smoke" type="checkbox">燻製茶</label>
+      <label><input id="cold" type="checkbox">水出し用</label>
+      <label><input id="iced" type="checkbox">アイスティー向け</label>
+      <label><input id="theine" type="checkbox">テインフリー</label>
+    </div>
+
+    <div class="meta-row">
+      <span id="meta"></span>
+      <span id="active" class="active"></span>
+    </div>
+  </div>
+</div>
+
+<div id="status" class="status">銘柄データを読み込み中…</div>
+<main id="list" class="grid wrap"></main>
+
+<script src="app-config.js"></script>
+<script>
+let R=[], aromaSel=new Set(), detailSel=new Set();
+
+const C=window.MF_APP_CONFIG||{};
+const $=x=>document.getElementById(x);
+const sp=s=>String(s||'').split(/[、,;／|]/).map(x=>x.trim()).filter(Boolean);
+const n=s=>String(s||'').normalize('NFKC').toLowerCase();
+const yes=s=>['はい','yes','true','1','推奨'].includes(n(s));
+const esc=s=>String(s||'').replace(/[&<>"']/g,c=>({
+  '&':'&amp;',
+  '<':'&lt;',
+  '>':'&gt;',
+  '"':'&quot;',
+  "'":'&#39;'
+}[c]));
+const uniq=a=>[...new Set(a.filter(Boolean))].sort((a,b)=>a.localeCompare(b,'ja'));
+
+function fill(id,a){
+  const e=$(id);
+  uniq(a).forEach(x=>e.add(new Option(x,x)));
+}
+
+function hasAll(value,set){
+  const vals=sp(value);
+  return [...set].every(x=>vals.includes(x));
+}
+
+function driveId(url){
+  const s=String(url||'');
+  let m=s.match(/\/d\/([A-Za-z0-9_-]{20,})/);
+  if(m)return m[1];
+  m=s.match(/[?&]id=([A-Za-z0-9_-]{20,})/);
+  if(m)return m[1];
+  if(/^[A-Za-z0-9_-]{20,}$/.test(s))return s;
+  return '';
+}
+
+function imageUrl(value){
+  if(!value)return '';
+  const id=driveId(value);
+  return id
+    ? `https://drive.google.com/thumbnail?id=${encodeURIComponent(id)}&sz=w1200`
+    : value;
+}
+
+function applyBrand(){
+  document.title=C.APP_TITLE||document.title;
+  $('title').textContent=C.APP_TITLE||'LE MAÎTRE EN THÉ';
+  $('subtitle').textContent=C.APP_SUBTITLE||'';
+
+  const hero=imageUrl(C.HERO_IMAGE_URL);
+  if(hero)$('hero').style.backgroundImage=`url("${hero.replace(/"/g,'')}")`;
+
+  const logo=imageUrl(C.LOGO_IMAGE_URL);
+  if(logo){
+    $('logo').src=logo;
+    $('logo').style.display='block';
+  }
+}
+
+function chip(label,on,cls,fn){
+  const b=document.createElement('button');
+  b.type='button';
+  b.className='chip '+(cls||'')+(on?' on':'');
+  b.textContent=label;
+  b.onclick=fn;
+  return b;
+}
+
+function renderAromaChips(){
+  const box=$('aromaChips');
+  box.innerHTML='';
+
+  uniq(R.flatMap(r=>sp(r['香味大分類']))).forEach(x=>
+    box.appendChild(
+      chip(x,aromaSel.has(x),'',()=>{
+        aromaSel.has(x) ? aromaSel.delete(x) : aromaSel.add(x);
+        pruneDetails();
+        renderAromaChips();
+        renderDetailChips();
+        render();
+      })
+    )
+  );
+}
+
+function availableDetails(){
+  let rows=R;
+  if(aromaSel.size)rows=rows.filter(r=>hasAll(r['香味大分類'],aromaSel));
+  return uniq(rows.flatMap(r=>sp(r['香味詳細タグ'])));
+}
+
+function pruneDetails(){
+  const allowed=new Set(availableDetails());
+  [...detailSel].forEach(x=>{
+    if(!allowed.has(x))detailSel.delete(x);
+  });
+}
+
+function renderDetailChips(){
+  const box=$('detailChips');
+  box.innerHTML='';
+  const vals=availableDetails();
+
+  if(!vals.length){
+    const s=document.createElement('span');
+    s.className='hint';
+    s.textContent='該当する詳細タグはありません';
+    box.appendChild(s);
+    return;
+  }
+
+  vals.forEach(x=>
+    box.appendChild(
+      chip(x,detailSel.has(x),'detail',()=>{
+        detailSel.has(x) ? detailSel.delete(x) : detailSel.add(x);
+        renderDetailChips();
+        render();
+      })
+    )
+  );
+}
+
+function matches(r){
+  const q=n($('q').value);
+
+  if(q&&!n(Object.values(r).join(' ')).includes(q))return false;
+  if($('tea').value&&!sp(r['茶種タグ']).includes($('tea').value))return false;
+  if($('origin').value&&!sp(r['産地・国']).includes($('origin').value))return false;
+  if($('time').value&&!sp(r['時間帯タグ']).includes($('time').value))return false;
+  if(aromaSel.size&&!hasAll(r['香味大分類'],aromaSel))return false;
+  if(detailSel.size&&!hasAll(r['香味詳細タグ'],detailSel))return false;
+  if($('end').checked&&['終売','販売終了'].includes(r['現行ステータス']))return false;
+  if($('milk').checked&&!yes(r['ミルクティー推奨']))return false;
+  if($('smoke').checked&&!yes(r['燻製茶']))return false;
+  if($('cold').checked&&!yes(r['水出し用ブレンド']))return false;
+  if($('iced').checked&&!yes(r['アイスティー向け']))return false;
+  if($('theine').checked&&!yes(r['テインフリー']))return false;
+
+  return true;
+}
+
+function activeText(){
+  const a=[];
+
+  if($('tea').value)a.push($('tea').value);
+  if($('origin').value)a.push($('origin').value);
+  if($('time').value)a.push($('time').value);
+  if(aromaSel.size)a.push('香味:'+[...aromaSel].join('+'));
+  if(detailSel.size)a.push('詳細:'+[...detailSel].join('+'));
+  if($('milk').checked)a.push('ミルク');
+  if($('smoke').checked)a.push('燻製');
+  if($('cold').checked)a.push('水出し');
+  if($('iced').checked)a.push('アイスティー');
+  if($('theine').checked)a.push('テインフリー');
+
+  return a.join(' ／ ');
+}
+
+function render(){
+  const a=R.filter(matches);
+
+  $('meta').textContent=a.length+' / '+R.length+' 銘柄';
+  $('active').textContent=activeText();
+
+  if(!a.length){
+    $('list').innerHTML='<div class="empty">条件に一致する銘柄がありません。</div>';
+    return;
+  }
+
+  $('list').innerHTML=a.map(r=>{
+    const tags=[
+      r['茶種タグ'],
+      r['産地・国'],
+      r['香味大分類'],
+      r['時間帯タグ']
+    ].flatMap(sp);
+
+    const details=sp(r['香味詳細タグ']);
+    const facts=[];
+
+    if(yes(r['ミルクティー推奨']))facts.push('ミルク');
+    if(yes(r['燻製茶']))facts.push('燻製');
+    if(yes(r['水出し用ブレンド']))facts.push('水出し');
+    if(yes(r['アイスティー向け']))facts.push('アイスティー');
+    if(yes(r['テインフリー']))facts.push(r['テインフリー種別']||'テインフリー');
+
+    const leaf=imageUrl(r['茶葉画像URL']);
+    const liquor=imageUrl(r['水色画像URL']);
+    const imgs=[leaf,liquor].filter(Boolean);
+
+    const visual=imgs.length
+      ? `<div class="visuals ${imgs.length===1?'one':''}">${
+          imgs.map((u,i)=>
+            `<img class="tea-img" loading="lazy" src="${esc(u)}" alt="${i===0?'茶葉':'水色'}">`
+          ).join('')
+        }</div>`
+      : '';
+
+    return `
+      <article class="card">
+        ${visual}
+        <div class="body">
+          <span class="ref">${esc(r['Tリファレンス番号'])}</span>
+          <span class="name">${esc(r['現在の公式名']||r['銘柄名（黒い本）'])}</span>
+          <div class="tags">
+            ${tags.map(t=>`<span class="tag">${esc(t)}</span>`).join('')}
+            ${details.map(t=>`<span class="tag detail">${esc(t)}</span>`).join('')}
+          </div>
+          <div class="desc">${esc(r['現在の公式説明']||r['黒い本説明'])}</div>
+          ${
+            facts.length
+              ? `<div class="facts">${facts.map(t=>`<span class="fact">${esc(t)}</span>`).join('')}</div>`
+              : ''
+          }
+        </div>
+      </article>
+    `;
+  }).join('');
+}
+
+function reset(){
+  $('q').value='';
+  ['tea','origin','time'].forEach(x=>$(x).value='');
+  ['milk','smoke','cold','iced','theine'].forEach(x=>$(x).checked=false);
+  $('end').checked=true;
+  aromaSel.clear();
+  detailSel.clear();
+  renderAromaChips();
+  renderDetailChips();
+  render();
+}
+
+function initData(payload){
+  if(!payload||payload.ok!==true||!Array.isArray(payload.rows)){
+    throw new Error('Invalid response');
+  }
+
+  R=payload.rows;
+
+  fill('tea',R.flatMap(x=>sp(x['茶種タグ'])));
+  fill('origin',R.flatMap(x=>sp(x['産地・国'])));
+  fill('time',R.flatMap(x=>sp(x['時間帯タグ'])));
+
+  renderAromaChips();
+  renderDetailChips();
+  render();
+
+  $('status').textContent=
+    `最終取得: ${new Date(payload.updatedAt).toLocaleString('ja-JP')} ／ ${R.length}銘柄`;
+}
+
+function loadJsonp(){
+  return new Promise((resolve,reject)=>{
+    const base=String(C.GAS_API_URL||'').trim();
+
+    if(!/^https:\/\//.test(base)||base.includes('PASTE_YOUR')){
+      return reject(new Error('app-config.js に GAS_API_URL を設定してください。'));
+    }
+
+    const cb='__mfTeaCb_'+Date.now();
+    const s=document.createElement('script');
+
+    const timer=setTimeout(()=>{
+      cleanup();
+      reject(new Error('データ取得がタイムアウトしました。'));
+    },20000);
+
+    function cleanup(){
+      clearTimeout(timer);
+      delete window[cb];
+      s.remove();
+    }
+
+    window[cb]=data=>{
+      cleanup();
+      resolve(data);
+    };
+
+    s.onerror=()=>{
+      cleanup();
+      reject(new Error('GAS APIを読み込めませんでした。'));
+    };
+
+    s.src=
+      base+
+      (base.includes('?')?'&':'?')+
+      'action=teaData&callback='+
+      encodeURIComponent(cb)+
+      '&_='+
+      Date.now();
+
+    document.head.appendChild(s);
+  });
+}
+
+['q','tea','origin','time','end','milk','smoke','cold','iced','theine'].forEach(x=>
+  $(x).addEventListener(x==='q'?'input':'change',()=>render())
+);
+
+$('reset').addEventListener('click',reset);
+
+applyBrand();
+
+loadJsonp()
+  .then(initData)
+  .catch(err=>{
+    $('status').textContent=err.message;
+    $('status').classList.add('error');
+    $('list').innerHTML='<div class="empty">設定を確認してください。</div>';
+  });
+
+if('serviceWorker' in navigator){
+  window.addEventListener('load',()=>{
+    navigator.serviceWorker.register('./service-worker.js').catch(()=>{});
+  });
+}
+</script>
+</body>
+</html>
