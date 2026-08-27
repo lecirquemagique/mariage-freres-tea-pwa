@@ -4,7 +4,7 @@ window.MF_APP_CONFIG = {
 
   // 任意。My Driveに置いた装飾画像の共有URLを貼れます。
   // 画像ファイル単体を「リンクを知っている全員：閲覧者」にしてください。
-  HERO_IMAGE_URL: 'https://drive.google.com/file/d/1hNFcctQlfJBEdrHY1sxp6U6cdq6aCu8L/view?usp=sharing',
+  HERO_IMAGE_URL: 'https://drive.google.com/file/d/1-wuwh5VVFYCUtvlb5dwzOGXfrgVk6Ix2/view?usp=sharing',
   LOGO_IMAGE_URL: '',
 
   APP_TITLE: 'LE MAÎTRE EN THÉ',
