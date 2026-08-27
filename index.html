@@ -332,7 +332,7 @@ function matches(r){
   if($('milk').checked&&!yes(r['ミルクティー推奨']))return false;
   if($('smoke').checked&&!yes(r['燻製茶']))return false;
   if($('cold').checked&&!yes(r['水出し用ブレンド']))return false;
-  if($('iced').checked&&!yes(r['アイスティー向け']))return false;
+  if($('iced').checked&&!yes(r['アイスティー推奨']))return false;
   if($('theine').checked&&!yes(r['テインフリー']))return false;
 
   return true;
@@ -380,7 +380,7 @@ function render(){
     if(yes(r['ミルクティー推奨']))facts.push('ミルク');
     if(yes(r['燻製茶']))facts.push('燻製');
     if(yes(r['水出し用ブレンド']))facts.push('水出し');
-    if(yes(r['アイスティー向け']))facts.push('アイスティー');
+    if(yes(r['アイスティー推奨']))facts.push('アイスティー');
     if(yes(r['テインフリー']))facts.push(r['テインフリー種別']||'テインフリー');
 
     const leaf=imageUrl(r['茶葉画像URL']);
