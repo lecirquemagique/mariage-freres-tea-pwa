@@ -1,11 +1,12 @@
 .env
 .env.*
 !.env.example
+config.json
 
 node_modules/
 browser-profile/
+chrome-cdp-profile/
 images/
 logs/
 collector-state.json
 *.local.json
-

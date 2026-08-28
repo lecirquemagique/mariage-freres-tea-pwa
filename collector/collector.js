@@ -24,6 +24,9 @@ function parseArgs(argv) {
     headless: null,
     authSetup: false,
     browserChannel: null,
+    connectCdp: null,
+    useExistingPages: false,
+    reloadExistingPages: true,
     refs: null,
   };
   for (let i = 2; i < argv.length; i += 1) {
@@ -34,6 +37,10 @@ function parseArgs(argv) {
     else if (arg === '--auth-setup') args.authSetup = true;
     else if (arg === '--browser-channel') args.browserChannel = argv[++i];
     else if (arg.startsWith('--browser-channel=')) args.browserChannel = arg.slice('--browser-channel='.length);
+    else if (arg === '--connect-cdp') args.connectCdp = argv[++i];
+    else if (arg.startsWith('--connect-cdp=')) args.connectCdp = arg.slice('--connect-cdp='.length);
+    else if (arg === '--use-existing-pages') args.useExistingPages = true;
+    else if (arg === '--no-reload-existing-pages') args.reloadExistingPages = false;
     else if (arg === '--config') args.config = argv[++i];
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
     else if (arg === '--refs') args.refs = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
@@ -148,6 +155,19 @@ function pickCandidate(candidates, product, imageType) {
     .filter((candidate) => candidate.url && candidate.score > 0)
     .sort((a, b) => b.score - a.score);
   return scored[0] || null;
+}
+
+function pageMatchesProduct(page, product) {
+  const pageUrl = page.url();
+  const reference = String(product.reference || '').toLowerCase();
+  const productUrl = String(product.productUrl || '').toLowerCase();
+  return pageUrl.toLowerCase() === productUrl || pageUrl.toLowerCase().includes(reference);
+}
+
+async function getProductPage(context, product, { useExistingPages = false } = {}) {
+  const existing = context.pages().find((page) => pageMatchesProduct(page, product));
+  if (existing && useExistingPages) return { page: existing, shouldClose: false, reused: true };
+  return { page: await context.newPage(), shouldClose: true, reused: false };
 }
 
 async function createCdpNetworkCapture(page, debug) {
@@ -456,8 +476,18 @@ async function acquireImage({ page, networkBodies, candidate, imageType, product
   return row;
 }
 
-async function processProduct({ context, product, config, paths, debug }) {
-  const page = await context.newPage();
+async function processProduct({
+  context,
+  product,
+  config,
+  paths,
+  debug,
+  useExistingPages = false,
+  reloadExistingPages = true,
+  keepPagesOpen = false,
+}) {
+  const pageInfo = await getProductPage(context, product, { useExistingPages });
+  const page = pageInfo.page;
   const pageUrl = product.productUrl;
   const cdp = await createCdpNetworkCapture(page, debug);
   const startedAt = Date.now();
@@ -465,8 +495,18 @@ async function processProduct({ context, product, config, paths, debug }) {
 
   try {
     if (debug) console.log(`[open] ${product.reference} ${pageUrl}`);
-    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
-    await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
+    if (pageInfo.reused) {
+      if (debug) console.log(`[reuse-page] ${product.reference} ${page.url()}`);
+      await page.bringToFront().catch(() => {});
+      if (reloadExistingPages) {
+        if (debug) console.log(`[reload-existing-page] ${product.reference}`);
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
+      }
+      await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
+    } else {
+      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
+      await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
+    }
     await sleep(config.settleDelayMs || 2500);
 
     const title = await page.title();
@@ -569,7 +609,7 @@ async function processProduct({ context, product, config, paths, debug }) {
     return result;
   } finally {
     await cdp.session.detach().catch(() => {});
-    await page.close().catch(() => {});
+    if (pageInfo.shouldClose && !keepPagesOpen) await page.close().catch(() => {});
   }
 }
 
@@ -617,13 +657,19 @@ async function waitForEnter(message) {
   });
 }
 
-async function runAuthSetup({ context, products, config, debug }) {
-  const page = await context.newPage();
+async function runAuthSetup({ context, products, config, debug, keepPageOpen = false }) {
+  const page = context.pages()[0] || await context.newPage();
   const firstUrl = products[0]?.productUrl || 'https://www.mariagefreres.com/fr/';
+  await page.bringToFront().catch(() => {});
+  await page.evaluate(() => {
+    window.moveTo(80, 80);
+    window.resizeTo(1400, 1000);
+  }).catch(() => {});
   console.log(`Opening ${firstUrl}`);
   await page.goto(firstUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 }).catch((error) => {
     console.log(`Initial navigation warning: ${error.message}`);
   });
+  await page.bringToFront().catch(() => {});
   await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
   console.log('');
   console.log('Complete any Cloudflare/browser verification in the opened Chrome window.');
@@ -639,7 +685,13 @@ async function runAuthSetup({ context, products, config, debug }) {
     console.log(`[auth-setup] url=${url}`);
     console.log(`[auth-setup] cookies=${cookies.length}`);
   }
-  await page.close().catch(() => {});
+  if (!keepPageOpen) await page.close().catch(() => {});
+}
+
+async function connectBrowser(args) {
+  const browser = await chromium.connectOverCDP(args.connectCdp);
+  const context = browser.contexts()[0] || await browser.newContext();
+  return { browser, context };
 }
 
 async function main() {
@@ -673,21 +725,49 @@ async function main() {
 
   const launchOptions = {
     headless,
-    viewport: { width: 1440, height: 1200 },
+    viewport: args.authSetup ? null : { width: 1440, height: 1200 },
     locale: 'fr-FR',
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36',
+    args: [
+      '--new-window',
+      '--start-maximized',
+      '--window-position=80,80',
+      '--window-size=1400,1000',
+      '--no-first-run',
+      '--no-default-browser-check',
+    ],
   };
 
+  let browserChannel = '';
   if (process.env.MF_COLLECTOR_CHROMIUM_PATH) {
     launchOptions.executablePath = process.env.MF_COLLECTOR_CHROMIUM_PATH;
   } else {
-    const browserChannel = args.browserChannel || config.browserChannel || process.env.MF_COLLECTOR_BROWSER_CHANNEL || '';
+    browserChannel = args.browserChannel || config.browserChannel || process.env.MF_COLLECTOR_BROWSER_CHANNEL || '';
     if (browserChannel) launchOptions.channel = browserChannel;
   }
 
-  const context = await chromium.launchPersistentContext(paths.profileDir, launchOptions);
+  if (args.debug || args.authSetup) {
+    console.log(`[mode] ${args.connectCdp ? 'connect-cdp' : 'launch'}`);
+    if (args.connectCdp) console.log(`[cdp] endpoint=${args.connectCdp}`);
+    console.log(`[launch] headless=${args.connectCdp ? '(external browser)' : launchOptions.headless}`);
+    console.log(`[launch] channel=${args.connectCdp ? '(external browser)' : launchOptions.channel || ''}`);
+    console.log(`[launch] executablePath=${args.connectCdp ? '(external browser)' : launchOptions.executablePath || ''}`);
+    console.log(`[launch] profileDir=${paths.profileDir}`);
+  }
+
+  const externalBrowser = args.connectCdp ? await connectBrowser(args) : null;
+  const context = externalBrowser
+    ? externalBrowser.context
+    : await chromium.launchPersistentContext(paths.profileDir, launchOptions);
+
   try {
+    if (externalBrowser && args.authSetup) {
+      console.log('Connected to existing Chrome. Complete verification there, then press Enter here.');
+      await runAuthSetup({ context, products, config, debug: args.debug, keepPageOpen: true });
+      return;
+    }
+
     if (args.authSetup) {
       await runAuthSetup({ context, products, config, debug: args.debug });
       return;
@@ -695,7 +775,16 @@ async function main() {
 
     for (let i = 0; i < products.length; i += 1) {
       const product = products[i];
-      const result = await processProduct({ context, product, config, paths, debug: args.debug });
+      const result = await processProduct({
+        context,
+        product,
+        config,
+        paths,
+        debug: args.debug,
+        useExistingPages: args.useExistingPages || Boolean(args.connectCdp),
+        reloadExistingPages: args.reloadExistingPages,
+        keepPagesOpen: Boolean(args.connectCdp),
+      });
       updateState(state, product, result, Number.isFinite(config.maxRetries) ? config.maxRetries : 3);
       writeJson(paths.stateFile, state);
       console.log(`${product.reference}: ${state.products[product.reference].status}`);
@@ -707,7 +796,7 @@ async function main() {
       }
     }
   } finally {
-    await context.close();
+    if (!externalBrowser) await context.close();
   }
 }
 

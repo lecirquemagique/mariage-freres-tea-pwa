@@ -4,6 +4,7 @@
   "logsDir": "logs",
   "stateFile": "collector-state.json",
   "browserChannel": "chrome",
+  "cdpEndpoint": "http://127.0.0.1:9222",
   "headless": false,
   "maxPerRun": 5,
   "maxRetries": 3,

@@ -28,6 +28,50 @@ Chrome opens with the collector-only persistent profile at `C:\MF-Image-Collecto
 
 Do not point `profileDir` at your everyday Chrome user data directory.
 
+## Manual Chrome With CDP
+
+If Playwright-launched Chrome keeps repeating Cloudflare verification, start Chrome yourself from your normal Windows PowerShell or Command Prompt. This keeps Chrome on your interactive desktop and lets you complete verification manually.
+
+Close any previous Chrome window that was started with the same debugging profile, then run one of these commands:
+
+```powershell
+.\collector\start-chrome-cdp.ps1
+```
+
+Or start Chrome directly:
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$PWD\chrome-cdp-profile" --new-window "https://www.mariagefreres.com/fr/yin-zhen-t2301-thes-au-poids.html"
+```
+
+If Chrome is installed under `Program Files (x86)`:
+
+```powershell
+& "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$PWD\chrome-cdp-profile" --new-window "https://www.mariagefreres.com/fr/yin-zhen-t2301-thes-au-poids.html"
+```
+
+Complete Cloudflare verification in that Chrome window. You may also open the T2302 page in another tab:
+
+```text
+https://www.mariagefreres.com/fr/pai-mu-tan-imperial-t2302-thes-au-poids.html
+```
+
+Then leave Chrome open and run the collector in a second PowerShell:
+
+```powershell
+npm run collect:images:cdp
+```
+
+Or directly:
+
+```powershell
+node collector\collector.js --connect-cdp http://127.0.0.1:9222 --debug --refs T2301,T2302
+```
+
+In CDP mode, the collector does not launch Chrome. It connects to the already-running browser, reuses open product tabs when available, and otherwise opens new tabs inside that same manually verified Chrome.
+
+When it reuses an already-open product tab, it reloads that tab once so CDP can capture fresh Network image response bodies. To inspect DOM/cache only without reloading, add `--no-reload-existing-pages`.
+
 ## Test Run After Verification
 
 ```powershell

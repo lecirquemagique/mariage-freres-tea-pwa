@@ -5,6 +5,7 @@
   "scripts": {
     "collect:images": "node collector/collector.js --browser-channel chrome",
     "collect:images:auth": "node collector/collector.js --browser-channel chrome --auth-setup --debug --refs T2301,T2302",
+    "collect:images:cdp": "node collector/collector.js --connect-cdp http://127.0.0.1:9222 --debug --refs T2301,T2302",
     "collect:images:debug": "node collector/collector.js --browser-channel chrome --debug --headed --refs T2301,T2302",
     "collect:images:test": "node collector/collector.js --browser-channel chrome --debug --refs T2301,T2302"
   },
