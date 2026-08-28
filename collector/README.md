@@ -1,6 +1,8 @@
 # MARIAGE FRERES Image Collector
 
-This collector is intentionally separate from the PWA. It opens official MARIAGE FRERES product pages with Playwright Chromium, keeps a persistent browser profile, and records image acquisition metadata that can later be joined back to the tea master fields `茶葉画像URL` and `水色画像URL`.
+This collector is intentionally separate from the PWA. It opens official MARIAGE FRERES product pages with Playwright, keeps a collector-only persistent browser profile, and records image acquisition metadata that can later be joined back to the tea master fields `茶葉画像URL` and `水色画像URL`.
+
+By default `config.example.json` uses Playwright's `channel: "chrome"` so Windows can launch the locally installed Google Chrome. The profile directory is `browser-profile` inside the collector working folder; it does not use or modify your normal Chrome profile.
 
 ## Setup
 
@@ -10,15 +12,29 @@ npm install
 copy collector\config.example.json config.json
 ```
 
+`package.json` includes the required `playwright` dependency. When `browserChannel` is set to `chrome`, Playwright uses installed Google Chrome and does not need to download bundled Chromium for normal local runs.
+
 No API keys or credentials are required by the collector. Keep `.env`, browser profiles, logs, and downloaded images out of Git.
 
-## Test Run
+## First Chrome Verification Setup
+
+Run this once in a normal Windows console:
 
 ```powershell
-node collector\collector.js --config config.json --debug --headed --refs T2301,T2302
+node collector\collector.js --config config.json --browser-channel chrome --auth-setup --debug --refs T2301,T2302
 ```
 
-Use `--headed` for the first runs. The site may present browser verification, and the persistent `browser-profile` directory lets cookies, cache, and local storage survive future executions.
+Chrome opens with the collector-only persistent profile at `C:\MF-Image-Collector\browser-profile`. Complete any MARIAGE FRERES or Cloudflare verification in that window. When the real product page is visible, press Enter in the console. Cookies, local storage, cache, and browser state remain in the collector profile for later runs.
+
+Do not point `profileDir` at your everyday Chrome user data directory.
+
+## Test Run After Verification
+
+```powershell
+node collector\collector.js --config config.json --browser-channel chrome --debug --headed --refs T2301,T2302
+```
+
+Use `--headed` while stabilizing T2301/T2302. After the collector profile can load product pages reliably, you can try `--headless`; if the site challenges headless Chrome again, keep the scheduled command headed.
 
 ## Initial Findings
 
@@ -38,14 +54,14 @@ Observed in the Codex sandbox on 2026-08-29:
 - Headed Playwright in the same sandbox also did not pass verification without manual browser interaction.
 - The only image response captured before verification was Cloudflare challenge imagery, not product imagery.
 
-This supports using a persistent headed Chromium profile for the first run. Once the browser profile has passed verification, later runs can reuse cookies, cache, and local storage and should prefer saved Network response bodies over direct image URL requests.
+This supports using a persistent headed Chrome profile for the first run. Once the browser profile has passed verification, later runs can reuse cookies, cache, and local storage and should prefer saved Network response bodies over direct image URL requests.
 
 ## Hourly Run
 
 The collector exits after processing at most `maxPerRun` products. Schedule this command in Windows Task Scheduler every hour:
 
 ```powershell
-node C:\MF-Image-Collector\collector\collector.js --config C:\MF-Image-Collector\config.json
+node C:\MF-Image-Collector\collector\collector.js --config C:\MF-Image-Collector\config.json --browser-channel chrome
 ```
 
 Do not implement an infinite loop inside Node. Let Task Scheduler handle the hourly cadence.

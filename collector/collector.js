@@ -22,6 +22,8 @@ function parseArgs(argv) {
     debug: false,
     headed: false,
     headless: null,
+    authSetup: false,
+    browserChannel: null,
     refs: null,
   };
   for (let i = 2; i < argv.length; i += 1) {
@@ -29,6 +31,9 @@ function parseArgs(argv) {
     if (arg === '--debug') args.debug = true;
     else if (arg === '--headed') args.headed = true;
     else if (arg === '--headless') args.headless = true;
+    else if (arg === '--auth-setup') args.authSetup = true;
+    else if (arg === '--browser-channel') args.browserChannel = argv[++i];
+    else if (arg.startsWith('--browser-channel=')) args.browserChannel = arg.slice('--browser-channel='.length);
     else if (arg === '--config') args.config = argv[++i];
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
     else if (arg === '--refs') args.refs = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
@@ -601,6 +606,42 @@ function updateState(state, product, result, maxRetries) {
   };
 }
 
+async function waitForEnter(message) {
+  console.log(message);
+  await new Promise((resolve) => {
+    process.stdin.resume();
+    process.stdin.once('data', () => {
+      process.stdin.pause();
+      resolve();
+    });
+  });
+}
+
+async function runAuthSetup({ context, products, config, debug }) {
+  const page = await context.newPage();
+  const firstUrl = products[0]?.productUrl || 'https://www.mariagefreres.com/fr/';
+  console.log(`Opening ${firstUrl}`);
+  await page.goto(firstUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 }).catch((error) => {
+    console.log(`Initial navigation warning: ${error.message}`);
+  });
+  await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
+  console.log('');
+  console.log('Complete any Cloudflare/browser verification in the opened Chrome window.');
+  console.log('Use only this collector profile window; your normal Chrome profile is not used.');
+  console.log('After the product page is visible, press Enter here to save and reuse the profile.');
+  await waitForEnter('');
+
+  const title = await page.title().catch(() => '');
+  const url = page.url();
+  const cookies = await context.cookies().catch(() => []);
+  if (debug) {
+    console.log(`[auth-setup] title=${title}`);
+    console.log(`[auth-setup] url=${url}`);
+    console.log(`[auth-setup] cookies=${cookies.length}`);
+  }
+  await page.close().catch(() => {});
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   const baseDir = process.cwd();
@@ -621,7 +662,7 @@ async function main() {
   fs.mkdirSync(paths.imagesDir, { recursive: true });
   fs.mkdirSync(paths.logsDir, { recursive: true });
 
-  const headless = args.headless === true ? true : args.headed ? false : config.headless !== false;
+  const headless = args.authSetup ? false : args.headless === true ? true : args.headed ? false : config.headless !== false;
   const state = readJson(paths.stateFile, { products: {} });
   const products = selectProducts(config, state, args.refs);
 
@@ -640,10 +681,18 @@ async function main() {
 
   if (process.env.MF_COLLECTOR_CHROMIUM_PATH) {
     launchOptions.executablePath = process.env.MF_COLLECTOR_CHROMIUM_PATH;
+  } else {
+    const browserChannel = args.browserChannel || config.browserChannel || process.env.MF_COLLECTOR_BROWSER_CHANNEL || '';
+    if (browserChannel) launchOptions.channel = browserChannel;
   }
 
   const context = await chromium.launchPersistentContext(paths.profileDir, launchOptions);
   try {
+    if (args.authSetup) {
+      await runAuthSetup({ context, products, config, debug: args.debug });
+      return;
+    }
+
     for (let i = 0; i < products.length; i += 1) {
       const product = products[i];
       const result = await processProduct({ context, product, config, paths, debug: args.debug });
@@ -666,4 +715,3 @@ main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });
-

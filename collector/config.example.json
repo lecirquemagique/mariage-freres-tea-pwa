@@ -3,6 +3,7 @@
   "imagesDir": "images",
   "logsDir": "logs",
   "stateFile": "collector-state.json",
+  "browserChannel": "chrome",
   "headless": false,
   "maxPerRun": 5,
   "maxRetries": 3,
@@ -30,4 +31,3 @@
     }
   ]
 }
-

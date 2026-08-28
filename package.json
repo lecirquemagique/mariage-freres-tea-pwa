@@ -3,12 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "collect:images": "node collector/collector.js",
-    "collect:images:debug": "node collector/collector.js --debug --headed --refs T2301,T2302",
-    "collect:images:test": "node collector/collector.js --debug --refs T2301,T2302"
+    "collect:images": "node collector/collector.js --browser-channel chrome",
+    "collect:images:auth": "node collector/collector.js --browser-channel chrome --auth-setup --debug --refs T2301,T2302",
+    "collect:images:debug": "node collector/collector.js --browser-channel chrome --debug --headed --refs T2301,T2302",
+    "collect:images:test": "node collector/collector.js --browser-channel chrome --debug --refs T2301,T2302"
   },
   "dependencies": {
     "playwright": "^1.57.0"
   }
 }
-
