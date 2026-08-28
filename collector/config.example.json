@@ -1,0 +1,33 @@
+{
+  "profileDir": "browser-profile",
+  "imagesDir": "images",
+  "logsDir": "logs",
+  "stateFile": "collector-state.json",
+  "headless": false,
+  "maxPerRun": 5,
+  "maxRetries": 3,
+  "pageDelayMs": {
+    "min": 4000,
+    "max": 14000
+  },
+  "navigationTimeoutMs": 90000,
+  "networkIdleTimeoutMs": 45000,
+  "settleDelayMs": 2500,
+  "products": [
+    {
+      "reference": "T2301",
+      "name": "YIN ZHEN",
+      "productUrl": "https://www.mariagefreres.com/fr/yin-zhen-t2301-thes-au-poids.html",
+      "status": "pending",
+      "retry_count": 0
+    },
+    {
+      "reference": "T2302",
+      "name": "PAI MU TAN IMPERIAL",
+      "productUrl": "https://www.mariagefreres.com/fr/pai-mu-tan-imperial-t2302-thes-au-poids.html",
+      "status": "pending",
+      "retry_count": 0
+    }
+  ]
+}
+

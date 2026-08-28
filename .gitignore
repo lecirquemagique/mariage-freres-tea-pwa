@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+
+node_modules/
+browser-profile/
+images/
+logs/
+collector-state.json
+*.local.json
+
