@@ -7,6 +7,14 @@ const { chromium } = require('playwright');
 
 const DEFAULT_CONFIG = 'config.json';
 const IMAGE_TYPES = ['tea', 'liqueur'];
+const MASTER_COLUMNS = {
+  reference: 'Tリファレンス番号',
+  name: '現在の公式名',
+  fallbackName: '銘柄名（黒い本）',
+  teaImageUrl: '茶葉画像URL',
+  liqueurImageUrl: '水色画像URL',
+  productUrl: '公式商品ページURL',
+};
 const MIME_EXT = {
   'image/jpeg': '.jpg',
   'image/jpg': '.jpg',
@@ -27,6 +35,7 @@ function parseArgs(argv) {
     connectCdp: null,
     useExistingPages: false,
     reloadExistingPages: true,
+    dryRun: false,
     refs: null,
   };
   for (let i = 2; i < argv.length; i += 1) {
@@ -41,6 +50,7 @@ function parseArgs(argv) {
     else if (arg.startsWith('--connect-cdp=')) args.connectCdp = arg.slice('--connect-cdp='.length);
     else if (arg === '--use-existing-pages') args.useExistingPages = true;
     else if (arg === '--no-reload-existing-pages') args.reloadExistingPages = false;
+    else if (arg === '--dry-run') args.dryRun = true;
     else if (arg === '--config') args.config = argv[++i];
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
     else if (arg === '--refs') args.refs = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
@@ -52,6 +62,11 @@ function parseArgs(argv) {
 function readJson(filePath, fallback = null) {
   if (!fs.existsSync(filePath)) return fallback;
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+function readOptionalText(filePath) {
+  if (!fs.existsSync(filePath)) return '';
+  return fs.readFileSync(filePath, 'utf8');
 }
 
 function writeJson(filePath, data) {
@@ -101,8 +116,118 @@ function normalizeUrl(raw, baseUrl) {
   }
 }
 
+function normalizeText(value) {
+  return String(value || '').trim();
+}
+
+function hasValue(value) {
+  return normalizeText(value).length > 0;
+}
+
+function gasJsonpUrl(baseUrl) {
+  const url = new URL(baseUrl);
+  url.searchParams.set('action', 'teaData');
+  url.searchParams.set('callback', '__mfCollectorCb');
+  url.searchParams.set('_', String(Date.now()));
+  return url.href;
+}
+
+function parseJsonp(text, callbackName = '__mfCollectorCb') {
+  const trimmed = text.trim();
+  const prefix = `${callbackName}(`;
+  if (!trimmed.startsWith(prefix)) {
+    throw new Error('GAS response was not JSONP. Expected callback wrapper.');
+  }
+  const json = trimmed.endsWith(';')
+    ? trimmed.slice(prefix.length, -2)
+    : trimmed.slice(prefix.length, -1);
+  return JSON.parse(json);
+}
+
+function findGasUrlFromAppConfig(baseDir) {
+  const appConfig = readOptionalText(path.join(baseDir, 'app-config.js'));
+  return appConfig.match(/GAS_API_URL:\s*['"]([^'"]+)['"]/)?.[1] || '';
+}
+
+async function fetchMasterProducts(config, baseDir, debug) {
+  const source = config.masterSource || {};
+  if (source.enabled === false) return null;
+
+  const gasApiUrl =
+    source.gasApiUrl ||
+    process.env.MF_MASTER_GAS_API_URL ||
+    findGasUrlFromAppConfig(baseDir);
+
+  if (!gasApiUrl || gasApiUrl.includes('PASTE_YOUR')) return null;
+
+  const url = gasJsonpUrl(gasApiUrl);
+  if (debug) console.log(`[master] fetch ${url.replace(/_=\d+/, '_=<timestamp>')}`);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Master GAS API returned HTTP ${response.status}`);
+
+  const payload = parseJsonp(await response.text());
+  if (!payload || payload.ok !== true || !Array.isArray(payload.rows)) {
+    throw new Error('Master GAS API returned an invalid teaData payload.');
+  }
+
+  const products = payload.rows
+    .map((row) => {
+      const reference = normalizeText(row[MASTER_COLUMNS.reference]);
+      const productUrl = normalizeText(row[MASTER_COLUMNS.productUrl]);
+      if (!reference || !productUrl) return null;
+      return {
+        reference,
+        name: normalizeText(row[MASTER_COLUMNS.name]) || normalizeText(row[MASTER_COLUMNS.fallbackName]),
+        productUrl,
+        master: {
+          teaImageUrl: normalizeText(row[MASTER_COLUMNS.teaImageUrl]),
+          liqueurImageUrl: normalizeText(row[MASTER_COLUMNS.liqueurImageUrl]),
+        },
+      };
+    })
+    .filter(Boolean);
+
+  if (debug) console.log(`[master] rows=${payload.rows.length} productsWithUrls=${products.length} updatedAt=${payload.updatedAt || ''}`);
+  return { products, updatedAt: payload.updatedAt || '', rowCount: payload.rows.length };
+}
+
 function isProbablyImageUrl(url) {
   return /\.(avif|webp|png|jpe?g|gif)(?:[?#]|$)/i.test(url || '');
+}
+
+function referenceRegex(reference) {
+  const escaped = String(reference || '').toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i');
+}
+
+function candidateHasExactReference(candidate, product) {
+  const re = referenceRegex(product.reference);
+  const hay = [
+    candidate.url,
+    candidate.sourceUrl,
+    candidate.alt,
+    candidate.title,
+    candidate.closestText,
+    candidate.sectionText,
+  ].join(' ');
+  return re.test(hay);
+}
+
+function candidateReferenceTokens(candidate) {
+  const hay = [
+    candidate.url,
+    candidate.sourceUrl,
+    candidate.alt,
+    candidate.title,
+    candidate.closestText,
+    candidate.sectionText,
+  ].join(' ');
+  return [...new Set([...hay.matchAll(/(^|[^a-z0-9])(t\d{2,5}|tp\d{2,5})([^a-z0-9]|$)/gi)].map((match) => match[2].toUpperCase()))];
+}
+
+function candidateHasConflictingReference(candidate, product) {
+  const expected = String(product.reference || '').toUpperCase();
+  return candidateReferenceTokens(candidate).some((token) => token !== expected);
 }
 
 function classifyCandidate(candidate, product, imageType) {
@@ -123,7 +248,8 @@ function classifyCandidate(candidate, product, imageType) {
   let score = 0;
   let reject = 0;
 
-  if (hay.includes(reference)) score += 4;
+  if (candidateHasConflictingReference(candidate, product)) reject += 50;
+  if (candidateHasExactReference(candidate, product)) score += 10;
   if (name && hay.includes(name)) score += 2;
   if (hay.includes('media/catalog/product')) score += 4;
   if (hay.includes('/cache/')) score += 1;
@@ -136,7 +262,7 @@ function classifyCandidate(candidate, product, imageType) {
   } else {
     if (/liqueur|liquor|liquore|color_liqueur/.test(hay)) reject += 8;
     if (/thes-au-poids|tea-by-the-weight|te-al-peso/.test(hay)) score += 2;
-    if (/t\d{3,5}(-\d+p)?\.(jpe?g|png|webp|avif)/.test(hay)) score += 5;
+    if (candidateHasExactReference(candidate, product) && /t\d{2,5}(-\d+p)?\.(jpe?g|png|webp|avif)/.test(hay)) score += 5;
   }
 
   if (/logo|payment|paiement|livraison|delivery|shipping|secure|sprite|icon|favicon|jardin/.test(hay)) reject += 10;
@@ -147,21 +273,21 @@ function classifyCandidate(candidate, product, imageType) {
 }
 
 function pickCandidate(candidates, product, imageType) {
-  const scored = candidates
+  const scoredAll = candidates
     .map((candidate) => ({
       ...candidate,
       score: classifyCandidate(candidate, product, imageType),
     }))
     .filter((candidate) => candidate.url && candidate.score > 0)
     .sort((a, b) => b.score - a.score);
-  return scored[0] || null;
+  const exact = scoredAll.filter((candidate) => candidateHasExactReference(candidate, product));
+  return exact[0] || null;
 }
 
 function pageMatchesProduct(page, product) {
   const pageUrl = page.url();
-  const reference = String(product.reference || '').toLowerCase();
   const productUrl = String(product.productUrl || '').toLowerCase();
-  return pageUrl.toLowerCase() === productUrl || pageUrl.toLowerCase().includes(reference);
+  return pageUrl.toLowerCase() === productUrl || referenceRegex(product.reference).test(pageUrl);
 }
 
 async function getProductPage(context, product, { useExistingPages = false } = {}) {
@@ -613,17 +739,35 @@ async function processProduct({
   }
 }
 
-function selectProducts(config, state, refs) {
+function productImageStatus(product) {
+  const teaComplete = hasValue(product.master?.teaImageUrl);
+  const liqueurComplete = hasValue(product.master?.liqueurImageUrl);
+  if (teaComplete && liqueurComplete) return 'complete';
+  if (teaComplete || liqueurComplete) return 'partial';
+  return 'pending';
+}
+
+function selectProducts(config, state, refs, sourceProducts = null) {
   const maxRetries = Number.isFinite(config.maxRetries) ? config.maxRetries : 3;
-  const merged = (config.products || []).map((product) => ({ ...product, ...(state.products?.[product.reference] || {}) }));
+  const productList = sourceProducts?.length ? sourceProducts : config.products || [];
+  const merged = productList.map((product) => {
+    const localState = state.products?.[product.reference] || {};
+    const masterStatus = productImageStatus(product);
+    return {
+      ...product,
+      master_status: masterStatus,
+      ...localState,
+      productUrl: product.productUrl || localState.productUrl,
+    };
+  });
   const filtered = refs?.length
     ? merged.filter((product) => refs.includes(product.reference))
     : merged.filter((product) => {
-        const status = product.status || 'pending';
+        const status = product.status || product.master_status || 'pending';
         const retryCount = product.retry_count || 0;
         if (status === 'complete') return false;
         if (status === 'error' && retryCount >= maxRetries) return false;
-        return ['pending', 'partial', 'retry', 'error'].includes(status);
+        return ['pending', 'partial', 'retry', 'error'].includes(status) || product.master_status === 'partial';
       });
   return filtered.slice(0, refs?.length ? refs.length : config.maxPerRun || 5);
 }
@@ -644,6 +788,37 @@ function updateState(state, product, result, maxRetries) {
     last_error: result.error || '',
     images: result.images,
   };
+}
+
+function compactImageResult(row) {
+  if (!row) return 'missing';
+  if (!row.success) return `fail${row.error_message ? ` (${row.error_message})` : ''}`;
+  return `ok:${row.acquired_method || 'unknown'}`;
+}
+
+function logProductSummary(product, stateEntry) {
+  const tea = stateEntry.images?.tea;
+  const liqueur = stateEntry.images?.liqueur;
+  const methods = IMAGE_TYPES
+    .map((type) => stateEntry.images?.[type]?.success ? `${type}:${stateEntry.images[type].acquired_method}` : '')
+    .filter(Boolean)
+    .join(',');
+  const errors = IMAGE_TYPES
+    .map((type) => {
+      const row = stateEntry.images?.[type];
+      return row && !row.success && row.error_message ? `${type}:${row.error_message}` : '';
+    })
+    .filter(Boolean)
+    .join(' | ');
+
+  console.log(JSON.stringify({
+    reference: product.reference,
+    tea: compactImageResult(tea),
+    liqueur: compactImageResult(liqueur),
+    status: stateEntry.status,
+    acquired_method: methods,
+    error: errors,
+  }));
 }
 
 async function waitForEnter(message) {
@@ -716,10 +891,26 @@ async function main() {
 
   const headless = args.authSetup ? false : args.headless === true ? true : args.headed ? false : config.headless !== false;
   const state = readJson(paths.stateFile, { products: {} });
-  const products = selectProducts(config, state, args.refs);
+  const master = await fetchMasterProducts(config, baseDir, args.debug);
+  const products = selectProducts(config, state, args.refs, master?.products || null);
 
   if (products.length === 0) {
     console.log('No pending products selected.');
+    return;
+  }
+
+  console.log(`Selected ${products.length} product(s)${master ? ` from master rows=${master.rowCount}` : ' from config'}.`);
+
+  if (args.dryRun) {
+    for (const product of products) {
+      console.log(JSON.stringify({
+        reference: product.reference,
+        name: product.name || '',
+        product_url: product.productUrl,
+        master_status: product.master_status || 'pending',
+        state_status: state.products?.[product.reference]?.status || '',
+      }));
+    }
     return;
   }
 
@@ -787,7 +978,7 @@ async function main() {
       });
       updateState(state, product, result, Number.isFinite(config.maxRetries) ? config.maxRetries : 3);
       writeJson(paths.stateFile, state);
-      console.log(`${product.reference}: ${state.products[product.reference].status}`);
+      logProductSummary(product, state.products[product.reference]);
 
       if (i < products.length - 1) {
         const waitMs = randomDelay(config.pageDelayMs);
@@ -797,6 +988,7 @@ async function main() {
     }
   } finally {
     if (!externalBrowser) await context.close();
+    else setImmediate(() => process.exit(process.exitCode || 0));
   }
 }
 

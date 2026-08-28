@@ -5,6 +5,11 @@
   "stateFile": "collector-state.json",
   "browserChannel": "chrome",
   "cdpEndpoint": "http://127.0.0.1:9222",
+  "masterSource": {
+    "enabled": true,
+    "type": "gas_jsonp",
+    "gasApiUrl": ""
+  },
   "headless": false,
   "maxPerRun": 5,
   "maxRetries": 3,

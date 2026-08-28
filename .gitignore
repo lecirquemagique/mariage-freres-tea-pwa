@@ -4,6 +4,7 @@
 config.json
 
 node_modules/
+pnpm-lock.yaml
 browser-profile/
 chrome-cdp-profile/
 images/

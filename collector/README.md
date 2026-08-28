@@ -72,6 +72,67 @@ In CDP mode, the collector does not launch Chrome. It connects to the already-ru
 
 When it reuses an already-open product tab, it reloads that tab once so CDP can capture fresh Network image response bodies. To inspect DOM/cache only without reloading, add `--no-reload-existing-pages`.
 
+For the original two-product verification with detailed candidate output:
+
+```powershell
+npm run collect:images:cdp:debug
+```
+
+## Master Selection
+
+The collector can read the current tea master through the same GAS JSONP endpoint used by the PWA:
+
+1. `config.masterSource.gasApiUrl`
+2. `MF_MASTER_GAS_API_URL`
+3. `app-config.js` `GAS_API_URL`
+
+The current API already exposes the columns needed for read-only selection:
+
+- `Tリファレンス番号`
+- `現在の公式名`
+- `銘柄名（黒い本）`
+- `茶葉画像URL`
+- `水色画像URL`
+- `公式商品ページURL`
+
+Selection rules:
+
+- Rows with both image URL columns populated are treated as `complete` and skipped.
+- Rows with exactly one image URL populated are treated as `partial`.
+- Rows with neither image URL populated are treated as `pending`.
+- Local `collector-state.json` can also mark a reference as `complete`, `partial`, `retry`, or `error`.
+- Each run processes at most `maxPerRun` products, default `5`.
+
+Preview the next selected products without opening MARIAGE FRERES:
+
+```powershell
+npm run collect:images:dry-run
+```
+
+## Proposed Master/API Additions
+
+No Google Sheets columns or GAS API behavior are changed by this collector yet.
+
+To write results back later, add either a GAS endpoint or a separate import workflow that updates the existing columns:
+
+- `茶葉画像URL`
+- `水色画像URL`
+- `公式商品ページURL` if missing or corrected
+
+Recommended optional audit columns, pending approval:
+
+- `画像取得ステータス`
+- `画像取得日時`
+- `画像取得方法`
+- `画像取得エラー`
+- `画像取得リトライ回数`
+
+Recommended GAS action, pending approval:
+
+- `action=updateImageResults`
+- Input: reference, tea URL/path, liqueur URL/path, methods, dimensions, MIME types, status, error
+- Behavior: update only the matching reference row and only approved image/audit columns
+
 ## Test Run After Verification
 
 ```powershell
@@ -105,8 +166,10 @@ This supports using a persistent headed Chrome profile for the first run. Once t
 The collector exits after processing at most `maxPerRun` products. Schedule this command in Windows Task Scheduler every hour:
 
 ```powershell
-node C:\MF-Image-Collector\collector\collector.js --config C:\MF-Image-Collector\config.json --browser-channel chrome
+.\collector\register-hourly-cdp-task.ps1
 ```
+
+The scheduled task calls `collector\run-cdp-once.ps1`, which checks that `http://127.0.0.1:9222` is available, then runs one collector pass. Keep the manual CDP Chrome open with `collector\start-chrome-cdp.ps1`.
 
 Do not implement an infinite loop inside Node. Let Task Scheduler handle the hourly cadence.
 
