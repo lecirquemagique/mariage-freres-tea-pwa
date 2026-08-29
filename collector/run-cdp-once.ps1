@@ -1,6 +1,8 @@
 param(
   [string]$Root = "",
   [string]$CdpEndpoint = "http://127.0.0.1:9222",
+  [string]$NodeExe = "node",
+  [string]$MasterGasApiUrl = "",
   [switch]$Debug,
   [switch]$WriteBack
 )
@@ -20,6 +22,10 @@ try {
 }
 
 $args = @("collector\collector.js", "--connect-cdp", $CdpEndpoint)
+if (-not [string]::IsNullOrWhiteSpace($MasterGasApiUrl)) {
+  $env:MF_MASTER_GAS_API_URL = $MasterGasApiUrl
+  $env:MF_MASTER_WRITE_GAS_API_URL = $MasterGasApiUrl
+}
 if ($Debug) {
   $args += "--debug"
 }
@@ -27,4 +33,4 @@ if ($WriteBack) {
   $args += "--write-back"
 }
 
-node @args
+& $NodeExe @args

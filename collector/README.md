@@ -115,13 +115,18 @@ The current API already exposes the columns needed for read-only selection:
 - `銘柄名（黒い本）`
 - `茶葉画像URL`
 - `水色画像URL`
+- `茶葉サムネイルURL`
+- `茶葉画像状態`
+- `茶葉サムネイル状態`
+- `水色画像状態`
 - `公式商品ページURL`
 
 Selection rules:
 
-- Rows with both image URL columns populated are treated as `complete` and skipped.
-- Rows with exactly one image URL populated are treated as `partial`.
-- Rows with neither image URL populated are treated as `pending`.
+- Rows where `tea`, `teaThumbnail`, and `liqueur` are all resolved are treated as `complete` and skipped.
+- An image is resolved when its URL column is populated, or when its matching status column is `not_available`.
+- Rows with some resolved images are treated as `partial`.
+- Rows with no resolved images are treated as `pending`.
 - Local `collector-state.json` can also mark a reference as `complete`, `partial`, `retry`, or `error`.
 - Each run processes at most `maxPerRun` products, default `5`.
 
@@ -138,6 +143,18 @@ The current Google Sheets columns are sufficient for image display writeback:
 - `茶葉画像URL`
 - `水色画像URL`
 - `茶葉サムネイルURL`
+- `茶葉画像状態`
+- `茶葉サムネイル状態`
+- `水色画像状態`
+
+URL columns are for PWA display. Status columns are for collector scheduling and prevent infinite retries when an image is confirmed absent on the official page.
+
+Status values:
+
+- `available`: image exists and the Drive URL was written.
+- `not_available`: the official page was checked and no valid candidate exists.
+- `pending`: not processed yet.
+- `error`: attempted but failed.
 
 The collector can POST acquired local images to a GAS endpoint. GAS saves the files to Drive, avoids duplicate file names according to `duplicatePolicy`, generates URLs such as:
 
@@ -147,7 +164,23 @@ https://drive.google.com/thumbnail?id=<FILE_ID>&sz=w1200
 
 Then GAS writes those URLs back to the existing master row. It does not write official `media/catalog/product/cache/...` URLs to the master.
 
-Add `backend/mf-image-collector.gs` to the existing Apps Script project. If the project already has `doPost(e)`, do not create a second dispatcher; route only `action === 'uploadImageResults'` to `mfImageCollectorDoPost(e)`. If `茶葉サムネイルURL` is missing, the helper appends it once at the end of the master sheet.
+Add `backend/mf-image-collector.gs` to the existing Apps Script project. Do not create a second top-level `doPost(e)` if the project already has one; route only `action === 'uploadImageResults'` to `mfImageCollectorDoPost(e)`. If `茶葉サムネイルURL` or the status columns are missing, the helper appends them once at the end of the master sheet.
+
+If the existing Apps Script has no `doPost(e)`, add this small dispatcher:
+
+```javascript
+function doPost(e) {
+  return mfImageCollectorDoPost(e);
+}
+```
+
+If it already has `doPost(e)`, add this branch near the top of the existing function, after parsing the request JSON:
+
+```javascript
+if (payload.action === 'uploadImageResults') {
+  return mfImageCollectorDoPost(e);
+}
+```
 
 In Apps Script project settings, set this Script Property:
 
@@ -260,6 +293,18 @@ The collector exits after processing at most `maxPerRun` products. Schedule this
 
 The scheduled task calls `collector\run-cdp-once.ps1`, which checks that `http://127.0.0.1:9222` is available, then runs one collector pass. Keep the manual CDP Chrome open with `collector\start-chrome-cdp.ps1`.
 
+If `node` is not in PATH, pass the full executable path:
+
+```powershell
+.\collector\register-hourly-cdp-task.ps1 -WriteBack -NodeExe "C:\Program Files\nodejs\node.exe"
+```
+
+If `config.json` does not contain `masterSource.gasApiUrl` and `writeBack.gasApiUrl`, pass only the non-secret GAS endpoint. The run script exposes it to the collector as both `MF_MASTER_GAS_API_URL` and `MF_MASTER_WRITE_GAS_API_URL`. Keep `MF_COLLECTOR_WRITE_SECRET` in the user environment or `config.json`, not in the scheduled-task command:
+
+```powershell
+.\collector\register-hourly-cdp-task.ps1 -WriteBack -MasterGasApiUrl "https://script.google.com/macros/s/.../exec"
+```
+
 Do not implement an infinite loop inside Node. Let Task Scheduler handle the hourly cadence.
 
 ## Result Logs
@@ -279,4 +324,4 @@ Each processed image writes a JSONL row with:
 - `success`
 - `error_message`
 
-Statuses are stored in `collector-state.json`: `pending`, `partial`, `complete`, `retry`, or `error`.
+Run statuses are stored in `collector-state.json`: `pending`, `partial`, `complete`, `retry`, or `error`. Per-image master statuses are stored in the three Sheets status columns as `available`, `not_available`, `pending`, or `error`.

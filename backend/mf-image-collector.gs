@@ -1,19 +1,15 @@
 /*
  * MARIAGE FRERES image collector writeback helpers.
  *
- * Add this file to the existing Google Apps Script project, or copy the
- * functions into the current Code.gs. If that project already has doPost(e),
- * call mfImageCollectorDoPost(e) from the existing dispatcher when
- * action === 'uploadImageResults' instead of defining a second doPost.
+ * Add this file to the existing Google Apps Script project, or copy these
+ * functions into the current Code.gs. Then route only
+ * action === 'uploadImageResults' from the existing doPost(e) dispatcher to
+ * mfImageCollectorDoPost(e). Do not add a second top-level doPost(e).
  */
 
 var MF_IMAGE_COLLECTOR_FOLDER_ID = '192M8W9aopop-k0H_xHMJBWkEVy3fK4eX';
 var MF_IMAGE_COLLECTOR_SHEET_NAME = '銘柄マスター';
 var MF_IMAGE_COLLECTOR_SECRET_PROPERTY = 'MF_COLLECTOR_WRITE_SECRET';
-
-function doPost(e) {
-  return mfImageCollectorDoPost(e);
-}
 
 function mfImageCollectorDoPost(e) {
   try {
@@ -50,27 +46,34 @@ function mfImageCollectorUploadImageResults_(payload) {
     if (imageType !== 'tea' && imageType !== 'teaThumbnail' && imageType !== 'liqueur') continue;
 
     var fileName = String(image.file_name || '').trim();
-    if (!fileName) throw new Error('file_name is required.');
+    var status = mfImageCollectorNormalizeStatus_(image.status);
+    if (status === 'available' && !fileName) throw new Error('file_name is required.');
     var mimeType = String(image.mime_type || 'application/octet-stream');
     var base64 = String(image.data_base64 || '');
-    if (!base64) throw new Error('data_base64 is required.');
+    if (status === 'available' && !base64) throw new Error('data_base64 is required.');
 
-    var folderName = mfImageCollectorFolderNameForType_(imageType);
-    var targetFolder = mfImageCollectorGetOrCreateSubfolder_(rootFolder, folderName);
-    var fileResult = mfImageCollectorUpsertFile_(targetFolder, fileName, mimeType, base64, duplicatePolicy);
-    if (imageType === 'liqueur') {
-      mfImageCollectorTrashLegacyLiqueurFiles_(rootFolder, reference);
-      mfImageCollectorTrashLegacyLiqueurFiles_(targetFolder, reference);
-    }
-    uploaded.push({
+    var result = {
       image_type: imageType,
-      file_id: fileResult.file.getId(),
-      name: fileResult.file.getName(),
-      folder: folderName,
-      mime_type: mimeType,
-      action: fileResult.action,
-      url: mfImageCollectorThumbnailUrl_(fileResult.file.getId(), urlSize)
-    });
+      status: status,
+      error_message: String(image.error_message || '')
+    };
+
+    if (status === 'available') {
+      var folderName = mfImageCollectorFolderNameForType_(imageType);
+      var targetFolder = mfImageCollectorGetOrCreateSubfolder_(rootFolder, folderName);
+      var fileResult = mfImageCollectorUpsertFile_(targetFolder, fileName, mimeType, base64, duplicatePolicy);
+      if (imageType === 'liqueur') {
+        mfImageCollectorTrashLegacyLiqueurFiles_(rootFolder, reference);
+        mfImageCollectorTrashLegacyLiqueurFiles_(targetFolder, reference);
+      }
+      result.file_id = fileResult.file.getId();
+      result.name = fileResult.file.getName();
+      result.folder = folderName;
+      result.mime_type = mimeType;
+      result.action = fileResult.action;
+      result.url = mfImageCollectorThumbnailUrl_(fileResult.file.getId(), urlSize);
+    }
+    uploaded.push(result);
   }
 
   var row = mfImageCollectorUpdateSheet_(reference, uploaded);
@@ -113,6 +116,12 @@ function mfImageCollectorGetOrCreateSubfolder_(rootFolder, name) {
 function mfImageCollectorFolderNameForType_(imageType) {
   if (imageType === 'teaThumbnail') return 'tea-thumbnail';
   return imageType;
+}
+
+function mfImageCollectorNormalizeStatus_(status) {
+  var value = String(status || '').toLowerCase();
+  if (value === 'available' || value === 'not_available' || value === 'pending' || value === 'error') return value;
+  return 'available';
 }
 
 function mfImageCollectorTrashLegacyLiqueurFiles_(folder, reference) {
@@ -166,6 +175,9 @@ function mfImageCollectorUpdateSheet_(reference, images) {
   var teaCol = headers.indexOf('茶葉画像URL');
   var teaThumbnailCol = mfImageCollectorEnsureHeader_(sheet, headers, '茶葉サムネイルURL');
   var liqueurCol = headers.indexOf('水色画像URL');
+  var teaStatusCol = mfImageCollectorEnsureHeader_(sheet, headers, '茶葉画像状態');
+  var teaThumbnailStatusCol = mfImageCollectorEnsureHeader_(sheet, headers, '茶葉サムネイル状態');
+  var liqueurStatusCol = mfImageCollectorEnsureHeader_(sheet, headers, '水色画像状態');
   if (refCol < 0 || teaCol < 0 || teaThumbnailCol < 0 || liqueurCol < 0) {
     throw new Error('Required columns are missing.');
   }
@@ -186,7 +198,18 @@ function mfImageCollectorUpdateSheet_(reference, images) {
       : image.image_type === 'teaThumbnail'
         ? teaThumbnailCol
         : liqueurCol;
-    sheet.getRange(rowIndex + 1, col + 1).setValue(image.url);
+    var statusCol = image.image_type === 'tea'
+      ? teaStatusCol
+      : image.image_type === 'teaThumbnail'
+        ? teaThumbnailStatusCol
+        : liqueurStatusCol;
+
+    if (image.url) {
+      sheet.getRange(rowIndex + 1, col + 1).setValue(image.url);
+    } else if (image.status === 'not_available') {
+      sheet.getRange(rowIndex + 1, col + 1).setValue('');
+    }
+    sheet.getRange(rowIndex + 1, statusCol + 1).setValue(image.status || (image.url ? 'available' : 'error'));
   }
 
   return rowIndex + 1;
@@ -199,7 +222,20 @@ function mfImageCollectorEnsureHeader_(sheet, headers, headerName) {
   var lastColumn = sheet.getLastColumn();
   sheet.insertColumnAfter(lastColumn);
   sheet.getRange(1, lastColumn + 1).setValue(headerName);
+  if (headerName.indexOf('状態') >= 0) {
+    mfImageCollectorApplyStatusValidation_(sheet, lastColumn + 1);
+  }
+  headers.push(headerName);
   return lastColumn;
+}
+
+function mfImageCollectorApplyStatusValidation_(sheet, columnNumber) {
+  var rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['available', 'not_available', 'pending', 'error'], true)
+    .setAllowInvalid(false)
+    .build();
+  var maxRows = Math.max(sheet.getMaxRows() - 1, 1);
+  sheet.getRange(2, columnNumber, maxRows, 1).setDataValidation(rule);
 }
 
 function mfImageCollectorThumbnailUrl_(fileId, size) {

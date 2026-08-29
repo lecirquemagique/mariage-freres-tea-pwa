@@ -20,6 +20,9 @@ const MASTER_COLUMNS = {
   teaImageUrl: '茶葉画像URL',
   teaThumbnailUrl: '茶葉サムネイルURL',
   liqueurImageUrl: '水色画像URL',
+  teaImageStatus: '茶葉画像状態',
+  teaThumbnailStatus: '茶葉サムネイル状態',
+  liqueurImageStatus: '水色画像状態',
   productUrl: '公式商品ページURL',
 };
 const MIME_EXT = {
@@ -143,6 +146,11 @@ function hasValue(value) {
   return normalizeText(value).length > 0;
 }
 
+function normalizeImageStatus(value) {
+  const status = normalizeText(value).toLowerCase();
+  return ['available', 'not_available', 'pending', 'error'].includes(status) ? status : '';
+}
+
 function gasJsonpUrl(baseUrl) {
   const url = new URL(baseUrl);
   url.searchParams.set('action', 'teaData');
@@ -181,17 +189,25 @@ function getWriteBackSettings(config, baseDir) {
 }
 
 function encodeImageForWriteBack(row, imageType) {
-  if (!row?.success || !row.file_path || !fs.existsSync(row.file_path)) return null;
-  return {
+  if (!row) return null;
+  const status = row.success ? 'available' : row.not_available ? 'not_available' : 'error';
+  const payload = {
     image_type: imageType,
     folder_key: IMAGE_TYPE_FOLDERS[imageType] || imageType,
-    file_name: path.basename(row.file_path),
+    status,
+    error_message: row.error_message || '',
+    source_url: row.source_url || '',
+    resolved_url: row.resolved_url || '',
+    file_name: row.file_path ? path.basename(row.file_path) : '',
     mime_type: row.mime_type || 'application/octet-stream',
     width: row.width || 0,
     height: row.height || 0,
     acquired_method: row.acquired_method || '',
-    data_base64: fs.readFileSync(row.file_path).toString('base64'),
   };
+  if (row.success && row.file_path && fs.existsSync(row.file_path)) {
+    payload.data_base64 = fs.readFileSync(row.file_path).toString('base64');
+  }
+  return payload;
 }
 
 async function writeBackImageResults({ config, baseDir, product, result, debug }) {
@@ -304,6 +320,9 @@ async function fetchMasterProducts(config, baseDir, debug) {
           teaImageUrl: normalizeText(row[MASTER_COLUMNS.teaImageUrl]),
           teaThumbnailUrl: normalizeText(row[MASTER_COLUMNS.teaThumbnailUrl]),
           liqueurImageUrl: normalizeText(row[MASTER_COLUMNS.liqueurImageUrl]),
+          teaImageStatus: normalizeImageStatus(row[MASTER_COLUMNS.teaImageStatus]),
+          teaThumbnailStatus: normalizeImageStatus(row[MASTER_COLUMNS.teaThumbnailStatus]),
+          liqueurImageStatus: normalizeImageStatus(row[MASTER_COLUMNS.liqueurImageStatus]),
         },
       };
     })
@@ -868,6 +887,7 @@ async function processProduct({
           acquired_at: nowIso(),
           success: false,
           not_available: true,
+          status: 'not_available',
           error_message: `No ${imageType} candidate detected.`,
         };
         appendJsonl(paths.resultLog, row);
@@ -917,9 +937,9 @@ async function processProduct({
 }
 
 function productImageStatus(product) {
-  const teaComplete = hasValue(product.master?.teaImageUrl);
-  const teaThumbnailComplete = hasValue(product.master?.teaThumbnailUrl);
-  const liqueurComplete = hasValue(product.master?.liqueurImageUrl);
+  const teaComplete = hasValue(product.master?.teaImageUrl) || product.master?.teaImageStatus === 'not_available';
+  const teaThumbnailComplete = hasValue(product.master?.teaThumbnailUrl) || product.master?.teaThumbnailStatus === 'not_available';
+  const liqueurComplete = hasValue(product.master?.liqueurImageUrl) || product.master?.liqueurImageStatus === 'not_available';
   if (teaComplete && teaThumbnailComplete && liqueurComplete) return 'complete';
   if (teaComplete || teaThumbnailComplete || liqueurComplete) return 'partial';
   return 'pending';
@@ -989,6 +1009,7 @@ function updateState(state, product, result, maxRetries, config = {}) {
 
 function compactImageResult(row) {
   if (!row) return 'missing';
+  if (row.not_available || row.status === 'not_available') return 'not_available';
   if (!row.success) return `fail${row.error_message ? ` (${row.error_message})` : ''}`;
   return `ok:${row.acquired_method || 'unknown'}`;
 }
