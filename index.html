@@ -43,6 +43,38 @@
     .chip.on{background:linear-gradient(180deg,#2a2114,#17120d);color:#ffe8ad;border-color:var(--gold)}
     .chip.detail.on{background:#3b2d16;border-color:var(--gold2);color:#ffe8ad}
 
+    .feature-chips{
+  display:flex;
+  gap:7px;
+  flex-wrap:wrap;
+}
+
+.feature-chip{
+  cursor:pointer;
+}
+
+.feature-chip input{
+  position:absolute;
+  opacity:0;
+  pointer-events:none;
+}
+
+.feature-chip span{
+  display:block;
+  border:1px solid var(--line);
+  background:#11100e;
+  color:#d8cbb4;
+  border-radius:6px;
+  padding:8px 10px;
+  font-size:12px;
+  box-shadow:inset 0 0 0 1px rgba(198,161,90,.06);
+}
+
+.feature-chip input:checked + span{
+  background:linear-gradient(180deg,#2a2114,#17120d);
+  color:#ffe8ad;
+  border-color:var(--gold);
+}
     .checks{display:flex;gap:9px;margin-top:14px;flex-wrap:wrap;padding-top:12px;border-top:1px solid #31271a}
     .checks label{font-size:11px;display:flex;align-items:center;gap:5px;border:1px solid #4f3c20;border-radius:6px;padding:7px 9px;background:#0f0e0c;color:#d6c8ae}
     .checks input{accent-color:var(--gold)}
@@ -176,14 +208,39 @@
       <div id="detailChips" class="chips"></div>
     </div>
 
-    <div class="checks">
-      <label><input id="end" type="checkbox" checked>終売を除く</label>
-      <label><input id="milk" type="checkbox">ミルクティー向け</label>
-      <label><input id="smoke" type="checkbox">燻製茶</label>
-      <label><input id="cold" type="checkbox">水出し用</label>
-      <label><input id="iced" type="checkbox">アイスティー向け</label>
-      <label><input id="theine" type="checkbox">テインフリー</label>
-    </div>
+<div class="section">
+  <div class="section-title">楽しみ方・特徴</div>
+  <div class="feature-chips">
+    <label class="feature-chip">
+      <input id="milk" type="checkbox">
+      <span>ミルクティー</span>
+    </label>
+
+    <label class="feature-chip">
+      <input id="iced" type="checkbox">
+      <span>アイスティー</span>
+    </label>
+
+    <label class="feature-chip">
+      <input id="cold" type="checkbox">
+      <span>水出し</span>
+    </label>
+
+    <label class="feature-chip">
+      <input id="smoke" type="checkbox">
+      <span>燻製茶</span>
+    </label>
+
+    <label class="feature-chip">
+      <input id="theine" type="checkbox">
+      <span>テインフリー</span>
+    </label>
+  </div>
+</div>
+
+<div class="checks">
+  <label><input id="end" type="checkbox" checked>終売を除く</label>
+</div>
 
     <div class="meta-row">
       <span id="meta"></span>
