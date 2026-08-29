@@ -665,10 +665,10 @@
     </div>
 
     <div class="section">
-         <div class="section-title">時間帯</div>
-         <div id="timeChips" class="chips"></div>
+      <div class="section-title">時間帯</div>
+      <div id="timeChips" class="chips"></div>
     </div>
-    
+
     <div class="checks">
       <label>
         <input id="end" type="checkbox" checked>
@@ -700,6 +700,17 @@ let timeSel='';
 
 const MAJOR_REGIONS=['ダージリン','アッサム'];
 const TIME_OPTIONS=['朝','昼','午後','夜'];
+
+const TEA_TYPE_ORDER=[
+  '黒茶',
+  '青茶',
+  '緑茶',
+  '白茶',
+  '黄茶',
+  '後発酵茶',
+  'ルイボス',
+  'チザン'
+];
 
 const C=window.MF_APP_CONFIG||{};
 
@@ -739,6 +750,49 @@ function fill(id,a){
   uniq(a).forEach(x=>
     e.add(new Option(x,x))
   );
+}
+
+
+function normalizeTeaType(value){
+  const raw=String(value||'').trim();
+  const v=n(raw);
+
+  if(
+    v.includes('チザン') ||
+    v.includes('tisane') ||
+    v.includes('ハーブティー') ||
+    v==='ハーブ'
+  ){
+    return 'チザン';
+  }
+
+  return raw;
+}
+
+
+function fillTeaTypes(){
+  const e=$('tea');
+
+  const values=new Set(
+    R.flatMap(r=>
+      sp(r['茶種タグ'])
+    )
+    .map(normalizeTeaType)
+    .filter(Boolean)
+  );
+
+  TEA_TYPE_ORDER.forEach(x=>{
+    if(values.has(x)){
+      e.add(new Option(x,x));
+      values.delete(x);
+    }
+  });
+
+  [...values]
+    .sort((a,b)=>a.localeCompare(b,'ja'))
+    .forEach(x=>
+      e.add(new Option(x,x))
+    );
 }
 
 
@@ -1031,15 +1085,18 @@ function matches(r){
     return false;
   }
 
-  if(
-    $('tea').value &&
-    !sp(
-      r['茶種タグ']
-    ).includes(
-      $('tea').value
-    )
-  ){
-    return false;
+  if($('tea').value){
+    const teaTypes=
+      sp(r['茶種タグ'])
+        .map(normalizeTeaType);
+
+    if(
+      !teaTypes.includes(
+        $('tea').value
+      )
+    ){
+      return false;
+    }
   }
 
   if($('origin').value){
@@ -1177,23 +1234,10 @@ function activeText(){
     );
   }
 
-  if(timeSel){
-    a.push(
-      timeSel
-    );
-  }
-
   if(aromaSel.size){
     a.push(
       '香味:'+
       [...aromaSel].join('+')
-    );
-  }
-
-  if(detailSel.size){
-    a.push(
-      '詳細:'+
-      [...detailSel].join('+')
     );
   }
 
@@ -1215,6 +1259,12 @@ function activeText(){
 
   if($('theine').checked){
     a.push('テインフリー');
+  }
+
+  if(timeSel){
+    a.push(
+      timeSel
+    );
   }
 
   return a.join(' ／ ');
@@ -1430,8 +1480,8 @@ function reset(){
   aromaSel.clear();
   detailSel.clear();
 
-  renderTimeChips();
   renderAromaChips();
+  renderTimeChips();
   render();
 }
 
@@ -1451,12 +1501,7 @@ function initData(payload){
   R=
     payload.rows;
 
-  fill(
-    'tea',
-    R.flatMap(x=>
-      sp(x['茶種タグ'])
-    )
-  );
+  fillTeaTypes();
 
   fill(
     'origin',
@@ -1468,8 +1513,8 @@ function initData(payload){
     ]
   );
 
-  renderTimeChips();
   renderAromaChips();
+  renderTimeChips();
   render();
 
   $('status').textContent=
