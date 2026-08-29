@@ -250,6 +250,7 @@
 <script src="app-config.js"></script>
 <script>
 let R=[], aromaSel=new Set(), detailSel=new Set();
+const MAJOR_REGIONS=['ダージリン','アッサム'];
 
 const C=window.MF_APP_CONFIG||{};
 const $=x=>document.getElementById(x);
@@ -374,7 +375,15 @@ function matches(r){
 
   if(q&&!n(Object.values(r).join(' ')).includes(q))return false;
   if($('tea').value&&!sp(r['茶種タグ']).includes($('tea').value))return false;
-  if($('origin').value&&!sp(r['産地・国']).includes($('origin').value))return false;
+  if($('origin').value){
+  const origin=$('origin').value;
+
+  if(MAJOR_REGIONS.includes(origin)){
+    if(!n(r['産地・地域／茶園']).includes(n(origin)))return false;
+  }else{
+    if(!sp(r['産地・国']).includes(origin))return false;
+  }
+  }
   if($('time').value&&!sp(r['時間帯タグ']).includes($('time').value))return false;
   if(aromaSel.size&&!hasAll(r['香味大分類'],aromaSel))return false;
   if(detailSel.size&&!hasAll(r['香味詳細タグ'],detailSel))return false;
@@ -486,7 +495,10 @@ function initData(payload){
   R=payload.rows;
 
   fill('tea',R.flatMap(x=>sp(x['茶種タグ'])));
-  fill('origin',R.flatMap(x=>sp(x['産地・国'])));
+  fill('origin',[
+  ...R.flatMap(x=>sp(x['産地・国'])),
+  ...MAJOR_REGIONS
+  ]);
   fill('time',R.flatMap(x=>sp(x['時間帯タグ'])));
 
   renderAromaChips();
