@@ -111,6 +111,11 @@ function randomDelay({ min = 4000, max = 14000 } = {}) {
   return Math.floor(min + Math.random() * Math.max(0, max - min));
 }
 
+function parseTime(value) {
+  const time = Date.parse(value || '');
+  return Number.isFinite(time) ? time : 0;
+}
+
 function resolveProjectPath(baseDir, value) {
   if (!value) return '';
   return path.isAbsolute(value) ? value : path.join(baseDir, value);
@@ -162,6 +167,13 @@ function normalizeProductUrlStatus(value) {
   const status = normalizeText(value).toLowerCase();
   if (status === 'not_available') return 'not_found';
   return ['available', 'not_found', 'pending', 'error'].includes(status) ? status : '';
+}
+
+function isDiscoveryNotFoundResult(discovery) {
+  const status = normalizeProductUrlStatus(discovery?.status);
+  if (status === 'not_found') return true;
+  return status === 'error' &&
+    normalizeText(discovery?.error_message) === 'No official product page with exact reference was verified.';
 }
 
 function gasJsonpUrl(baseUrl) {
@@ -632,7 +644,7 @@ async function discoverProductPageUrl(context, product, config, debug) {
       await sleep(config.settleDelayMs || 2500);
 
       const title = await page.title().catch(() => '');
-      const bodyText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+      const bodyText = await page.locator('body').innerText({ timeout: 5000 });
       if (/cloudflare|verify you are human|vérifiez que vous êtes humain|just a moment/i.test(`${title}\n${bodyText}`)) {
         return {
           success: false,
@@ -673,7 +685,7 @@ async function discoverProductPageUrl(context, product, config, debug) {
 
         const finalUrl = page.url();
         const titleText = await page.title().catch(() => '');
-        const visibleText = await page.locator('body').innerText({ timeout: 8000 }).catch(() => '');
+        const visibleText = await page.locator('body').innerText({ timeout: 8000 });
         if (/cloudflare|verify you are human|vérifiez que vous êtes humain|just a moment/i.test(`${titleText}\n${visibleText}`)) {
           return {
             success: false,
@@ -1189,6 +1201,10 @@ function productImageStatus(product) {
 
 function selectProducts(config, state, refs, sourceProducts = null) {
   const maxRetries = Number.isFinite(config.maxRetries) ? config.maxRetries : 3;
+  const maxPerRun = config.maxPerRun || 5;
+  const retryMaxPerRun = Number.isFinite(config.retryMaxPerRun) ? config.retryMaxPerRun : 1;
+  const retryBackoffMs = Number.isFinite(config.retryBackoffMs) ? config.retryBackoffMs : 6 * 60 * 60 * 1000;
+  const now = Date.now();
   const hasMasterProducts = Boolean(sourceProducts?.length);
   const productList = hasMasterProducts ? sourceProducts : config.products || [];
   const merged = productList.map((product) => {
@@ -1201,28 +1217,53 @@ function selectProducts(config, state, refs, sourceProducts = null) {
       productUrl: product.productUrl || localState.productUrl,
     };
   });
-  const filtered = refs?.length
-    ? merged.filter((product) => refs.includes(product.reference))
-    : merged.filter((product) => {
-        const localStatus = product.status || '';
-        const masterStatus = product.master_status || 'pending';
-        const urlDiscoveryStatus = normalizeProductUrlStatus(product.urlDiscovery?.status) || product.master?.productUrlStatus || '';
-        const status = hasMasterProducts && masterStatus !== 'complete' && localStatus === 'complete'
-          ? masterStatus
-          : localStatus || masterStatus;
-        const retryCount = product.retry_count || 0;
-        if (!hasValue(product.productUrl) && urlDiscoveryStatus === 'not_found') return false;
-        if (status === 'complete') return false;
-        if (status === 'error' && retryCount >= maxRetries) return false;
-        return ['pending', 'partial', 'retry', 'error'].includes(status) || product.master_status === 'partial';
-      });
-  return filtered.slice(0, refs?.length ? refs.length : config.maxPerRun || 5);
+  if (refs?.length) {
+    return merged.filter((product) => refs.includes(product.reference));
+  }
+
+  const pending = [];
+  const retry = [];
+  for (const product of merged) {
+    const localStatus = product.status || '';
+    const masterStatus = product.master_status || 'pending';
+    const urlDiscoveryStatus = isDiscoveryNotFoundResult(product.urlDiscovery)
+      ? 'not_found'
+      : normalizeProductUrlStatus(product.urlDiscovery?.status) || product.master?.productUrlStatus || '';
+    const status = hasMasterProducts && masterStatus !== 'complete' && localStatus === 'complete'
+      ? masterStatus
+      : localStatus || masterStatus;
+    const retryCount = product.retry_count || 0;
+    if (!hasValue(product.productUrl) && urlDiscoveryStatus === 'not_found') continue;
+    if (status === 'complete' || status === 'not_found') continue;
+
+    const isRetry = status === 'retry' || status === 'error';
+    if (isRetry) {
+      if (retryCount >= maxRetries) continue;
+      const lastAttemptAt = parseTime(product.last_attempt_at || product.updated_at || product.urlDiscovery?.acquired_at);
+      if (lastAttemptAt && now - lastAttemptAt < retryBackoffMs) continue;
+      retry.push(product);
+      continue;
+    }
+
+    if (['pending', 'partial'].includes(status) || product.master_status === 'partial') {
+      pending.push(product);
+    }
+  }
+
+  if (pending.length === 0) {
+    return retry.slice(0, maxPerRun);
+  }
+  const selectedRetry = retry.slice(0, Math.min(retryMaxPerRun, maxPerRun));
+  const selectedPending = pending.slice(0, maxPerRun - selectedRetry.length);
+  return selectedRetry.concat(selectedPending);
 }
 
 function productScheduleStatus(product) {
   const localStatus = product.status || '';
   const masterStatus = product.master_status || productImageStatus(product);
-  const urlDiscoveryStatus = normalizeProductUrlStatus(product.urlDiscovery?.status) || product.master?.productUrlStatus || '';
+  const urlDiscoveryStatus = isDiscoveryNotFoundResult(product.urlDiscovery)
+    ? 'not_found'
+    : normalizeProductUrlStatus(product.urlDiscovery?.status) || product.master?.productUrlStatus || '';
   if (masterStatus === 'complete' || localStatus === 'complete') return 'complete';
   if (!hasValue(product.productUrl) && urlDiscoveryStatus === 'not_found') return 'not_found';
   if (localStatus === 'retry') return 'retry';
@@ -1267,6 +1308,29 @@ function buildStatusSummary(config, state, master, products) {
   };
 }
 
+async function normalizeNotFoundProductUrlWriteBacks({ config, baseDir, state, master, debug }) {
+  if (!writeBackRequired(config) || !master?.products?.length) return;
+  for (const product of master.products) {
+    const localState = state.products?.[product.reference];
+    const masterUrlStatus = normalizeProductUrlStatus(product.master?.productUrlStatus);
+    if (hasValue(product.master?.productUrl) || masterUrlStatus === 'not_found' || !isDiscoveryNotFoundResult(localState?.urlDiscovery)) {
+      continue;
+    }
+    const discovery = {
+      success: false,
+      status: 'not_found',
+      url: '',
+      error_message: localState.urlDiscovery?.error_message || 'No official product page with exact reference was verified.',
+    };
+    try {
+      await writeBackProductPageUrl({ config, baseDir, product, discovery, debug });
+      if (debug) console.log(`[url-status-normalized] ${product.reference} not_found`);
+    } catch (error) {
+      if (debug) console.log(`[url-status-normalize-failed] ${product.reference} ${error.message}`);
+    }
+  }
+}
+
 function writeBackRequired(config) {
   return config.writeBack?.enabled === true;
 }
@@ -1293,6 +1357,7 @@ function updateState(state, product, result, maxRetries, config = {}) {
     status,
     retry_count: retryCount,
     updated_at: nowIso(),
+    last_attempt_at: nowIso(),
     last_error: result.error || '',
     productUrl: product.productUrl || previous.productUrl || '',
     urlDiscovery: result.urlDiscovery || previous.urlDiscovery || null,
@@ -1427,6 +1492,9 @@ async function main() {
   if (!master && !useConfigProducts) {
     throw new Error('Master products are required for normal collector runs. Use --use-config-products only for explicit local tests.');
   }
+  if (!args.statusJson && !args.dryRun) {
+    await normalizeNotFoundProductUrlWriteBacks({ config, baseDir, state, master, debug: args.debug });
+  }
   const products = selectProducts(config, state, args.refs, master?.products || null);
 
   if (args.statusJson) {
@@ -1543,11 +1611,14 @@ async function main() {
           : await discoverProductPageUrl(context, product, config, args.debug);
         const previous = state.products?.[product.reference] || {};
         const maxRetries = Number.isFinite(config.maxRetries) ? config.maxRetries : 3;
-        const discoveryRetryCount = discovery.success ? previous.retry_count || 0 : (previous.retry_count || product.retry_count || 0) + 1;
         const normalizedDiscoveryStatus = normalizeProductUrlStatus(discovery.status);
+        const discoveryIsNotFound = normalizedDiscoveryStatus === 'not_found';
+        const discoveryRetryCount = discovery.success || discoveryIsNotFound
+          ? previous.retry_count || 0
+          : (previous.retry_count || product.retry_count || 0) + 1;
         const discoveryStatusForState = discovery.success
           ? 'available'
-          : normalizedDiscoveryStatus === 'not_found' && discoveryRetryCount >= maxRetries
+          : discoveryIsNotFound
             ? 'not_found'
             : 'error';
         const discoveryForState = {
@@ -1583,12 +1654,20 @@ async function main() {
 
         state.products = state.products || {};
         if (args.discoverUrlsOnly || !discovery.success || (writeBackRequired(config) && discoveryResult.urlDiscovery?.writeBack?.success === false)) {
-          const status = discovery.success ? previous.status || 'pending' : discoveryRetryCount < maxRetries ? 'retry' : 'error';
+          const writeBackFailed = writeBackRequired(config) && discoveryResult.urlDiscovery?.writeBack?.success === false;
+          const status = discovery.success
+            ? previous.status || 'pending'
+            : discoveryIsNotFound && !writeBackFailed
+              ? 'not_found'
+              : discoveryRetryCount < maxRetries
+                ? 'retry'
+                : 'error';
           state.products[product.reference] = {
             ...previous,
             status,
             retry_count: discoveryRetryCount,
             updated_at: nowIso(),
+            last_attempt_at: nowIso(),
             last_error: discoveryResult.error || '',
             productUrl: product.productUrl || previous.productUrl || '',
             urlDiscovery: discoveryResult.urlDiscovery,

@@ -5,6 +5,8 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+$OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 try {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -33,6 +35,39 @@ function Normalize-ProductUrlStatus($Value) {
   return ""
 }
 
+function Test-DiscoveryNotFoundResult($Entry) {
+  if ($null -eq $Entry -or $null -eq $Entry.urlDiscovery) {
+    return $false
+  }
+  $UrlStatus = Normalize-ProductUrlStatus $Entry.urlDiscovery.status
+  if ($UrlStatus -eq "not_found") {
+    return $true
+  }
+  return $UrlStatus -eq "error" -and [string]$Entry.urlDiscovery.error_message -eq "No official product page with exact reference was verified."
+}
+
+function Get-EffectiveLocalStatus($Entry) {
+  if ($null -eq $Entry) {
+    return "pending"
+  }
+  if ([string]$Entry.status -eq "complete") {
+    return "complete"
+  }
+  if (Test-DiscoveryNotFoundResult $Entry) {
+    return "not_found"
+  }
+  if ([string]$Entry.status -eq "partial") {
+    return "partial"
+  }
+  if ([string]$Entry.status -eq "retry") {
+    return "retry"
+  }
+  if ([string]$Entry.status -eq "error") {
+    return "error"
+  }
+  return "pending"
+}
+
 function Show-MasterSummary($Root, $NodeExe) {
   if (-not (Test-Path $NodeExe)) {
     Write-Host "Master status: Node not found at $NodeExe"
@@ -40,7 +75,9 @@ function Show-MasterSummary($Root, $NodeExe) {
   }
 
   try {
+    Push-Location $Root
     $Output = & $NodeExe "collector\collector.js" "--status-json" 2>&1
+    Pop-Location
     $JsonLine = @($Output | Where-Object { ([string]$_).Trim().StartsWith("{") } | Select-Object -Last 1)
     if ($JsonLine.Count -eq 0) {
       Write-Host "Master status: collector did not return JSON"
@@ -59,6 +96,7 @@ function Show-MasterSummary($Root, $NodeExe) {
       Write-Host ("  {0}: {1} master={2} state={3} url={4}" -f $_.reference, $_.name, $_.master_status, $_.state_status, $_.url_discovery_status)
     }
   } catch {
+    Pop-Location -ErrorAction SilentlyContinue
     Write-Host "Master status: collector status failed - $($_.Exception.Message)"
   }
 }
@@ -91,22 +129,23 @@ if (Test-Path $StateFile) {
   try {
     $State = Read-JsonFileUtf8 $StateFile
     $Products = @($State.products.PSObject.Properties)
-    $Complete = @($Products | Where-Object { $_.Value.status -eq "complete" }).Count
-    $Partial = @($Products | Where-Object { $_.Value.status -eq "partial" }).Count
-    $Retry = @($Products | Where-Object { $_.Value.status -eq "retry" }).Count
-    $ErrorCount = @($Products | Where-Object { $_.Value.status -eq "error" }).Count
-    $NotFound = @($Products | Where-Object { $null -ne $_.Value.urlDiscovery -and (Normalize-ProductUrlStatus $_.Value.urlDiscovery.status) -eq "not_found" }).Count
+    $Complete = @($Products | Where-Object { (Get-EffectiveLocalStatus $_.Value) -eq "complete" }).Count
+    $Partial = @($Products | Where-Object { (Get-EffectiveLocalStatus $_.Value) -eq "partial" }).Count
+    $Retry = @($Products | Where-Object { (Get-EffectiveLocalStatus $_.Value) -eq "retry" }).Count
+    $ErrorCount = @($Products | Where-Object { (Get-EffectiveLocalStatus $_.Value) -eq "error" }).Count
+    $NotFound = @($Products | Where-Object { (Get-EffectiveLocalStatus $_.Value) -eq "not_found" }).Count
     Write-Host "Local state products: $($Products.Count) complete=$Complete partial=$Partial retry=$Retry error=$ErrorCount not_found=$NotFound"
     Write-Host "Recent local state:"
     $Products |
       Sort-Object { $_.Value.updated_at } -Descending |
       Select-Object -First 8 |
       ForEach-Object {
+        $EffectiveStatus = Get-EffectiveLocalStatus $_.Value
         $UrlStatus = ""
         if ($null -ne $_.Value.urlDiscovery) {
-          $UrlStatus = Normalize-ProductUrlStatus $_.Value.urlDiscovery.status
+          $UrlStatus = if (Test-DiscoveryNotFoundResult $_.Value) { "not_found" } else { Normalize-ProductUrlStatus $_.Value.urlDiscovery.status }
         }
-        Write-Host ("  {0}: {1} url={2} updated={3}" -f $_.Name, $_.Value.status, $UrlStatus, $_.Value.updated_at)
+        Write-Host ("  {0}: {1} url={2} raw={3} updated={4}" -f $_.Name, $EffectiveStatus, $UrlStatus, $_.Value.status, $_.Value.updated_at)
       }
   } catch {
     Write-Host "Local state: invalid JSON - $($_.Exception.Message)"

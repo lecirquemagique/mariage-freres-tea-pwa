@@ -132,8 +132,10 @@ Selection rules:
 - Rows with no resolved images are treated as `pending`.
 - Rows without `公式商品ページURL` are still eligible. The collector first searches the official site and writes the verified URL before collecting images.
 - If `公式商品ページURL状態` is `not_found`, the row is skipped in normal runs until the status is manually cleared, changed, or a future explicit rediscovery mode is used.
-- Local `collector-state.json` can also mark a reference as `complete`, `partial`, `retry`, or `error`.
+- Product URL discovery writes `not_found` on the first attempt when the official search was readable but no exact T reference match was verified. It retries only technical failures such as browser verification, HTTP errors, timeouts, CDP disconnects, DOM read failures, or other exceptions.
+- Local `collector-state.json` can also mark a reference as `complete`, `partial`, `not_found`, `retry`, or `error`.
 - Each run processes at most `maxPerRun` products, default `5`.
+- When pending products exist, retry products are limited to `retryMaxPerRun`, default `1`, and must wait at least `retryBackoffMs`, default `21600000` milliseconds, since `last_attempt_at`. If no pending products exist, a run may use all 5 slots for retries.
 
 Preview the next selected products without opening MARIAGE FRERES:
 
@@ -354,7 +356,9 @@ Before write-back starts, the launcher reads `MF_COLLECTOR_WRITE_SECRET` from th
 
 `画像回収_完全終了.bat` disables future runs and also closes only the collector Chrome process that was started with the repository's `chrome-cdp-profile` and CDP port.
 
-`画像回収_ステータス.bat` shows the scheduled task state, last/next run times, CDP Chrome availability, and a compact summary of recent local collector state.
+`画像回収_ステータス.bat` shows the scheduled task state, last/next run times, CDP Chrome availability, master counts, effective local state counts, and the next 5 candidates.
+
+Each scheduled run writes stdout/stderr to `logs/scheduled-YYYYMMDD-HHMMSS.log` for later diagnosis.
 
 Safety behavior:
 

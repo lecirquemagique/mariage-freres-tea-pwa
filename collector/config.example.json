@@ -25,6 +25,8 @@
   "headless": false,
   "maxPerRun": 5,
   "maxRetries": 3,
+  "retryMaxPerRun": 1,
+  "retryBackoffMs": 21600000,
   "pageDelayMs": {
     "min": 4000,
     "max": 14000

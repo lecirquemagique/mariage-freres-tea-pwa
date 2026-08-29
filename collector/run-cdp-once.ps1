@@ -8,9 +8,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $Mutex = New-Object System.Threading.Mutex($false, "MFImageCollectorRun")
 $LockTaken = $false
+$RunExitCode = 0
 
 try {
   $LockTaken = $Mutex.WaitOne(0)
@@ -24,6 +27,9 @@ if ([string]::IsNullOrWhiteSpace($Root)) {
 }
 
 Set-Location $Root
+$LogDir = Join-Path $Root "logs"
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$RunLog = Join-Path $LogDir ("scheduled-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
 
 if ($WriteBack -and [string]::IsNullOrWhiteSpace($env:MF_COLLECTOR_WRITE_SECRET)) {
   $UserSecret = [Environment]::GetEnvironmentVariable("MF_COLLECTOR_WRITE_SECRET", "User")
@@ -54,10 +60,15 @@ if ($WriteBack) {
   $args += "--write-back"
 }
 
-& $NodeExe @args
+$LASTEXITCODE = 0
+Write-Host "Run log: $RunLog"
+& $NodeExe @args 2>&1 | Tee-Object -FilePath $RunLog
+$RunExitCode = $LASTEXITCODE
 } finally {
   if ($LockTaken) {
     $Mutex.ReleaseMutex()
   }
   $Mutex.Dispose()
 }
+
+exit $RunExitCode
