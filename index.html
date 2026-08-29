@@ -406,6 +406,14 @@
       margin:10px 0
     }
 
+    .name-ja{
+      margin:5px 0 0;
+      font-size:12px;
+      line-height:1.45;
+      letter-spacing:.03em;
+      color:#b9ab91
+    }
+    
     .tag{
       background:#18140f;
       border:1px solid #4d3c23;
@@ -1432,6 +1440,12 @@ function render(){
                 )
               }
             </span>
+            
+            ${
+              r['日本語名（黒い本）']
+                ? `<div class="name-ja">${esc(r['日本語名（黒い本）'])}</div>`
+                : ''
+            }
 
             <div class="tags">
 
