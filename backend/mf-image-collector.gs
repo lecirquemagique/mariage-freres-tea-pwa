@@ -1,15 +1,18 @@
 /*
  * MARIAGE FRERES image collector writeback helpers.
  *
- * Add this file to the existing Google Apps Script project, or copy these
- * functions into the current Code.gs. Then route only
- * action === 'uploadImageResults' from the existing doPost(e) dispatcher to
- * mfImageCollectorDoPost(e). Do not add a second top-level doPost(e).
+ * Replace the existing mf-image-collector.gs file with this whole file.
+ * Keep exactly one top-level doPost(e); mfImageCollectorDoPost(e) handles
+ * both uploadImageResults and updateProductPageUrl actions.
  */
 
 var MF_IMAGE_COLLECTOR_FOLDER_ID = '192M8W9aopop-k0H_xHMJBWkEVy3fK4eX';
 var MF_IMAGE_COLLECTOR_SHEET_NAME = '銘柄マスター';
 var MF_IMAGE_COLLECTOR_SECRET_PROPERTY = 'MF_COLLECTOR_WRITE_SECRET';
+
+function doPost(e) {
+  return mfImageCollectorDoPost(e);
+}
 
 function mfImageCollectorDoPost(e) {
   try {

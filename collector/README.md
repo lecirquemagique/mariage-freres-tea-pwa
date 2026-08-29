@@ -183,9 +183,7 @@ https://drive.google.com/thumbnail?id=<FILE_ID>&sz=w1200
 
 Then GAS writes those URLs back to the existing master row. It does not write official `media/catalog/product/cache/...` URLs to the master.
 
-Add `backend/mf-image-collector.gs` to the existing Apps Script project. Do not create a second top-level `doPost(e)` if the project already has one; route only the collector actions to `mfImageCollectorDoPost(e)`. If `茶葉サムネイルURL` or the status columns are missing, the helper appends them once at the end of the master sheet.
-
-If the existing Apps Script has no `doPost(e)`, add this small dispatcher:
+Replace the existing Apps Script `mf-image-collector.gs` file with `backend/mf-image-collector.gs` as a whole. The file includes a single top-level `doPost(e)`:
 
 ```javascript
 function doPost(e) {
@@ -193,21 +191,14 @@ function doPost(e) {
 }
 ```
 
-If it already has `doPost(e)`, add this branch near the top of the existing function, after parsing the request JSON:
+Do not add separate action branches to `doPost(e)`. `mfImageCollectorDoPost(e)` handles both collector POST actions internally:
 
-```javascript
-if (payload.action === 'uploadImageResults') {
-  return mfImageCollectorDoPost(e);
-}
+```text
+uploadImageResults
+updateProductPageUrl
 ```
 
-The same dispatcher must also route URL discovery writeback:
-
-```javascript
-if (payload.action === 'updateProductPageUrl') {
-  return mfImageCollectorDoPost(e);
-}
-```
+If `茶葉サムネイルURL`, `公式商品ページURL状態`, or the status columns are missing, the helper appends them once at the end of the master sheet.
 
 In Apps Script project settings, set this Script Property:
 
