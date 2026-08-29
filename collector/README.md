@@ -131,7 +131,7 @@ Selection rules:
 - Rows with some resolved images are treated as `partial`.
 - Rows with no resolved images are treated as `pending`.
 - Rows without `公式商品ページURL` are still eligible. The collector first searches the official site and writes the verified URL before collecting images.
-- If `公式商品ページURL状態` is `not_available`, the row is skipped until the status is manually cleared or changed.
+- If `公式商品ページURL状態` is `not_found`, the row is skipped in normal runs until the status is manually cleared, changed, or a future explicit rediscovery mode is used.
 - Local `collector-state.json` can also mark a reference as `complete`, `partial`, `retry`, or `error`.
 - Each run processes at most `maxPerRun` products, default `5`.
 
@@ -168,12 +168,19 @@ The current Google Sheets columns are sufficient for image display writeback:
 
 URL columns are for PWA display. Status columns are for collector scheduling and prevent infinite retries when an image is confirmed absent on the official page.
 
-Status values:
+Image status values:
 
 - `available`: image exists and the Drive URL was written.
-- `not_available`: the official page was checked and no valid candidate exists.
+- `not_available`: the official page was checked and that image type was confirmed absent.
 - `pending`: not processed yet.
 - `error`: attempted but failed.
+
+Product URL discovery status values for `公式商品ページURL状態`:
+
+- `available`: a verified official product URL was written.
+- `not_found`: the current discovery method could not verify an official product page after the retry limit. This does not mean the official page does not exist.
+- `pending`: not processed yet.
+- `error`: attempted but failed and can still be retried until the retry limit.
 
 The collector can POST acquired local images to a GAS endpoint. GAS saves the files to Drive, avoids duplicate file names according to `duplicatePolicy`, generates URLs such as:
 
@@ -376,4 +383,4 @@ Each processed image writes a JSONL row with:
 - `success`
 - `error_message`
 
-Run statuses are stored in `collector-state.json`: `pending`, `partial`, `complete`, `retry`, or `error`. Per-image master statuses are stored in the three Sheets status columns as `available`, `not_available`, `pending`, or `error`.
+Run statuses are stored in `collector-state.json`: `pending`, `partial`, `complete`, `retry`, or `error`. Per-image master statuses are stored in the three Sheets status columns as `available`, `not_available`, `pending`, or `error`. Product URL discovery status is stored in `公式商品ページURL状態` as `available`, `not_found`, `pending`, or `error`.

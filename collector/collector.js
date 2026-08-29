@@ -156,6 +156,12 @@ function normalizeImageStatus(value) {
   return ['available', 'not_available', 'pending', 'error'].includes(status) ? status : '';
 }
 
+function normalizeProductUrlStatus(value) {
+  const status = normalizeText(value).toLowerCase();
+  if (status === 'not_available') return 'not_found';
+  return ['available', 'not_found', 'pending', 'error'].includes(status) ? status : '';
+}
+
 function gasJsonpUrl(baseUrl) {
   const url = new URL(baseUrl);
   url.searchParams.set('action', 'teaData');
@@ -300,7 +306,7 @@ async function writeBackProductPageUrl({ config, baseDir, product, discovery, de
     secret: settings.secret,
     reference: product.reference,
     product_page_url: discovery.url || '',
-    status: discovery.success ? 'available' : discovery.status || 'not_available',
+    status: discovery.success ? 'available' : normalizeProductUrlStatus(discovery.status) || 'error',
     error_message: discovery.error_message || '',
   };
 
@@ -384,7 +390,7 @@ async function fetchMasterProducts(config, baseDir, debug) {
         productUrl,
         master: {
           productUrl,
-          productUrlStatus: normalizeImageStatus(row[MASTER_COLUMNS.productUrlStatus]),
+          productUrlStatus: normalizeProductUrlStatus(row[MASTER_COLUMNS.productUrlStatus]),
           teaImageUrl: normalizeText(row[MASTER_COLUMNS.teaImageUrl]),
           teaThumbnailUrl: normalizeText(row[MASTER_COLUMNS.teaThumbnailUrl]),
           liqueurImageUrl: normalizeText(row[MASTER_COLUMNS.liqueurImageUrl]),
@@ -694,7 +700,7 @@ async function discoverProductPageUrl(context, product, config, debug) {
 
     return {
       success: false,
-      status: 'not_available',
+      status: 'not_found',
       method: 'official_search',
       searched_queries: queries,
       attempted_urls: attempted,
@@ -1195,12 +1201,12 @@ function selectProducts(config, state, refs, sourceProducts = null) {
     : merged.filter((product) => {
         const localStatus = product.status || '';
         const masterStatus = product.master_status || 'pending';
-        const urlDiscoveryStatus = product.urlDiscovery?.status || product.master?.productUrlStatus || '';
+        const urlDiscoveryStatus = normalizeProductUrlStatus(product.urlDiscovery?.status) || product.master?.productUrlStatus || '';
         const status = hasMasterProducts && masterStatus !== 'complete' && localStatus === 'complete'
           ? masterStatus
           : localStatus || masterStatus;
         const retryCount = product.retry_count || 0;
-        if (!hasValue(product.productUrl) && urlDiscoveryStatus === 'not_available') return false;
+        if (!hasValue(product.productUrl) && urlDiscoveryStatus === 'not_found') return false;
         if (status === 'complete') return false;
         if (status === 'error' && retryCount >= maxRetries) return false;
         return ['pending', 'partial', 'retry', 'error'].includes(status) || product.master_status === 'partial';
@@ -1480,10 +1486,11 @@ async function main() {
         const previous = state.products?.[product.reference] || {};
         const maxRetries = Number.isFinite(config.maxRetries) ? config.maxRetries : 3;
         const discoveryRetryCount = discovery.success ? previous.retry_count || 0 : (previous.retry_count || product.retry_count || 0) + 1;
+        const normalizedDiscoveryStatus = normalizeProductUrlStatus(discovery.status);
         const discoveryStatusForState = discovery.success
           ? 'available'
-          : discovery.status === 'not_available' && discoveryRetryCount >= maxRetries
-            ? 'not_available'
+          : normalizedDiscoveryStatus === 'not_found' && discoveryRetryCount >= maxRetries
+            ? 'not_found'
             : 'error';
         const discoveryForState = {
           ...discovery,

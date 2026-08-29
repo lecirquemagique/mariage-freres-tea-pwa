@@ -130,6 +130,13 @@ function mfImageCollectorNormalizeStatus_(status) {
   return 'available';
 }
 
+function mfImageCollectorNormalizeProductUrlStatus_(status) {
+  var value = String(status || '').toLowerCase();
+  if (value === 'not_available') return 'not_found';
+  if (value === 'available' || value === 'not_found' || value === 'pending' || value === 'error') return value;
+  return 'error';
+}
+
 function mfImageCollectorTrashLegacyLiqueurFiles_(folder, reference) {
   var names = [
     reference + '_liqueur.jpg',
@@ -181,7 +188,7 @@ function mfImageCollectorUpdateProductPageUrl_(payload) {
   var reference = String(payload.reference || '').trim();
   if (!reference) throw new Error('reference is required.');
 
-  var status = mfImageCollectorNormalizeStatus_(payload.status);
+  var status = mfImageCollectorNormalizeProductUrlStatus_(payload.status);
   var productPageUrl = String(payload.product_page_url || '').trim();
   if (status === 'available') {
     if (!productPageUrl) throw new Error('product_page_url is required when status is available.');
@@ -291,21 +298,29 @@ function mfImageCollectorUpdateSheet_(reference, images) {
 
 function mfImageCollectorEnsureHeader_(sheet, headers, headerName) {
   var existing = headers.indexOf(headerName);
-  if (existing >= 0) return existing;
+  if (existing >= 0) {
+    if (headerName.indexOf('状態') >= 0) {
+      mfImageCollectorApplyStatusValidation_(sheet, existing + 1, headerName);
+    }
+    return existing;
+  }
 
   var lastColumn = sheet.getLastColumn();
   sheet.insertColumnAfter(lastColumn);
   sheet.getRange(1, lastColumn + 1).setValue(headerName);
   if (headerName.indexOf('状態') >= 0) {
-    mfImageCollectorApplyStatusValidation_(sheet, lastColumn + 1);
+    mfImageCollectorApplyStatusValidation_(sheet, lastColumn + 1, headerName);
   }
   headers.push(headerName);
   return lastColumn;
 }
 
-function mfImageCollectorApplyStatusValidation_(sheet, columnNumber) {
+function mfImageCollectorApplyStatusValidation_(sheet, columnNumber, headerName) {
+  var values = headerName === '公式商品ページURL状態'
+    ? ['available', 'not_found', 'pending', 'error']
+    : ['available', 'not_available', 'pending', 'error'];
   var rule = SpreadsheetApp.newDataValidation()
-    .requireValueInList(['available', 'not_available', 'pending', 'error'], true)
+    .requireValueInList(values, true)
     .setAllowInvalid(false)
     .build();
   var maxRows = Math.max(sheet.getMaxRows() - 1, 1);
