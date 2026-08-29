@@ -47,7 +47,7 @@ function mfImageCollectorUploadImageResults_(payload) {
   for (var i = 0; i < images.length; i += 1) {
     var image = images[i] || {};
     var imageType = String(image.image_type || '').trim();
-    if (imageType !== 'tea' && imageType !== 'liqueur') continue;
+    if (imageType !== 'tea' && imageType !== 'teaThumbnail' && imageType !== 'liqueur') continue;
 
     var fileName = String(image.file_name || '').trim();
     if (!fileName) throw new Error('file_name is required.');
@@ -55,7 +55,8 @@ function mfImageCollectorUploadImageResults_(payload) {
     var base64 = String(image.data_base64 || '');
     if (!base64) throw new Error('data_base64 is required.');
 
-    var targetFolder = mfImageCollectorGetOrCreateSubfolder_(rootFolder, imageType);
+    var folderName = mfImageCollectorFolderNameForType_(imageType);
+    var targetFolder = mfImageCollectorGetOrCreateSubfolder_(rootFolder, folderName);
     var fileResult = mfImageCollectorUpsertFile_(targetFolder, fileName, mimeType, base64, duplicatePolicy);
     if (imageType === 'liqueur') {
       mfImageCollectorTrashLegacyLiqueurFiles_(rootFolder, reference);
@@ -65,7 +66,7 @@ function mfImageCollectorUploadImageResults_(payload) {
       image_type: imageType,
       file_id: fileResult.file.getId(),
       name: fileResult.file.getName(),
-      folder: imageType,
+      folder: folderName,
       mime_type: mimeType,
       action: fileResult.action,
       url: mfImageCollectorThumbnailUrl_(fileResult.file.getId(), urlSize)
@@ -107,6 +108,11 @@ function mfImageCollectorGetOrCreateSubfolder_(rootFolder, name) {
   var folders = rootFolder.getFoldersByName(name);
   if (folders.hasNext()) return folders.next();
   return rootFolder.createFolder(name);
+}
+
+function mfImageCollectorFolderNameForType_(imageType) {
+  if (imageType === 'teaThumbnail') return 'tea-thumbnail';
+  return imageType;
 }
 
 function mfImageCollectorTrashLegacyLiqueurFiles_(folder, reference) {
@@ -158,8 +164,9 @@ function mfImageCollectorUpdateSheet_(reference, images) {
   var headers = values[0].map(function(value) { return String(value).trim(); });
   var refCol = headers.indexOf('Tリファレンス番号');
   var teaCol = headers.indexOf('茶葉画像URL');
+  var teaThumbnailCol = mfImageCollectorEnsureHeader_(sheet, headers, '茶葉サムネイルURL');
   var liqueurCol = headers.indexOf('水色画像URL');
-  if (refCol < 0 || teaCol < 0 || liqueurCol < 0) {
+  if (refCol < 0 || teaCol < 0 || teaThumbnailCol < 0 || liqueurCol < 0) {
     throw new Error('Required columns are missing.');
   }
 
@@ -174,11 +181,25 @@ function mfImageCollectorUpdateSheet_(reference, images) {
 
   for (var j = 0; j < images.length; j += 1) {
     var image = images[j];
-    var col = image.image_type === 'tea' ? teaCol : liqueurCol;
+    var col = image.image_type === 'tea'
+      ? teaCol
+      : image.image_type === 'teaThumbnail'
+        ? teaThumbnailCol
+        : liqueurCol;
     sheet.getRange(rowIndex + 1, col + 1).setValue(image.url);
   }
 
   return rowIndex + 1;
+}
+
+function mfImageCollectorEnsureHeader_(sheet, headers, headerName) {
+  var existing = headers.indexOf(headerName);
+  if (existing >= 0) return existing;
+
+  var lastColumn = sheet.getLastColumn();
+  sheet.insertColumnAfter(lastColumn);
+  sheet.getRange(1, lastColumn + 1).setValue(headerName);
+  return lastColumn;
 }
 
 function mfImageCollectorThumbnailUrl_(fileId, size) {

@@ -12,10 +12,17 @@ Images are organized by type:
 
 ```text
 tea/T2301.jpg
+tea-thumbnail/T2301.jpg
 liqueur/TheBlanc1-Cream_1.png
 ```
 
-Liqueur images are shared color swatches, not per-reference product photos. URLs containing `color_liqueur` are the primary liqueur candidates. Product catalog images such as `media/catalog/product/...-270p.jpg` are not liqueur images for the tea master.
+Image types:
+
+- `tea`: per-reference large tea leaf image, for example `t2301.jpg`.
+- `teaThumbnail`: per-reference official 270p tea leaf thumbnail, for example `t2301-270p.jpg`.
+- `liqueur`: shared color swatch from `media/contentmanager/content/...color_liqueur/...`.
+
+Product catalog images such as `media/catalog/product/...-270p.jpg` are never liqueur images. They are accepted only as `teaThumbnail`, and only when the T reference matches exactly so `T230` and `T2301` cannot be mixed.
 
 By default `config.example.json` uses Playwright's `channel: "chrome"` so Windows can launch the locally installed Google Chrome. The profile directory is `browser-profile` inside the collector working folder; it does not use or modify your normal Chrome profile.
 
@@ -130,6 +137,7 @@ The current Google Sheets columns are sufficient for image display writeback:
 
 - `茶葉画像URL`
 - `水色画像URL`
+- `茶葉サムネイルURL`
 
 The collector can POST acquired local images to a GAS endpoint. GAS saves the files to Drive, avoids duplicate file names according to `duplicatePolicy`, generates URLs such as:
 
@@ -139,7 +147,7 @@ https://drive.google.com/thumbnail?id=<FILE_ID>&sz=w1200
 
 Then GAS writes those URLs back to the existing master row. It does not write official `media/catalog/product/cache/...` URLs to the master.
 
-Add `backend/mf-image-collector.gs` to the existing Apps Script project. If the project already has `doPost(e)`, do not create a second dispatcher; route only `action === 'uploadImageResults'` to `mfImageCollectorDoPost(e)`.
+Add `backend/mf-image-collector.gs` to the existing Apps Script project. If the project already has `doPost(e)`, do not create a second dispatcher; route only `action === 'uploadImageResults'` to `mfImageCollectorDoPost(e)`. If `茶葉サムネイルURL` is missing, the helper appends it once at the end of the master sheet.
 
 In Apps Script project settings, set this Script Property:
 
@@ -195,12 +203,16 @@ Confirmed one-reference proof on 2026-08-29:
 
 - T2301 images were acquired locally.
 - `tea/T2301.jpg` was uploaded to Drive file ID `1xRiAKAz88A64m3rHmZzZXn89JyJe8w6O`.
+- `tea-thumbnail/T2301.jpg` was uploaded to Drive file ID `1bLJEcFqehfkerkzwcAI_OFhhA9g5NlQV`.
 - `liqueur/TheBlanc1-Cream_1.png` was uploaded to Drive file ID `1RZBle9GhPieELWibwcWQ2HzWDktBfMPZ`.
 - The master row for T2301 was updated:
   - `茶葉画像URL`: `https://drive.google.com/thumbnail?id=1xRiAKAz88A64m3rHmZzZXn89JyJe8w6O&sz=w1200`
+  - `茶葉サムネイルURL`: `https://drive.google.com/thumbnail?id=1bLJEcFqehfkerkzwcAI_OFhhA9g5NlQV&sz=w1200`
   - `水色画像URL`: `https://drive.google.com/thumbnail?id=1RZBle9GhPieELWibwcWQ2HzWDktBfMPZ&sz=w1200`
 - The PWA reads these URLs into the T2301 image elements. Anonymous visual loading still requires Drive link-sharing to be enabled on the files.
 - The previous incorrect `T2301_liqueur.jpg` file was renamed to `legacy_wrong_T2301_liqueur_catalog_270p.jpg`.
+
+PWA display logic is not changed in this collector phase. A later PWA change can use `茶葉サムネイルURL` for list cards and `茶葉画像URL` for detail views.
 
 Recommended optional audit columns, not required for the current writeback:
 

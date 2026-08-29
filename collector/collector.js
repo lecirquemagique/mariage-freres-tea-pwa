@@ -6,13 +6,19 @@ const path = require('path');
 const { chromium } = require('playwright');
 
 const DEFAULT_CONFIG = 'config.json';
-const IMAGE_TYPES = ['tea', 'liqueur'];
+const IMAGE_TYPES = ['tea', 'teaThumbnail', 'liqueur'];
+const IMAGE_TYPE_FOLDERS = {
+  tea: 'tea',
+  teaThumbnail: 'tea-thumbnail',
+  liqueur: 'liqueur',
+};
 const DRIVE_THUMBNAIL_SIZE = 'w1200';
 const MASTER_COLUMNS = {
   reference: 'Tリファレンス番号',
   name: '現在の公式名',
   fallbackName: '銘柄名（黒い本）',
   teaImageUrl: '茶葉画像URL',
+  teaThumbnailUrl: '茶葉サムネイルURL',
   liqueurImageUrl: '水色画像URL',
   productUrl: '公式商品ページURL',
 };
@@ -178,7 +184,7 @@ function encodeImageForWriteBack(row, imageType) {
   if (!row?.success || !row.file_path || !fs.existsSync(row.file_path)) return null;
   return {
     image_type: imageType,
-    folder_key: imageType,
+    folder_key: IMAGE_TYPE_FOLDERS[imageType] || imageType,
     file_name: path.basename(row.file_path),
     mime_type: row.mime_type || 'application/octet-stream',
     width: row.width || 0,
@@ -296,6 +302,7 @@ async function fetchMasterProducts(config, baseDir, debug) {
         productUrl,
         master: {
           teaImageUrl: normalizeText(row[MASTER_COLUMNS.teaImageUrl]),
+          teaThumbnailUrl: normalizeText(row[MASTER_COLUMNS.teaThumbnailUrl]),
           liqueurImageUrl: normalizeText(row[MASTER_COLUMNS.liqueurImageUrl]),
         },
       };
@@ -369,6 +376,15 @@ function isCatalogProductCandidate(candidate) {
     /media\/catalog\/product/i.test(candidateHaystack(candidate));
 }
 
+function isTeaThumbnailCandidate(candidate, product) {
+  if (!candidateHasExactReference(candidate, product)) return false;
+  const reference = String(product.reference || '').toLowerCase();
+  const url = String(candidate.url || '').toLowerCase();
+  const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return isCatalogProductCandidate(candidate) &&
+    new RegExp(`(^|/)${escaped}-\\d+p\\.(jpe?g|png|webp|avif)(?:[?#]|$)`, 'i').test(url);
+}
+
 function classifyCandidate(candidate, product, imageType) {
   const reference = String(product.reference || '').toLowerCase();
   const name = String(product.name || '').toLowerCase();
@@ -389,8 +405,13 @@ function classifyCandidate(candidate, product, imageType) {
     if (/liqueur|liquor|liquore/.test(hay)) score += 10;
     if (isCatalogProductCandidate(candidate)) reject += 80;
     if (/\/t\/\d\/t\d{2,5}-\d+p\.(jpe?g|png|webp|avif)(?:[?#]|$)/i.test(candidate.url || '')) reject += 100;
+  } else if (imageType === 'teaThumbnail') {
+    if (isTeaThumbnailCandidate(candidate, product)) score += 100;
+    if (isColorLiqueurCandidate(candidate)) reject += 100;
+    if (!/-\d+p\.(jpe?g|png|webp|avif)(?:[?#]|$)/i.test(candidate.url || '')) reject += 25;
   } else {
     if (hay.includes('media/catalog/product')) score += 4;
+    if (/-\d+p\.(jpe?g|png|webp|avif)(?:[?#]|$)/i.test(candidate.url || '')) reject += 15;
     if (/liqueur|liquor|liquore|color_liqueur/.test(hay)) reject += 8;
     if (/thes-au-poids|tea-by-the-weight|te-al-peso/.test(hay)) score += 2;
     if (candidateHasExactReference(candidate, product) && /t\d{2,5}(-\d+p)?\.(jpe?g|png|webp|avif)/.test(hay)) score += 5;
@@ -425,6 +446,9 @@ function pickCandidate(candidates, product, imageType) {
     .sort((a, b) => b.score - a.score);
   if (imageType === 'liqueur') {
     return scoredAll.find((candidate) => isColorLiqueurCandidate(candidate)) || null;
+  }
+  if (imageType === 'teaThumbnail') {
+    return scoredAll.find((candidate) => isTeaThumbnailCandidate(candidate, product)) || null;
   }
   const exact = scoredAll.filter((candidate) => candidateHasExactReference(candidate, product));
   return exact[0] || null;
@@ -635,7 +659,7 @@ async function screenshotCandidateElement(page, candidate) {
 async function saveImage({ baseDir, imageType, product, pageUrl, candidate, acquired, method, logFile }) {
   const mimeType = acquired.mimeType || candidate.mimeType || '';
   const ext = extensionForMime(mimeType, candidate.url);
-  const typeDir = imageType === 'liqueur' ? 'liqueur' : 'tea';
+  const typeDir = IMAGE_TYPE_FOLDERS[imageType] || imageType;
   const liqueurName = basenameFromUrl(acquired.resolvedUrl || candidate.url);
   const fileName = imageType === 'liqueur' && liqueurName
     ? liqueurName
@@ -843,6 +867,7 @@ async function processProduct({
           acquired_method: '',
           acquired_at: nowIso(),
           success: false,
+          not_available: true,
           error_message: `No ${imageType} candidate detected.`,
         };
         appendJsonl(paths.resultLog, row);
@@ -893,9 +918,10 @@ async function processProduct({
 
 function productImageStatus(product) {
   const teaComplete = hasValue(product.master?.teaImageUrl);
+  const teaThumbnailComplete = hasValue(product.master?.teaThumbnailUrl);
   const liqueurComplete = hasValue(product.master?.liqueurImageUrl);
-  if (teaComplete && liqueurComplete) return 'complete';
-  if (teaComplete || liqueurComplete) return 'partial';
+  if (teaComplete && teaThumbnailComplete && liqueurComplete) return 'complete';
+  if (teaComplete || teaThumbnailComplete || liqueurComplete) return 'partial';
   return 'pending';
 }
 
@@ -934,7 +960,11 @@ function writeBackRequired(config) {
 }
 
 function resultIsComplete(result, config) {
-  return result.successCount === 2 && (!writeBackRequired(config) || result.writeBack?.success === true);
+  const resolvedCount = IMAGE_TYPES.filter((type) => {
+    const row = result.images?.[type];
+    return row?.success || row?.not_available;
+  }).length;
+  return resolvedCount === IMAGE_TYPES.length && (!writeBackRequired(config) || result.writeBack?.success === true);
 }
 
 function updateState(state, product, result, maxRetries, config = {}) {
@@ -944,7 +974,7 @@ function updateState(state, product, result, maxRetries, config = {}) {
   const retryCount = complete ? previous.retry_count || 0 : (previous.retry_count || product.retry_count || 0) + 1;
   let status = 'error';
   if (complete) status = 'complete';
-  else if (result.successCount === 1) status = 'partial';
+  else if (result.successCount > 0) status = 'partial';
   else if (retryCount < maxRetries) status = 'retry';
 
   state.products[product.reference] = {
@@ -965,6 +995,7 @@ function compactImageResult(row) {
 
 function logProductSummary(product, stateEntry) {
   const tea = stateEntry.images?.tea;
+  const teaThumbnail = stateEntry.images?.teaThumbnail;
   const liqueur = stateEntry.images?.liqueur;
   const methods = IMAGE_TYPES
     .map((type) => stateEntry.images?.[type]?.success ? `${type}:${stateEntry.images[type].acquired_method}` : '')
@@ -982,6 +1013,7 @@ function logProductSummary(product, stateEntry) {
   console.log(JSON.stringify({
     reference: product.reference,
     tea: compactImageResult(tea),
+    teaThumbnail: compactImageResult(teaThumbnail),
     liqueur: compactImageResult(liqueur),
     status: stateEntry.status,
     acquired_method: methods,
