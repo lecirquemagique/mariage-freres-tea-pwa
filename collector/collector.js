@@ -489,6 +489,28 @@ function isCatalogProductCandidate(candidate) {
     /media\/catalog\/product/i.test(candidateHaystack(candidate));
 }
 
+function imageInfoFromOfficialUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (!/(^|\.)mariagefreres\.(com|co\.jp)$/i.test(url.hostname)) return null;
+    const pathname = decodeURIComponent(url.pathname).toLowerCase();
+    if (/\/media\/contentmanager\/content\/.*color_liqueur\//i.test(pathname)) {
+      return { imageType: 'liqueur', reference: '', cacheKeyName: path.basename(pathname) };
+    }
+    if (!/\/media\/catalog\/product\//i.test(pathname)) return null;
+    const file = path.basename(pathname);
+    const match = file.match(/^(t\d{2,5})(-\d+p)?\.(jpe?g|png|webp|avif)$/i);
+    if (!match) return null;
+    return {
+      reference: match[1].toUpperCase(),
+      imageType: match[2] ? 'teaThumbnail' : 'tea',
+      cacheKeyName: file,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function isTeaThumbnailCandidate(candidate, product) {
   if (!candidateHasExactReference(candidate, product)) return false;
   const reference = String(product.reference || '').toLowerCase();
@@ -567,6 +589,82 @@ function pickCandidate(candidates, product, imageType) {
   return exact[0] || null;
 }
 
+function discoveryCacheKey(reference, imageType, sourceUrl) {
+  return `${String(reference || '').toUpperCase()}|${imageType}|${sourceUrl}`;
+}
+
+function ensureDiscoveryCacheShape(cache) {
+  const shaped = cache && typeof cache === 'object' ? cache : {};
+  shaped.images = shaped.images && typeof shaped.images === 'object' ? shaped.images : {};
+  return shaped;
+}
+
+function loadDiscoveryCache(filePath) {
+  return ensureDiscoveryCacheShape(readJson(filePath, { images: {} }));
+}
+
+function discoveryCacheCandidates(cache, product) {
+  const reference = String(product.reference || '').toUpperCase();
+  return Object.values(cache.images || {})
+    .filter((entry) => entry.reference === reference && ['url_ref_exact', 'current_verified_page'].includes(entry.verification_status))
+    .map((entry) => ({
+      sourceKind: 'discovery_cache',
+      url: entry.source_url,
+      sourceUrl: entry.source_url,
+      width: entry.width || 0,
+      height: entry.height || 0,
+      naturalWidth: entry.width || 0,
+      naturalHeight: entry.height || 0,
+      mimeType: entry.mime_type || '',
+      closestText: `${entry.reference} ${entry.image_type}`,
+      sectionText: entry.image_type === 'liqueur' ? 'Liqueur color_liqueur' : entry.reference,
+    }));
+}
+
+function updateDiscoveryCache({ cache, candidates, product, pageUrl, masterReferences, debug }) {
+  const detectedAt = nowIso();
+  let added = 0;
+  for (const candidate of candidates) {
+    const info = imageInfoFromOfficialUrl(candidate.url);
+    if (!info) continue;
+
+    let reference = info.reference;
+    let verificationStatus = 'url_ref_exact';
+    if (info.imageType === 'liqueur') {
+      reference = String(product.reference || '').toUpperCase();
+      verificationStatus = 'current_verified_page';
+    }
+    if (!reference || !masterReferences.has(reference)) continue;
+
+    const key = discoveryCacheKey(reference, info.imageType, candidate.url);
+    if (cache.images[key]) {
+      cache.images[key] = {
+        ...cache.images[key],
+        last_seen_at: detectedAt,
+        seen_count: (cache.images[key].seen_count || 1) + 1,
+      };
+      continue;
+    }
+
+    cache.images[key] = {
+      reference,
+      image_type: info.imageType,
+      source_url: candidate.url,
+      discovered_from_page: pageUrl,
+      detected_at: detectedAt,
+      last_seen_at: detectedAt,
+      seen_count: 1,
+      verification_status: verificationStatus,
+      width: candidate.naturalWidth || candidate.width || 0,
+      height: candidate.naturalHeight || candidate.height || 0,
+      mime_type: candidate.mimeType || '',
+    };
+    added += 1;
+  }
+  if (debug && added) console.log(`[opportunistic] cached ${added} image candidate(s) from ${product.reference}`);
+  return added;
+}
+
 function pageMatchesProduct(page, product) {
   const pageUrl = page.url();
   const productUrl = String(product.productUrl || '').toLowerCase();
@@ -595,21 +693,29 @@ function productSearchQueries(product) {
   return [...new Set(queries.filter(Boolean))].slice(0, 4);
 }
 
-function productSearchUrl(query) {
-  const url = new URL('https://www.mariagefreres.com/fr/catalogsearch/result/');
-  url.searchParams.set('q', query);
-  return url.href;
+function productSearchUrls(query) {
+  const fr = new URL('https://www.mariagefreres.com/fr/catalogsearch/result/');
+  fr.searchParams.set('q', query);
+  const en = new URL('https://www.mariagefreres.com/en/catalogsearch/result/');
+  en.searchParams.set('q', query);
+  const jp = new URL('https://www.mariagefreres.co.jp/view/search');
+  jp.searchParams.set('search_keyword', query);
+  return [fr.href, en.href, jp.href];
 }
 
 function looksLikeProductUrl(url) {
   try {
     const parsed = new URL(url);
-    if (parsed.hostname !== 'www.mariagefreres.com') return false;
-    if (!parsed.pathname.startsWith('/fr/')) return false;
-    if (!parsed.pathname.endsWith('.html')) return false;
-    if (/checkout|customer|catalogsearch|wishlist|review|contacts/i.test(parsed.pathname)) return false;
-    if (!/(^|-)t\d{2,5}([-.]|$)/i.test(parsed.pathname)) return false;
-    return true;
+    if (parsed.hostname === 'www.mariagefreres.com' && (parsed.pathname.startsWith('/fr/') || parsed.pathname.startsWith('/en/'))) {
+      if (!parsed.pathname.endsWith('.html')) return false;
+      if (/checkout|customer|catalogsearch|wishlist|review|contacts/i.test(parsed.pathname)) return false;
+      if (!/(^|-)t\d{2,5}([-.]|$)/i.test(parsed.pathname)) return false;
+      return true;
+    }
+    if (parsed.hostname === 'www.mariagefreres.co.jp' && /^\/view\/item\/\d+/.test(parsed.pathname)) {
+      return true;
+    }
+    return false;
   } catch {
     return false;
   }
@@ -637,56 +743,15 @@ async function discoverProductPageUrl(context, product, config, debug) {
 
   try {
     for (const query of queries) {
-      const searchUrl = productSearchUrl(query);
-      if (debug) console.log(`[url-search] ${product.reference} query=${query} ${searchUrl}`);
-      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
-      await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
-      await sleep(config.settleDelayMs || 2500);
-
-      const title = await page.title().catch(() => '');
-      const bodyText = await page.locator('body').innerText({ timeout: 5000 });
-      if (/cloudflare|verify you are human|vérifiez que vous êtes humain|just a moment/i.test(`${title}\n${bodyText}`)) {
-        return {
-          success: false,
-          status: 'error',
-          method: 'official_search',
-          searched_queries: queries,
-          attempted_urls: attempted,
-          acquired_at: startedAt,
-          error_message: 'Official search is blocked by browser verification.',
-        };
-      }
-      if (/aucun résultat|aucun resultat|no results/i.test(bodyText)) {
-        if (debug) console.log(`[url-search-empty] ${product.reference} query=${query}`);
-        continue;
-      }
-
-      const candidates = await collectProductSearchCandidates(page);
-      const urls = candidates
-        .map((candidate) => candidate.href)
-        .filter((url) => looksLikeProductUrl(url))
-        .filter((url) => {
-          if (seen.has(url)) return false;
-          seen.add(url);
-          return true;
-        })
-        .slice(0, 10);
-
-      if (debug) {
-        console.log(`[url-candidates] ${product.reference} query=${query} count=${urls.length}`);
-        for (const url of urls) console.log(`[url-candidate] ${product.reference} ${url}`);
-      }
-
-      for (const url of urls) {
-        attempted.push(url);
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
+      for (const searchUrl of productSearchUrls(query)) {
+        if (debug) console.log(`[url-search] ${product.reference} query=${query} ${searchUrl}`);
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
         await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
         await sleep(config.settleDelayMs || 2500);
 
-        const finalUrl = page.url();
-        const titleText = await page.title().catch(() => '');
-        const visibleText = await page.locator('body').innerText({ timeout: 8000 });
-        if (/cloudflare|verify you are human|vérifiez que vous êtes humain|just a moment/i.test(`${titleText}\n${visibleText}`)) {
+        const title = await page.title().catch(() => '');
+        const bodyText = await page.locator('body').innerText({ timeout: 5000 });
+        if (/cloudflare|verify you are human|vérifiez que vous êtes humain|just a moment/i.test(`${title}\n${bodyText}`)) {
           return {
             success: false,
             status: 'error',
@@ -694,24 +759,66 @@ async function discoverProductPageUrl(context, product, config, debug) {
             searched_queries: queries,
             attempted_urls: attempted,
             acquired_at: startedAt,
-            error_message: 'Candidate product page is blocked by browser verification.',
+            error_message: 'Official search is blocked by browser verification.',
           };
         }
-        if (referenceRegex(product.reference).test(visibleText)) {
-          if (debug) console.log(`[url-verified] ${product.reference} ${finalUrl}`);
-          return {
-            success: true,
-            status: 'available',
-            method: 'official_search',
-            url: finalUrl,
-            source_url: searchUrl,
-            searched_queries: queries,
-            attempted_urls: attempted,
-            acquired_at: startedAt,
-            error_message: '',
-          };
+        if (/aucun résultat|aucun resultat|no results|該当する商品がありません/i.test(bodyText)) {
+          if (debug) console.log(`[url-search-empty] ${product.reference} query=${query}`);
+          continue;
         }
-        if (debug) console.log(`[url-rejected] ${product.reference} ${finalUrl}`);
+
+        const candidates = await collectProductSearchCandidates(page);
+        const urls = candidates
+          .map((candidate) => candidate.href)
+          .filter((url) => looksLikeProductUrl(url))
+          .filter((url) => {
+            if (seen.has(url)) return false;
+            seen.add(url);
+            return true;
+          })
+          .slice(0, 10);
+
+        if (debug) {
+          console.log(`[url-candidates] ${product.reference} query=${query} count=${urls.length}`);
+          for (const url of urls) console.log(`[url-candidate] ${product.reference} ${url}`);
+        }
+
+        for (const url of urls) {
+          attempted.push(url);
+          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
+          await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
+          await sleep(config.settleDelayMs || 2500);
+
+          const finalUrl = page.url();
+          const titleText = await page.title().catch(() => '');
+          const visibleText = await page.locator('body').innerText({ timeout: 8000 });
+          if (/cloudflare|verify you are human|vérifiez que vous êtes humain|just a moment/i.test(`${titleText}\n${visibleText}`)) {
+            return {
+              success: false,
+              status: 'error',
+              method: 'official_search',
+              searched_queries: queries,
+              attempted_urls: attempted,
+              acquired_at: startedAt,
+              error_message: 'Candidate product page is blocked by browser verification.',
+            };
+          }
+          if (referenceRegex(product.reference).test(visibleText)) {
+            if (debug) console.log(`[url-verified] ${product.reference} ${finalUrl}`);
+            return {
+              success: true,
+              status: 'available',
+              method: 'official_search',
+              url: finalUrl,
+              source_url: searchUrl,
+              searched_queries: queries,
+              attempted_urls: attempted,
+              acquired_at: startedAt,
+              error_message: '',
+            };
+          }
+          if (debug) console.log(`[url-rejected] ${product.reference} ${finalUrl}`);
+        }
       }
     }
 
@@ -1058,6 +1165,8 @@ async function processProduct({
   useExistingPages = false,
   reloadExistingPages = true,
   keepPagesOpen = false,
+  discoveryCache = null,
+  masterReferences = new Set(),
 }) {
   const pageInfo = await getProductPage(context, product, { useExistingPages });
   const page = pageInfo.page;
@@ -1098,7 +1207,11 @@ async function processProduct({
       width: 0,
       height: 0,
     }));
-    const allCandidates = [...domCandidates, ...cacheCandidates, ...networkCandidates];
+    const discoveredCandidates = discoveryCache ? discoveryCacheCandidates(discoveryCache, product) : [];
+    const allCandidates = [...domCandidates, ...cacheCandidates, ...networkCandidates, ...discoveredCandidates];
+    if (discoveryCache) {
+      updateDiscoveryCache({ cache: discoveryCache, candidates: allCandidates, product, pageUrl, masterReferences, debug });
+    }
 
     if (debug) {
       console.log(`[candidates] ${product.reference} ${allCandidates.length}`);
@@ -1121,7 +1234,7 @@ async function processProduct({
     if (debug) {
       fs.writeFileSync(
         path.join(paths.logsDir, `${product.reference}-candidates-${startedAt}.json`),
-        JSON.stringify({ product, title, domCandidates, cacheCandidates, networkCandidates }, null, 2)
+        JSON.stringify({ product, title, domCandidates, cacheCandidates, networkCandidates, discoveredCandidates }, null, 2)
       );
     }
 
@@ -1233,7 +1346,7 @@ function selectProducts(config, state, refs, sourceProducts = null) {
       ? masterStatus
       : localStatus || masterStatus;
     const retryCount = product.retry_count || 0;
-    if (!hasValue(product.productUrl) && urlDiscoveryStatus === 'not_found') continue;
+    if (!hasValue(product.productUrl) && (urlDiscoveryStatus === 'not_found' || localStatus === 'not_found')) continue;
     if (status === 'complete' || status === 'not_found') continue;
 
     const isRetry = status === 'retry' || status === 'error';
@@ -1265,6 +1378,7 @@ function productScheduleStatus(product) {
     ? 'not_found'
     : normalizeProductUrlStatus(product.urlDiscovery?.status) || product.master?.productUrlStatus || '';
   if (masterStatus === 'complete' || localStatus === 'complete') return 'complete';
+  if (localStatus === 'not_found') return 'not_found';
   if (!hasValue(product.productUrl) && urlDiscoveryStatus === 'not_found') return 'not_found';
   if (localStatus === 'retry') return 'retry';
   if (localStatus === 'error') return 'error';
@@ -1272,7 +1386,27 @@ function productScheduleStatus(product) {
   return 'pending';
 }
 
-function buildStatusSummary(config, state, master, products) {
+function masterImageResolved(product, imageType) {
+  if (imageType === 'tea') return hasValue(product.master?.teaImageUrl) || product.master?.teaImageStatus === 'not_available';
+  if (imageType === 'teaThumbnail') return hasValue(product.master?.teaThumbnailUrl) || product.master?.teaThumbnailStatus === 'not_available';
+  if (imageType === 'liqueur') return hasValue(product.master?.liqueurImageUrl) || product.master?.liqueurImageStatus === 'not_available';
+  return false;
+}
+
+function discoveryCacheStats(cache, masterProducts = []) {
+  const entries = Object.values(cache?.images || {});
+  const masterByReference = new Map(masterProducts.map((product) => [product.reference, product]));
+  const unapplied = entries.filter((entry) => {
+    const product = masterByReference.get(entry.reference);
+    return product && !masterImageResolved(product, entry.image_type);
+  });
+  return {
+    image_count: entries.length,
+    unapplied_image_count: unapplied.length,
+  };
+}
+
+function buildStatusSummary(config, state, master, products, discoveryCache = null) {
   const counts = {
     complete: 0,
     pending: 0,
@@ -1297,6 +1431,7 @@ function buildStatusSummary(config, state, master, products) {
     master_rows: master?.rowCount || 0,
     product_count: sourceProducts.length,
     counts,
+    opportunistic_cache: discoveryCacheStats(discoveryCache, sourceProducts),
     next_candidates: products.map((product) => ({
       reference: product.reference,
       name: product.name || '',
@@ -1478,6 +1613,7 @@ async function main() {
     imagesDir: resolveProjectPath(baseDir, config.imagesDir || 'images'),
     logsDir: resolveProjectPath(baseDir, config.logsDir || 'logs'),
     stateFile: resolveProjectPath(baseDir, config.stateFile || 'collector-state.json'),
+    discoveryCacheFile: resolveProjectPath(baseDir, config.discoveryCacheFile || 'opportunistic-discoveries.json'),
   };
   paths.resultLog = path.join(paths.logsDir, `results-${new Date().toISOString().slice(0, 10)}.jsonl`);
 
@@ -1487,6 +1623,7 @@ async function main() {
 
   const headless = args.authSetup ? false : args.headless === true ? true : args.headed ? false : config.headless !== false;
   const state = readJson(paths.stateFile, { products: {} });
+  const discoveryCache = loadDiscoveryCache(paths.discoveryCacheFile);
   const useConfigProducts = args.useConfigProducts || config.masterSource?.enabled === false;
   const master = useConfigProducts ? null : await fetchMasterProducts(config, baseDir, args.debug);
   if (!master && !useConfigProducts) {
@@ -1496,9 +1633,10 @@ async function main() {
     await normalizeNotFoundProductUrlWriteBacks({ config, baseDir, state, master, debug: args.debug });
   }
   const products = selectProducts(config, state, args.refs, master?.products || null);
+  const masterReferences = new Set((master?.products || config.products || []).map((product) => product.reference).filter(Boolean));
 
   if (args.statusJson) {
-    console.log(JSON.stringify(buildStatusSummary(config, state, master, products)));
+    console.log(JSON.stringify(buildStatusSummary(config, state, master, products, discoveryCache)));
     return;
   }
 
@@ -1694,6 +1832,8 @@ async function main() {
         useExistingPages: args.useExistingPages || Boolean(args.connectCdp),
         reloadExistingPages: args.reloadExistingPages,
         keepPagesOpen: Boolean(args.connectCdp),
+        discoveryCache,
+        masterReferences,
       });
       try {
         await writeBackImageResults({ config, baseDir, product, result, debug: args.debug });
@@ -1704,6 +1844,7 @@ async function main() {
       }
       updateState(state, product, result, Number.isFinite(config.maxRetries) ? config.maxRetries : 3, config);
       writeJson(paths.stateFile, state);
+      writeJson(paths.discoveryCacheFile, discoveryCache);
       logProductSummary(product, state.products[product.reference]);
 
       if (i < products.length - 1) {

@@ -10,4 +10,5 @@ chrome-cdp-profile/
 images/
 logs/
 collector-state.json
+opportunistic-discoveries.json
 *.local.json

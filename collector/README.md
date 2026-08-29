@@ -154,7 +154,15 @@ Product URL discovery uses the official site search in this order:
 1. T reference number.
 2. Current official name or black-book name.
 
-The collector never writes a guessed product URL. It opens candidate official product pages and writes `公式商品ページURL` only when the visible product page text contains the exact T reference, so `T230` and `T2301` cannot be confused.
+Each query is tried against the French, English, and Japanese official sites where available. The collector never writes a guessed product URL. It opens candidate official product pages and writes `公式商品ページURL` only when the visible product page text contains the exact T reference, so `T230` and `T2301` cannot be confused.
+
+While opening official pages, the collector records opportunistic image discoveries in `opportunistic-discoveries.json`. Only these image families are cached:
+
+- `media/catalog/product/.../tNNNN.jpg` as `tea`
+- `media/catalog/product/.../tNNNN-270p.jpg` as `teaThumbnail`
+- `media/contentmanager/content/...color_liqueur/...` as `liqueur` for the currently verified page
+
+Images such as tins, boxes, teabags, sweets, teaware, banners, logos, icons, and unrelated SKUs are ignored. `TCNNNN`, `TFGNNNN`, and `TBNNNN` product images are not treated as `TNNNN` tea-leaf images unless the loaded image URL itself is an exact `tNNNN` or `tNNNN-270p` tea-leaf asset.
 
 ## Drive Upload And Sheet Writeback
 

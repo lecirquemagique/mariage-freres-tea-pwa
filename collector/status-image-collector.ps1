@@ -86,6 +86,9 @@ function Show-MasterSummary($Root, $NodeExe) {
     $Summary = ([string]$JsonLine[-1]) | ConvertFrom-Json -ErrorAction Stop
     Write-Host ("Master rows: {0}" -f $Summary.master_rows)
     Write-Host ("Master status: complete={0} pending={1} not_found={2} retry={3} error={4} partial={5}" -f $Summary.counts.complete, $Summary.counts.pending, $Summary.counts.not_found, $Summary.counts.retry, $Summary.counts.error, $Summary.counts.partial)
+    if ($null -ne $Summary.opportunistic_cache) {
+      Write-Host ("Opportunistic cache: images={0} unapplied={1}" -f $Summary.opportunistic_cache.image_count, $Summary.opportunistic_cache.unapplied_image_count)
+    }
     Write-Host "Next candidates:"
     $Candidates = @($Summary.next_candidates)
     if ($Candidates.Count -eq 0) {

@@ -192,7 +192,11 @@ function mfImageCollectorUpdateProductPageUrl_(payload) {
   var productPageUrl = String(payload.product_page_url || '').trim();
   if (status === 'available') {
     if (!productPageUrl) throw new Error('product_page_url is required when status is available.');
-    if (productPageUrl.indexOf('https://www.mariagefreres.com/fr/') !== 0) {
+    if (
+      productPageUrl.indexOf('https://www.mariagefreres.com/fr/') !== 0 &&
+      productPageUrl.indexOf('https://www.mariagefreres.com/en/') !== 0 &&
+      productPageUrl.indexOf('https://www.mariagefreres.co.jp/view/item/') !== 0
+    ) {
       throw new Error('Unexpected product_page_url host.');
     }
     if (!mfImageCollectorUrlHasExactReference_(productPageUrl, reference)) {
