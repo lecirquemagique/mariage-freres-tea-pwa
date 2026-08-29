@@ -161,8 +161,11 @@ function mfImageCollectorMakeFilesDisplayable(fileIds) {
 
 function mfImageCollectorUpdateSheet_(reference, images) {
   var spreadsheetId = PropertiesService.getScriptProperties().getProperty('MF_MASTER_SPREADSHEET_ID');
+  if (!spreadsheetId && typeof SPREADSHEET_ID !== 'undefined') {
+    spreadsheetId = SPREADSHEET_ID;
+  }
   var ss = spreadsheetId ? SpreadsheetApp.openById(spreadsheetId) : SpreadsheetApp.getActiveSpreadsheet();
-  if (!ss) throw new Error('Spreadsheet not found. Bind this script or set MF_MASTER_SPREADSHEET_ID.');
+  if (!ss) throw new Error('Spreadsheet not found. Bind this script, define SPREADSHEET_ID, or set MF_MASTER_SPREADSHEET_ID.');
 
   var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
   if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);

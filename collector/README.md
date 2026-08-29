@@ -197,6 +197,8 @@ If the Apps Script is not bound to the tea master spreadsheet, also set:
 MF_MASTER_SPREADSHEET_ID=1QPMtFh4-FpeHuhA9ymYVJfwiXiNZhXUcNjgf0lrFO-0
 ```
 
+If the existing Apps Script already defines a global `SPREADSHEET_ID` constant, the collector helper uses that value automatically when `MF_MASTER_SPREADSHEET_ID` is not set.
+
 In local PowerShell, store the same secret outside Git:
 
 ```powershell
