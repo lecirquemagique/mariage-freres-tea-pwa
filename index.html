@@ -203,11 +203,6 @@
       <div id="aromaChips" class="chips"></div>
     </div>
 
-    <div class="section">
-      <div class="section-title">香味詳細 <span class="hint">複数選択＝AND</span></div>
-      <div id="detailChips" class="chips"></div>
-    </div>
-
 <div class="section">
   <div class="section-title">楽しみ方・特徴</div>
   <div class="feature-chips">
@@ -330,9 +325,7 @@ function renderAromaChips(){
     box.appendChild(
       chip(x,aromaSel.has(x),'',()=>{
         aromaSel.has(x) ? aromaSel.delete(x) : aromaSel.add(x);
-        pruneDetails();
         renderAromaChips();
-        renderDetailChips();
         render();
       })
     )
@@ -482,7 +475,6 @@ function reset(){
   aromaSel.clear();
   detailSel.clear();
   renderAromaChips();
-  renderDetailChips();
   render();
 }
 
@@ -498,7 +490,6 @@ function initData(payload){
   fill('time',R.flatMap(x=>sp(x['時間帯タグ'])));
 
   renderAromaChips();
-  renderDetailChips();
   render();
 
   $('status').textContent=
