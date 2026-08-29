@@ -725,7 +725,8 @@ const sp=s=>
 const n=s=>
   String(s||'')
     .normalize('NFKC')
-    .toLowerCase();
+    .toLowerCase()
+    .replace(/\s+/g,'');
 
 const yes=s=>
   ['はい','yes','true','1','推奨'].includes(n(s));
@@ -1498,8 +1499,9 @@ function initData(payload){
     );
   }
 
-  R=
-    payload.rows;
+  R=payload.rows;
+
+  $('q').value='T918';
 
   fillTeaTypes();
 
