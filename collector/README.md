@@ -104,9 +104,12 @@ npm run collect:images:cdp:debug
 
 The collector can read the current tea master through the same GAS JSONP endpoint used by the PWA:
 
-1. `config.masterSource.gasApiUrl`
-2. `MF_MASTER_GAS_API_URL`
-3. `app-config.js` `GAS_API_URL`
+1. `MF_MASTER_GAS_API_URL`
+2. `config.masterGasApiUrl`
+3. `config.masterSource.gasApiUrl`
+4. `app-config.js` `GAS_API_URL`
+
+Normal collector runs require the master API. If the master cannot be read, the collector exits with an error instead of silently falling back to the fixed test products. Use `--use-config-products`, or set `masterSource.enabled` to `false`, only for explicit local tests against `config.json` products.
 
 The current API already exposes the columns needed for read-only selection:
 
@@ -204,6 +207,7 @@ Then enable writeback in `config.json`:
 
 ```json
 {
+  "masterGasApiUrl": "https://script.google.com/macros/s/.../exec",
   "drive": {
     "folderId": "192M8W9aopop-k0H_xHMJBWkEVy3fK4eX",
     "duplicatePolicy": "skip",
@@ -212,7 +216,7 @@ Then enable writeback in `config.json`:
   "writeBack": {
     "enabled": true,
     "type": "gas",
-    "gasApiUrl": "https://script.google.com/macros/s/.../exec",
+    "gasApiUrl": "",
     "secretEnv": "MF_COLLECTOR_WRITE_SECRET"
   }
 }

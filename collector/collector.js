@@ -47,6 +47,7 @@ function parseArgs(argv) {
     reloadExistingPages: true,
     dryRun: false,
     writeBack: null,
+    useConfigProducts: false,
     refs: null,
   };
   for (let i = 2; i < argv.length; i += 1) {
@@ -64,6 +65,7 @@ function parseArgs(argv) {
     else if (arg === '--dry-run') args.dryRun = true;
     else if (arg === '--write-back') args.writeBack = true;
     else if (arg === '--no-write-back') args.writeBack = false;
+    else if (arg === '--use-config-products') args.useConfigProducts = true;
     else if (arg === '--config') args.config = argv[++i];
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
     else if (arg === '--refs') args.refs = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
@@ -170,6 +172,7 @@ function getWriteBackSettings(config, baseDir) {
   const gasApiUrl =
     writeBack.gasApiUrl ||
     process.env.MF_MASTER_WRITE_GAS_API_URL ||
+    config.masterGasApiUrl ||
     config.masterSource?.gasApiUrl ||
     findGasUrlFromAppConfig(baseDir);
 
@@ -291,11 +294,14 @@ async function fetchMasterProducts(config, baseDir, debug) {
   if (source.enabled === false) return null;
 
   const gasApiUrl =
-    source.gasApiUrl ||
     process.env.MF_MASTER_GAS_API_URL ||
+    config.masterGasApiUrl ||
+    source.gasApiUrl ||
     findGasUrlFromAppConfig(baseDir);
 
-  if (!gasApiUrl || gasApiUrl.includes('PASTE_YOUR')) return null;
+  if (!gasApiUrl || gasApiUrl.includes('PASTE_YOUR')) {
+    throw new Error('Master GAS API URL is required. Set MF_MASTER_GAS_API_URL or config.masterGasApiUrl. Use --use-config-products only for explicit local tests.');
+  }
 
   const url = gasJsonpUrl(gasApiUrl);
   if (debug) console.log(`[master] fetch ${url.replace(/_=\d+/, '_=<timestamp>')}`);
@@ -1116,7 +1122,11 @@ async function main() {
 
   const headless = args.authSetup ? false : args.headless === true ? true : args.headed ? false : config.headless !== false;
   const state = readJson(paths.stateFile, { products: {} });
-  const master = await fetchMasterProducts(config, baseDir, args.debug);
+  const useConfigProducts = args.useConfigProducts || config.masterSource?.enabled === false;
+  const master = useConfigProducts ? null : await fetchMasterProducts(config, baseDir, args.debug);
+  if (!master && !useConfigProducts) {
+    throw new Error('Master products are required for normal collector runs. Use --use-config-products only for explicit local tests.');
+  }
   const products = selectProducts(config, state, args.refs, master?.products || null);
 
   if (products.length === 0) {
