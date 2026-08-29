@@ -24,6 +24,7 @@ const MASTER_COLUMNS = {
   teaThumbnailStatus: '茶葉サムネイル状態',
   liqueurImageStatus: '水色画像状態',
   productUrl: '公式商品ページURL',
+  productUrlStatus: '公式商品ページURL状態',
 };
 const MIME_EXT = {
   'image/jpeg': '.jpg',
@@ -48,6 +49,7 @@ function parseArgs(argv) {
     dryRun: false,
     writeBack: null,
     useConfigProducts: false,
+    discoverUrlsOnly: false,
     refs: null,
   };
   for (let i = 2; i < argv.length; i += 1) {
@@ -66,6 +68,7 @@ function parseArgs(argv) {
     else if (arg === '--write-back') args.writeBack = true;
     else if (arg === '--no-write-back') args.writeBack = false;
     else if (arg === '--use-config-products') args.useConfigProducts = true;
+    else if (arg === '--discover-urls-only') args.discoverUrlsOnly = true;
     else if (arg === '--config') args.config = argv[++i];
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
     else if (arg === '--refs') args.refs = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
@@ -288,6 +291,47 @@ async function writeBackImageResults({ config, baseDir, product, result, debug }
   return result.writeBack;
 }
 
+async function writeBackProductPageUrl({ config, baseDir, product, discovery, debug }) {
+  const settings = getWriteBackSettings(config, baseDir);
+  if (!settings) return null;
+
+  const payload = {
+    action: 'updateProductPageUrl',
+    secret: settings.secret,
+    reference: product.reference,
+    product_page_url: discovery.url || '',
+    status: discovery.success ? 'available' : discovery.status || 'not_available',
+    error_message: discovery.error_message || '',
+  };
+
+  if (debug) {
+    console.log(`[url-writeback] ${product.reference} status=${payload.status} url=${payload.product_page_url}`);
+  }
+
+  const response = await fetch(settings.gasApiUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(formatWriteBackResponseError('Product URL writeback did not return JSON', settings, response, text));
+  }
+  if (!response.ok || data.ok === false) {
+    throw new Error(formatWriteBackResponseError(`Product URL writeback failed: ${data.error || responsePreview(text)}`, settings, response, text));
+  }
+  return {
+    success: true,
+    updated_at: nowIso(),
+    sheet_row: data.sheet_row || 0,
+    status: data.status || payload.status,
+    url: data.product_page_url || payload.product_page_url,
+  };
+}
+
 function parseJsonp(text, callbackName = '__mfCollectorCb') {
   const trimmed = text.trim();
   const prefix = `${callbackName}(`;
@@ -333,12 +377,14 @@ async function fetchMasterProducts(config, baseDir, debug) {
     .map((row) => {
       const reference = normalizeText(row[MASTER_COLUMNS.reference]);
       const productUrl = normalizeText(row[MASTER_COLUMNS.productUrl]);
-      if (!reference || !productUrl) return null;
+      if (!reference) return null;
       return {
         reference,
         name: normalizeText(row[MASTER_COLUMNS.name]) || normalizeText(row[MASTER_COLUMNS.fallbackName]),
         productUrl,
         master: {
+          productUrl,
+          productUrlStatus: normalizeImageStatus(row[MASTER_COLUMNS.productUrlStatus]),
           teaImageUrl: normalizeText(row[MASTER_COLUMNS.teaImageUrl]),
           teaThumbnailUrl: normalizeText(row[MASTER_COLUMNS.teaThumbnailUrl]),
           liqueurImageUrl: normalizeText(row[MASTER_COLUMNS.liqueurImageUrl]),
@@ -350,7 +396,10 @@ async function fetchMasterProducts(config, baseDir, debug) {
     })
     .filter(Boolean);
 
-  if (debug) console.log(`[master] rows=${payload.rows.length} productsWithUrls=${products.length} updatedAt=${payload.updatedAt || ''}`);
+  if (debug) {
+    const productsWithUrls = products.filter((product) => hasValue(product.productUrl)).length;
+    console.log(`[master] rows=${payload.rows.length} products=${products.length} productsWithUrls=${productsWithUrls} updatedAt=${payload.updatedAt || ''}`);
+  }
   return { products, updatedAt: payload.updatedAt || '', rowCount: payload.rows.length };
 }
 
@@ -505,6 +554,166 @@ async function getProductPage(context, product, { useExistingPages = false } = {
   const existing = context.pages().find((page) => pageMatchesProduct(page, product));
   if (existing && useExistingPages) return { page: existing, shouldClose: false, reused: true };
   return { page: await context.newPage(), shouldClose: true, reused: false };
+}
+
+function normalizeSearchTerm(value) {
+  return normalizeText(value)
+    .replace(/[®™]/g, '')
+    .replace(/[「」'"]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function productSearchQueries(product) {
+  const queries = [
+    normalizeText(product.reference),
+    normalizeSearchTerm(product.name),
+  ];
+  return [...new Set(queries.filter(Boolean))].slice(0, 4);
+}
+
+function productSearchUrl(query) {
+  const url = new URL('https://www.mariagefreres.com/fr/catalogsearch/result/');
+  url.searchParams.set('q', query);
+  return url.href;
+}
+
+function looksLikeProductUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname !== 'www.mariagefreres.com') return false;
+    if (!parsed.pathname.startsWith('/fr/')) return false;
+    if (!parsed.pathname.endsWith('.html')) return false;
+    if (/checkout|customer|catalogsearch|wishlist|review|contacts/i.test(parsed.pathname)) return false;
+    if (!/(^|-)t\d{2,5}([-.]|$)/i.test(parsed.pathname)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function collectProductSearchCandidates(page) {
+  return page.evaluate(() => {
+    const text = (node) => String(node?.innerText || node?.textContent || '').replace(/\s+/g, ' ').trim();
+    return [...document.querySelectorAll('a[href]')]
+      .map((anchor) => ({
+        href: anchor.href,
+        text: text(anchor),
+        closestText: text(anchor.closest('.product-item, li, article, .item, .product')),
+      }))
+      .filter((entry) => entry.href);
+  });
+}
+
+async function discoverProductPageUrl(context, product, config, debug) {
+  const page = await context.newPage();
+  const queries = productSearchQueries(product);
+  const seen = new Set();
+  const attempted = [];
+  const startedAt = nowIso();
+
+  try {
+    for (const query of queries) {
+      const searchUrl = productSearchUrl(query);
+      if (debug) console.log(`[url-search] ${product.reference} query=${query} ${searchUrl}`);
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
+      await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
+      await sleep(config.settleDelayMs || 2500);
+
+      const title = await page.title().catch(() => '');
+      const bodyText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+      if (/cloudflare|verify you are human|vérifiez que vous êtes humain|just a moment/i.test(`${title}\n${bodyText}`)) {
+        return {
+          success: false,
+          status: 'error',
+          method: 'official_search',
+          searched_queries: queries,
+          attempted_urls: attempted,
+          acquired_at: startedAt,
+          error_message: 'Official search is blocked by browser verification.',
+        };
+      }
+      if (/aucun résultat|aucun resultat|no results/i.test(bodyText)) {
+        if (debug) console.log(`[url-search-empty] ${product.reference} query=${query}`);
+        continue;
+      }
+
+      const candidates = await collectProductSearchCandidates(page);
+      const urls = candidates
+        .map((candidate) => candidate.href)
+        .filter((url) => looksLikeProductUrl(url))
+        .filter((url) => {
+          if (seen.has(url)) return false;
+          seen.add(url);
+          return true;
+        })
+        .slice(0, 10);
+
+      if (debug) {
+        console.log(`[url-candidates] ${product.reference} query=${query} count=${urls.length}`);
+        for (const url of urls) console.log(`[url-candidate] ${product.reference} ${url}`);
+      }
+
+      for (const url of urls) {
+        attempted.push(url);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
+        await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
+        await sleep(config.settleDelayMs || 2500);
+
+        const finalUrl = page.url();
+        const titleText = await page.title().catch(() => '');
+        const visibleText = await page.locator('body').innerText({ timeout: 8000 }).catch(() => '');
+        if (/cloudflare|verify you are human|vérifiez que vous êtes humain|just a moment/i.test(`${titleText}\n${visibleText}`)) {
+          return {
+            success: false,
+            status: 'error',
+            method: 'official_search',
+            searched_queries: queries,
+            attempted_urls: attempted,
+            acquired_at: startedAt,
+            error_message: 'Candidate product page is blocked by browser verification.',
+          };
+        }
+        if (referenceRegex(product.reference).test(visibleText)) {
+          if (debug) console.log(`[url-verified] ${product.reference} ${finalUrl}`);
+          return {
+            success: true,
+            status: 'available',
+            method: 'official_search',
+            url: finalUrl,
+            source_url: searchUrl,
+            searched_queries: queries,
+            attempted_urls: attempted,
+            acquired_at: startedAt,
+            error_message: '',
+          };
+        }
+        if (debug) console.log(`[url-rejected] ${product.reference} ${finalUrl}`);
+      }
+    }
+
+    return {
+      success: false,
+      status: 'not_available',
+      method: 'official_search',
+      searched_queries: queries,
+      attempted_urls: attempted,
+      acquired_at: startedAt,
+      error_message: 'No official product page with exact reference was verified.',
+    };
+  } catch (error) {
+    return {
+      success: false,
+      status: 'error',
+      method: 'official_search',
+      searched_queries: queries,
+      attempted_urls: attempted,
+      acquired_at: startedAt,
+      error_message: error.message,
+    };
+  } finally {
+    await page.close().catch(() => {});
+  }
 }
 
 async function createCdpNetworkCapture(page, debug) {
@@ -986,10 +1195,12 @@ function selectProducts(config, state, refs, sourceProducts = null) {
     : merged.filter((product) => {
         const localStatus = product.status || '';
         const masterStatus = product.master_status || 'pending';
+        const urlDiscoveryStatus = product.urlDiscovery?.status || product.master?.productUrlStatus || '';
         const status = hasMasterProducts && masterStatus !== 'complete' && localStatus === 'complete'
           ? masterStatus
           : localStatus || masterStatus;
         const retryCount = product.retry_count || 0;
+        if (!hasValue(product.productUrl) && urlDiscoveryStatus === 'not_available') return false;
         if (status === 'complete') return false;
         if (status === 'error' && retryCount >= maxRetries) return false;
         return ['pending', 'partial', 'retry', 'error'].includes(status) || product.master_status === 'partial';
@@ -1024,6 +1235,8 @@ function updateState(state, product, result, maxRetries, config = {}) {
     retry_count: retryCount,
     updated_at: nowIso(),
     last_error: result.error || '',
+    productUrl: product.productUrl || previous.productUrl || '',
+    urlDiscovery: result.urlDiscovery || previous.urlDiscovery || null,
     images: result.images,
     writeBack: result.writeBack || null,
   };
@@ -1055,6 +1268,8 @@ function logProductSummary(product, stateEntry) {
 
   console.log(JSON.stringify({
     reference: product.reference,
+    product_url: product.productUrl || '',
+    urlDiscovery: stateEntry.urlDiscovery?.status || '',
     tea: compactImageResult(tea),
     teaThumbnail: compactImageResult(teaThumbnail),
     liqueur: compactImageResult(liqueur),
@@ -1062,6 +1277,16 @@ function logProductSummary(product, stateEntry) {
     acquired_method: methods,
     drive: stateEntry.writeBack?.success ? 'ok' : '',
     error,
+  }));
+}
+
+function logUrlDiscoverySummary(product, result) {
+  console.log(JSON.stringify({
+    reference: product.reference,
+    product_url: result.urlDiscovery?.url || '',
+    urlDiscovery: result.urlDiscovery?.status || 'error',
+    status: result.status || 'retry',
+    error: result.error || result.urlDiscovery?.error_message || '',
   }));
 }
 
@@ -1217,6 +1442,105 @@ async function main() {
 
     for (let i = 0; i < products.length; i += 1) {
       const product = products[i];
+      const masterHasProductUrl = hasValue(product.master?.productUrl);
+      if (args.discoverUrlsOnly && masterHasProductUrl) {
+        const existingResult = {
+          urlDiscovery: {
+            success: true,
+            status: 'available',
+            method: 'master',
+            url: product.master.productUrl,
+            error_message: '',
+          },
+          status: product.status || product.master_status || 'pending',
+        };
+        logUrlDiscoverySummary(product, existingResult);
+        if (i < products.length - 1) {
+          const waitMs = randomDelay(config.pageDelayMs);
+          if (args.debug) console.log(`[delay] ${waitMs}ms`);
+          await sleep(waitMs);
+        }
+        continue;
+      }
+
+      if (!masterHasProductUrl) {
+        const discovery = hasValue(product.productUrl) && product.urlDiscovery?.status === 'available'
+          ? {
+              success: true,
+              status: 'available',
+              method: 'local_state',
+              url: product.productUrl,
+              source_url: '',
+              searched_queries: [],
+              attempted_urls: [],
+              acquired_at: nowIso(),
+              error_message: '',
+            }
+          : await discoverProductPageUrl(context, product, config, args.debug);
+        const previous = state.products?.[product.reference] || {};
+        const maxRetries = Number.isFinite(config.maxRetries) ? config.maxRetries : 3;
+        const discoveryRetryCount = discovery.success ? previous.retry_count || 0 : (previous.retry_count || product.retry_count || 0) + 1;
+        const discoveryStatusForState = discovery.success
+          ? 'available'
+          : discovery.status === 'not_available' && discoveryRetryCount >= maxRetries
+            ? 'not_available'
+            : 'error';
+        const discoveryForState = {
+          ...discovery,
+          status: discoveryStatusForState,
+          retry_count: discoveryRetryCount,
+        };
+        const discoveryResult = {
+          reference: product.reference,
+          pageUrl: '',
+          images: {},
+          successCount: 0,
+          urlDiscovery: discoveryForState,
+          error: discovery.success ? '' : discovery.error_message,
+        };
+
+        if (discovery.success) {
+          product.productUrl = discovery.url;
+        }
+
+        try {
+          await writeBackProductPageUrl({ config, baseDir, product, discovery: discoveryForState, debug: args.debug });
+        } catch (error) {
+          discoveryResult.error = discoveryResult.error
+            ? `${discoveryResult.error} | url writeback: ${error.message}`
+            : `url writeback: ${error.message}`;
+          discoveryResult.urlDiscovery = {
+            ...discoveryForState,
+            writeBack: { success: false, error_message: error.message, updated_at: nowIso() },
+          };
+          if (args.debug) console.log(`[url-writeback-failed] ${product.reference} ${error.message}`);
+        }
+
+        state.products = state.products || {};
+        if (args.discoverUrlsOnly || !discovery.success || (writeBackRequired(config) && discoveryResult.urlDiscovery?.writeBack?.success === false)) {
+          const status = discovery.success ? previous.status || 'pending' : discoveryRetryCount < maxRetries ? 'retry' : 'error';
+          state.products[product.reference] = {
+            ...previous,
+            status,
+            retry_count: discoveryRetryCount,
+            updated_at: nowIso(),
+            last_error: discoveryResult.error || '',
+            productUrl: product.productUrl || previous.productUrl || '',
+            urlDiscovery: discoveryResult.urlDiscovery,
+            images: previous.images || {},
+            writeBack: previous.writeBack || null,
+          };
+          writeJson(paths.stateFile, state);
+          logUrlDiscoverySummary(product, { ...discoveryResult, status });
+          if (i < products.length - 1) {
+            const waitMs = randomDelay(config.pageDelayMs);
+            if (args.debug) console.log(`[delay] ${waitMs}ms`);
+            await sleep(waitMs);
+          }
+          continue;
+        }
+      }
+
       const result = await processProduct({
         context,
         product,

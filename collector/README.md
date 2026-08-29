@@ -130,6 +130,8 @@ Selection rules:
 - An image is resolved when its URL column is populated, or when its matching status column is `not_available`.
 - Rows with some resolved images are treated as `partial`.
 - Rows with no resolved images are treated as `pending`.
+- Rows without `公式商品ページURL` are still eligible. The collector first searches the official site and writes the verified URL before collecting images.
+- If `公式商品ページURL状態` is `not_available`, the row is skipped until the status is manually cleared or changed.
 - Local `collector-state.json` can also mark a reference as `complete`, `partial`, `retry`, or `error`.
 - Each run processes at most `maxPerRun` products, default `5`.
 
@@ -139,6 +141,19 @@ Preview the next selected products without opening MARIAGE FRERES:
 npm run collect:images:dry-run
 ```
 
+To test only product URL discovery without image collection:
+
+```powershell
+node collector\collector.js --connect-cdp http://127.0.0.1:9222 --refs T2306,T238 --discover-urls-only --write-back
+```
+
+Product URL discovery uses the official site search in this order:
+
+1. T reference number.
+2. Current official name or black-book name.
+
+The collector never writes a guessed product URL. It opens candidate official product pages and writes `公式商品ページURL` only when the visible product page text contains the exact T reference, so `T230` and `T2301` cannot be confused.
+
 ## Drive Upload And Sheet Writeback
 
 The current Google Sheets columns are sufficient for image display writeback:
@@ -146,6 +161,7 @@ The current Google Sheets columns are sufficient for image display writeback:
 - `茶葉画像URL`
 - `水色画像URL`
 - `茶葉サムネイルURL`
+- `公式商品ページURL状態`
 - `茶葉画像状態`
 - `茶葉サムネイル状態`
 - `水色画像状態`
@@ -167,7 +183,7 @@ https://drive.google.com/thumbnail?id=<FILE_ID>&sz=w1200
 
 Then GAS writes those URLs back to the existing master row. It does not write official `media/catalog/product/cache/...` URLs to the master.
 
-Add `backend/mf-image-collector.gs` to the existing Apps Script project. Do not create a second top-level `doPost(e)` if the project already has one; route only `action === 'uploadImageResults'` to `mfImageCollectorDoPost(e)`. If `茶葉サムネイルURL` or the status columns are missing, the helper appends them once at the end of the master sheet.
+Add `backend/mf-image-collector.gs` to the existing Apps Script project. Do not create a second top-level `doPost(e)` if the project already has one; route only the collector actions to `mfImageCollectorDoPost(e)`. If `茶葉サムネイルURL` or the status columns are missing, the helper appends them once at the end of the master sheet.
 
 If the existing Apps Script has no `doPost(e)`, add this small dispatcher:
 
@@ -181,6 +197,14 @@ If it already has `doPost(e)`, add this branch near the top of the existing func
 
 ```javascript
 if (payload.action === 'uploadImageResults') {
+  return mfImageCollectorDoPost(e);
+}
+```
+
+The same dispatcher must also route URL discovery writeback:
+
+```javascript
+if (payload.action === 'updateProductPageUrl') {
   return mfImageCollectorDoPost(e);
 }
 ```
@@ -339,6 +363,7 @@ Safety behavior:
 - If CDP Chrome is not available, `run-cdp-once.ps1` exits before starting Node and before touching Sheets.
 - If a previous collector run is still active, the next run exits without starting a second collector process.
 - The scheduled task uses `MultipleInstances IgnoreNew`.
+- The scheduled task is persistent. The collector does not delete or unregister it when there are no pending rows.
 - If the PC is asleep, Task Scheduler can run the missed task after wake because `StartWhenAvailable` is enabled.
 - If Cloudflare verification appears again, the product is marked as an error for that run; the collector does not loop or repeatedly reload forever.
 - During manual start, if the initial run reports Cloudflare verification or another collector error, the hourly task is not registered. Complete verification in the dedicated Chrome window and run `画像回収_開始.bat` again.

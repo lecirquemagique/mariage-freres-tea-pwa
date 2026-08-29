@@ -14,10 +14,13 @@ var MF_IMAGE_COLLECTOR_SECRET_PROPERTY = 'MF_COLLECTOR_WRITE_SECRET';
 function mfImageCollectorDoPost(e) {
   try {
     var payload = JSON.parse((e && e.postData && e.postData.contents) || '{}');
-    if (payload.action !== 'uploadImageResults') {
-      return mfImageCollectorJson_({ ok: false, error: 'Unsupported action.' });
+    if (payload.action === 'uploadImageResults') {
+      return mfImageCollectorJson_(mfImageCollectorUploadImageResults_(payload));
     }
-    return mfImageCollectorJson_(mfImageCollectorUploadImageResults_(payload));
+    if (payload.action === 'updateProductPageUrl') {
+      return mfImageCollectorJson_(mfImageCollectorUpdateProductPageUrl_(payload));
+    }
+    return mfImageCollectorJson_({ ok: false, error: 'Unsupported action.' });
   } catch (error) {
     return mfImageCollectorJson_({ ok: false, error: String(error && error.message || error) });
   }
@@ -159,13 +162,78 @@ function mfImageCollectorMakeFilesDisplayable(fileIds) {
   return updated;
 }
 
-function mfImageCollectorUpdateSheet_(reference, images) {
+function mfImageCollectorOpenSpreadsheet_() {
   var spreadsheetId = PropertiesService.getScriptProperties().getProperty('MF_MASTER_SPREADSHEET_ID');
   if (!spreadsheetId && typeof SPREADSHEET_ID !== 'undefined') {
     spreadsheetId = SPREADSHEET_ID;
   }
   var ss = spreadsheetId ? SpreadsheetApp.openById(spreadsheetId) : SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) throw new Error('Spreadsheet not found. Bind this script, define SPREADSHEET_ID, or set MF_MASTER_SPREADSHEET_ID.');
+  return ss;
+}
+
+function mfImageCollectorUpdateProductPageUrl_(payload) {
+  mfImageCollectorAssertSecret_(payload);
+
+  var reference = String(payload.reference || '').trim();
+  if (!reference) throw new Error('reference is required.');
+
+  var status = mfImageCollectorNormalizeStatus_(payload.status);
+  var productPageUrl = String(payload.product_page_url || '').trim();
+  if (status === 'available') {
+    if (!productPageUrl) throw new Error('product_page_url is required when status is available.');
+    if (productPageUrl.indexOf('https://www.mariagefreres.com/fr/') !== 0) {
+      throw new Error('Unexpected product_page_url host.');
+    }
+    if (!mfImageCollectorUrlHasExactReference_(productPageUrl, reference)) {
+      throw new Error('product_page_url does not contain the exact reference.');
+    }
+  }
+
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('Sheet has no data rows.');
+
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var refCol = headers.indexOf('Tリファレンス番号');
+  var productUrlCol = headers.indexOf('公式商品ページURL');
+  var productUrlStatusCol = mfImageCollectorEnsureHeader_(sheet, headers, '公式商品ページURL状態');
+  if (refCol < 0 || productUrlCol < 0) throw new Error('Required product URL columns are missing.');
+
+  var rowIndex = -1;
+  for (var i = 1; i < values.length; i += 1) {
+    if (String(values[i][refCol]).trim() === reference) {
+      rowIndex = i;
+      break;
+    }
+  }
+  if (rowIndex < 0) throw new Error('Reference not found: ' + reference);
+
+  if (status === 'available') {
+    sheet.getRange(rowIndex + 1, productUrlCol + 1).setValue(productPageUrl);
+  }
+  sheet.getRange(rowIndex + 1, productUrlStatusCol + 1).setValue(status);
+
+  return {
+    ok: true,
+    reference: reference,
+    sheet_row: rowIndex + 1,
+    product_page_url: status === 'available' ? productPageUrl : '',
+    status: status
+  };
+}
+
+function mfImageCollectorUrlHasExactReference_(url, reference) {
+  var escaped = String(reference || '').toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  var re = new RegExp('(^|[^a-z0-9])' + escaped + '([^a-z0-9]|$)', 'i');
+  return re.test(String(url || '').toLowerCase());
+}
+
+function mfImageCollectorUpdateSheet_(reference, images) {
+  var ss = mfImageCollectorOpenSpreadsheet_();
 
   var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
   if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);

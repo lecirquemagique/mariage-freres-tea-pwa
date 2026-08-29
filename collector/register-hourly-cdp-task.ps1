@@ -23,13 +23,18 @@ if ($WriteBack) {
 }
 
 $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $Argument -WorkingDirectory $Root
-$Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Hours 1)
+$Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Days 3650)
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 $Settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 45)
 
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force | Out-Null
+$RegisteredTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+$RegisteredInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
 
 Write-Host "Registered scheduled task: $TaskName"
+Write-Host "State: $($RegisteredTask.State)"
+Write-Host "LastTaskResult: $($RegisteredInfo.LastTaskResult)"
+Write-Host "NextRunTime: $($RegisteredInfo.NextRunTime)"
 Write-Host "Root: $Root"
 Write-Host "CDP endpoint: $CdpEndpoint"
 Write-Host "Node: $NodeExe"
