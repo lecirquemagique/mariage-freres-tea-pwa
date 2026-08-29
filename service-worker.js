@@ -1,4 +1,4 @@
-const CACHE = 'mf-tea-pwa-v1-2';
+const CACHE = 'mf-tea-pwa-v1-1';
 const CORE = [
   './',
   './index.html',
