@@ -10,6 +10,17 @@
     "type": "gas_jsonp",
     "gasApiUrl": ""
   },
+  "drive": {
+    "folderId": "192M8W9aopop-k0H_xHMJBWkEVy3fK4eX",
+    "duplicatePolicy": "skip",
+    "urlSize": "w1200"
+  },
+  "writeBack": {
+    "enabled": false,
+    "type": "gas",
+    "gasApiUrl": "",
+    "secretEnv": "MF_COLLECTOR_WRITE_SECRET"
+  },
   "headless": false,
   "maxPerRun": 5,
   "maxRetries": 3,

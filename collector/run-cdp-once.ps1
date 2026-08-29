@@ -1,7 +1,8 @@
 param(
   [string]$Root = "",
   [string]$CdpEndpoint = "http://127.0.0.1:9222",
-  [switch]$Debug
+  [switch]$Debug,
+  [switch]$WriteBack
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,6 +23,8 @@ $args = @("collector\collector.js", "--connect-cdp", $CdpEndpoint)
 if ($Debug) {
   $args += "--debug"
 }
+if ($WriteBack) {
+  $args += "--write-back"
+}
 
 node @args
-

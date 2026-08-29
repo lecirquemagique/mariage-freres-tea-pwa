@@ -1,20 +1,26 @@
 # MARIAGE FRERES Image Collector
 
-This collector is intentionally separate from the PWA. It opens official MARIAGE FRERES product pages with Playwright, keeps a collector-only persistent browser profile, and records image acquisition metadata that can later be joined back to the tea master fields `茶葉画像URL` and `水色画像URL`.
+This collector is intentionally separate from the PWA. It opens official MARIAGE FRERES product pages with Playwright, keeps a collector-only persistent browser profile, and records image acquisition metadata.
+
+Official MARIAGE FRERES image URLs are kept only in local audit logs. The tea master should receive Google Drive thumbnail URLs generated from images uploaded to the existing Drive folder:
+
+```text
+192M8W9aopop-k0H_xHMJBWkEVy3fK4eX
+```
 
 By default `config.example.json` uses Playwright's `channel: "chrome"` so Windows can launch the locally installed Google Chrome. The profile directory is `browser-profile` inside the collector working folder; it does not use or modify your normal Chrome profile.
 
 ## Setup
 
 ```powershell
-cd C:\MF-Image-Collector
+cd C:\Users\nobuy\Documents\Codex\2026-08-29\github-main-feature-mf-image-collector\work\repo
 npm install
 copy collector\config.example.json config.json
 ```
 
 `package.json` includes the required `playwright` dependency. When `browserChannel` is set to `chrome`, Playwright uses installed Google Chrome and does not need to download bundled Chromium for normal local runs.
 
-No API keys or credentials are required by the collector. Keep `.env`, browser profiles, logs, and downloaded images out of Git.
+Keep `.env`, browser profiles, logs, and downloaded images out of Git.
 
 ## First Chrome Verification Setup
 
@@ -24,7 +30,7 @@ Run this once in a normal Windows console:
 node collector\collector.js --config config.json --browser-channel chrome --auth-setup --debug --refs T2301,T2302
 ```
 
-Chrome opens with the collector-only persistent profile at `C:\MF-Image-Collector\browser-profile`. Complete any MARIAGE FRERES or Cloudflare verification in that window. When the real product page is visible, press Enter in the console. Cookies, local storage, cache, and browser state remain in the collector profile for later runs.
+Chrome opens with the collector-only persistent profile at `browser-profile` inside this working folder. Complete any MARIAGE FRERES or Cloudflare verification in that window. When the real product page is visible, press Enter in the console. Cookies, local storage, cache, and browser state remain in the collector profile for later runs.
 
 Do not point `profileDir` at your everyday Chrome user data directory.
 
@@ -109,29 +115,99 @@ Preview the next selected products without opening MARIAGE FRERES:
 npm run collect:images:dry-run
 ```
 
-## Proposed Master/API Additions
+## Drive Upload And Sheet Writeback
 
-No Google Sheets columns or GAS API behavior are changed by this collector yet.
-
-To write results back later, add either a GAS endpoint or a separate import workflow that updates the existing columns:
+The current Google Sheets columns are sufficient for image display writeback:
 
 - `茶葉画像URL`
 - `水色画像URL`
-- `公式商品ページURL` if missing or corrected
 
-Recommended optional audit columns, pending approval:
+The collector can POST acquired local images to a GAS endpoint. GAS saves the files to Drive, avoids duplicate file names according to `duplicatePolicy`, generates URLs such as:
+
+```text
+https://drive.google.com/thumbnail?id=<FILE_ID>&sz=w1200
+```
+
+Then GAS writes those URLs back to the existing master row. It does not write official `media/catalog/product/cache/...` URLs to the master.
+
+Add `backend/mf-image-collector.gs` to the existing Apps Script project. If the project already has `doPost(e)`, do not create a second dispatcher; route only `action === 'uploadImageResults'` to `mfImageCollectorDoPost(e)`.
+
+In Apps Script project settings, set this Script Property:
+
+```text
+MF_COLLECTOR_WRITE_SECRET=<long random secret>
+```
+
+If the Apps Script is not bound to the tea master spreadsheet, also set:
+
+```text
+MF_MASTER_SPREADSHEET_ID=1QPMtFh4-FpeHuhA9ymYVJfwiXiNZhXUcNjgf0lrFO-0
+```
+
+In local PowerShell, store the same secret outside Git:
+
+```powershell
+$env:MF_COLLECTOR_WRITE_SECRET = "<same long random secret>"
+```
+
+Then enable writeback in `config.json`:
+
+```json
+{
+  "drive": {
+    "folderId": "192M8W9aopop-k0H_xHMJBWkEVy3fK4eX",
+    "duplicatePolicy": "skip",
+    "urlSize": "w1200"
+  },
+  "writeBack": {
+    "enabled": true,
+    "type": "gas",
+    "gasApiUrl": "https://script.google.com/macros/s/.../exec",
+    "secretEnv": "MF_COLLECTOR_WRITE_SECRET"
+  }
+}
+```
+
+Or keep `config.json` disabled and enable it only for a specific run:
+
+```powershell
+node collector\collector.js --connect-cdp http://127.0.0.1:9222 --refs T2301 --write-back
+```
+
+For normal hourly operation after the one-reference proof:
+
+```powershell
+npm run collect:images:cdp:writeback
+```
+
+`duplicatePolicy: "skip"` reuses an existing same-name file ID. `duplicatePolicy: "replace"` trashes same-name files and creates one replacement file, then rewrites the sheet URL to the new file ID.
+
+For files that were uploaded before this GAS helper was installed, run this in Apps Script to repair display sharing:
+
+```javascript
+mfImageCollectorMakeFilesDisplayable([
+  '160QxKNVXlCykueIiLeoFFmXreN4GiUwY',
+  '122387L-Kie1iOmoie1_edXxANxL0FxY9'
+]);
+```
+
+Confirmed one-reference proof on 2026-08-29:
+
+- T2301 images were acquired locally.
+- `T2301_tea.jpg` was uploaded to Drive file ID `160QxKNVXlCykueIiLeoFFmXreN4GiUwY`.
+- `T2301_liqueur.jpg` was uploaded to Drive file ID `122387L-Kie1iOmoie1_edXxANxL0FxY9`.
+- The master row for T2301 was updated:
+  - `茶葉画像URL`: `https://drive.google.com/thumbnail?id=160QxKNVXlCykueIiLeoFFmXreN4GiUwY&sz=w1200`
+  - `水色画像URL`: `https://drive.google.com/thumbnail?id=122387L-Kie1iOmoie1_edXxANxL0FxY9&sz=w1200`
+- The PWA reads these URLs into the T2301 image elements. Anonymous visual loading still requires Drive link-sharing to be enabled on the files.
+
+Recommended optional audit columns, not required for the current writeback:
 
 - `画像取得ステータス`
 - `画像取得日時`
 - `画像取得方法`
 - `画像取得エラー`
 - `画像取得リトライ回数`
-
-Recommended GAS action, pending approval:
-
-- `action=updateImageResults`
-- Input: reference, tea URL/path, liqueur URL/path, methods, dimensions, MIME types, status, error
-- Behavior: update only the matching reference row and only approved image/audit columns
 
 ## Test Run After Verification
 
@@ -166,7 +242,7 @@ This supports using a persistent headed Chrome profile for the first run. Once t
 The collector exits after processing at most `maxPerRun` products. Schedule this command in Windows Task Scheduler every hour:
 
 ```powershell
-.\collector\register-hourly-cdp-task.ps1
+.\collector\register-hourly-cdp-task.ps1 -WriteBack
 ```
 
 The scheduled task calls `collector\run-cdp-once.ps1`, which checks that `http://127.0.0.1:9222` is available, then runs one collector pass. Keep the manual CDP Chrome open with `collector\start-chrome-cdp.ps1`.

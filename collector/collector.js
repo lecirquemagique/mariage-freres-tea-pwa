@@ -7,6 +7,7 @@ const { chromium } = require('playwright');
 
 const DEFAULT_CONFIG = 'config.json';
 const IMAGE_TYPES = ['tea', 'liqueur'];
+const DRIVE_THUMBNAIL_SIZE = 'w1200';
 const MASTER_COLUMNS = {
   reference: 'Tリファレンス番号',
   name: '現在の公式名',
@@ -36,6 +37,7 @@ function parseArgs(argv) {
     useExistingPages: false,
     reloadExistingPages: true,
     dryRun: false,
+    writeBack: null,
     refs: null,
   };
   for (let i = 2; i < argv.length; i += 1) {
@@ -51,6 +53,8 @@ function parseArgs(argv) {
     else if (arg === '--use-existing-pages') args.useExistingPages = true;
     else if (arg === '--no-reload-existing-pages') args.reloadExistingPages = false;
     else if (arg === '--dry-run') args.dryRun = true;
+    else if (arg === '--write-back') args.writeBack = true;
+    else if (arg === '--no-write-back') args.writeBack = false;
     else if (arg === '--config') args.config = argv[++i];
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
     else if (arg === '--refs') args.refs = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
@@ -130,6 +134,107 @@ function gasJsonpUrl(baseUrl) {
   url.searchParams.set('callback', '__mfCollectorCb');
   url.searchParams.set('_', String(Date.now()));
   return url.href;
+}
+
+function driveThumbnailUrl(fileId, size = DRIVE_THUMBNAIL_SIZE) {
+  return `https://drive.google.com/thumbnail?id=${encodeURIComponent(fileId)}&sz=${encodeURIComponent(size)}`;
+}
+
+function getWriteBackSettings(config, baseDir) {
+  const writeBack = config.writeBack || {};
+  if (writeBack.enabled !== true) return null;
+
+  const gasApiUrl =
+    writeBack.gasApiUrl ||
+    process.env.MF_MASTER_WRITE_GAS_API_URL ||
+    config.masterSource?.gasApiUrl ||
+    findGasUrlFromAppConfig(baseDir);
+
+  if (!gasApiUrl) throw new Error('writeBack.enabled is true, but no GAS API URL is configured.');
+
+  const secretEnv = writeBack.secretEnv || 'MF_COLLECTOR_WRITE_SECRET';
+  const secret = process.env[secretEnv] || '';
+  if (!secret) throw new Error(`writeBack.enabled is true, but ${secretEnv} is not set.`);
+
+  return {
+    gasApiUrl,
+    secret,
+    folderId: config.drive?.folderId || writeBack.folderId || '',
+    duplicatePolicy: config.drive?.duplicatePolicy || writeBack.duplicatePolicy || 'skip',
+    urlSize: config.drive?.urlSize || writeBack.urlSize || DRIVE_THUMBNAIL_SIZE,
+  };
+}
+
+function encodeImageForWriteBack(row, imageType) {
+  if (!row?.success || !row.file_path || !fs.existsSync(row.file_path)) return null;
+  return {
+    image_type: imageType,
+    file_name: path.basename(row.file_path),
+    mime_type: row.mime_type || 'application/octet-stream',
+    width: row.width || 0,
+    height: row.height || 0,
+    acquired_method: row.acquired_method || '',
+    data_base64: fs.readFileSync(row.file_path).toString('base64'),
+  };
+}
+
+async function writeBackImageResults({ config, baseDir, product, result, debug }) {
+  const settings = getWriteBackSettings(config, baseDir);
+  if (!settings) return null;
+
+  const images = IMAGE_TYPES
+    .map((imageType) => encodeImageForWriteBack(result.images?.[imageType], imageType))
+    .filter(Boolean);
+
+  if (images.length === 0) {
+    if (debug) console.log(`[writeback] ${product.reference} skipped: no successful local images`);
+    return null;
+  }
+
+  const payload = {
+    action: 'uploadImageResults',
+    secret: settings.secret,
+    reference: product.reference,
+    folder_id: settings.folderId,
+    duplicate_policy: settings.duplicatePolicy,
+    url_size: settings.urlSize,
+    images,
+  };
+
+  if (debug) {
+    console.log(`[writeback] ${product.reference} uploading ${images.map((image) => image.file_name).join(', ')}`);
+  }
+
+  const response = await fetch(settings.gasApiUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Writeback did not return JSON. HTTP ${response.status}: ${text.slice(0, 300)}`);
+  }
+  if (!response.ok || data.ok === false) {
+    throw new Error(`Writeback failed. HTTP ${response.status}: ${data.error || text.slice(0, 300)}`);
+  }
+
+  for (const image of data.images || []) {
+    const row = result.images?.[image.image_type];
+    if (!row) continue;
+    row.drive_file_id = image.file_id || '';
+    row.drive_url = image.url || (image.file_id ? driveThumbnailUrl(image.file_id, settings.urlSize) : '');
+    row.drive_action = image.action || '';
+  }
+  result.writeBack = {
+    success: true,
+    updated_at: nowIso(),
+    sheet_row: data.sheet_row || 0,
+    images: data.images || [],
+  };
+  return result.writeBack;
 }
 
 function parseJsonp(text, callbackName = '__mfCollectorCb') {
@@ -671,10 +776,12 @@ async function processProduct({
       }
     }
 
-    fs.writeFileSync(
-      path.join(paths.logsDir, `${product.reference}-candidates-${startedAt}.json`),
-      JSON.stringify({ product, title, domCandidates, cacheCandidates, networkCandidates }, null, 2)
-    );
+    if (debug) {
+      fs.writeFileSync(
+        path.join(paths.logsDir, `${product.reference}-candidates-${startedAt}.json`),
+        JSON.stringify({ product, title, domCandidates, cacheCandidates, networkCandidates }, null, 2)
+      );
+    }
 
     for (const imageType of IMAGE_TYPES) {
       const candidate = pickCandidate(allCandidates, product, imageType);
@@ -749,7 +856,8 @@ function productImageStatus(product) {
 
 function selectProducts(config, state, refs, sourceProducts = null) {
   const maxRetries = Number.isFinite(config.maxRetries) ? config.maxRetries : 3;
-  const productList = sourceProducts?.length ? sourceProducts : config.products || [];
+  const hasMasterProducts = Boolean(sourceProducts?.length);
+  const productList = hasMasterProducts ? sourceProducts : config.products || [];
   const merged = productList.map((product) => {
     const localState = state.products?.[product.reference] || {};
     const masterStatus = productImageStatus(product);
@@ -763,7 +871,11 @@ function selectProducts(config, state, refs, sourceProducts = null) {
   const filtered = refs?.length
     ? merged.filter((product) => refs.includes(product.reference))
     : merged.filter((product) => {
-        const status = product.status || product.master_status || 'pending';
+        const localStatus = product.status || '';
+        const masterStatus = product.master_status || 'pending';
+        const status = hasMasterProducts && masterStatus !== 'complete' && localStatus === 'complete'
+          ? masterStatus
+          : localStatus || masterStatus;
         const retryCount = product.retry_count || 0;
         if (status === 'complete') return false;
         if (status === 'error' && retryCount >= maxRetries) return false;
@@ -772,12 +884,21 @@ function selectProducts(config, state, refs, sourceProducts = null) {
   return filtered.slice(0, refs?.length ? refs.length : config.maxPerRun || 5);
 }
 
-function updateState(state, product, result, maxRetries) {
+function writeBackRequired(config) {
+  return config.writeBack?.enabled === true;
+}
+
+function resultIsComplete(result, config) {
+  return result.successCount === 2 && (!writeBackRequired(config) || result.writeBack?.success === true);
+}
+
+function updateState(state, product, result, maxRetries, config = {}) {
   state.products = state.products || {};
   const previous = state.products[product.reference] || {};
-  const retryCount = result.successCount === 2 ? previous.retry_count || 0 : (previous.retry_count || product.retry_count || 0) + 1;
+  const complete = resultIsComplete(result, config);
+  const retryCount = complete ? previous.retry_count || 0 : (previous.retry_count || product.retry_count || 0) + 1;
   let status = 'error';
-  if (result.successCount === 2) status = 'complete';
+  if (complete) status = 'complete';
   else if (result.successCount === 1) status = 'partial';
   else if (retryCount < maxRetries) status = 'retry';
 
@@ -787,6 +908,7 @@ function updateState(state, product, result, maxRetries) {
     updated_at: nowIso(),
     last_error: result.error || '',
     images: result.images,
+    writeBack: result.writeBack || null,
   };
 }
 
@@ -810,6 +932,7 @@ function logProductSummary(product, stateEntry) {
     })
     .filter(Boolean)
     .join(' | ');
+  const error = errors || stateEntry.last_error || stateEntry.writeBack?.error_message || '';
 
   console.log(JSON.stringify({
     reference: product.reference,
@@ -817,7 +940,8 @@ function logProductSummary(product, stateEntry) {
     liqueur: compactImageResult(liqueur),
     status: stateEntry.status,
     acquired_method: methods,
-    error: errors,
+    drive: stateEntry.writeBack?.success ? 'ok' : '',
+    error,
   }));
 }
 
@@ -876,6 +1000,9 @@ async function main() {
   const fallbackConfigPath = path.join(baseDir, 'collector', 'config.example.json');
   const config = readJson(configPath, readJson(fallbackConfigPath));
   if (!config) throw new Error(`Config not found: ${configPath}`);
+  if (args.writeBack !== null) {
+    config.writeBack = { ...(config.writeBack || {}), enabled: args.writeBack };
+  }
 
   const paths = {
     profileDir: resolveProjectPath(baseDir, config.profileDir || 'browser-profile'),
@@ -976,7 +1103,14 @@ async function main() {
         reloadExistingPages: args.reloadExistingPages,
         keepPagesOpen: Boolean(args.connectCdp),
       });
-      updateState(state, product, result, Number.isFinite(config.maxRetries) ? config.maxRetries : 3);
+      try {
+        await writeBackImageResults({ config, baseDir, product, result, debug: args.debug });
+      } catch (error) {
+        result.writeBack = { success: false, error_message: error.message, updated_at: nowIso() };
+        result.error = result.error ? `${result.error} | writeback: ${error.message}` : `writeback: ${error.message}`;
+        if (args.debug) console.log(`[writeback-failed] ${product.reference} ${error.message}`);
+      }
+      updateState(state, product, result, Number.isFinite(config.maxRetries) ? config.maxRetries : 3, config);
       writeJson(paths.stateFile, state);
       logProductSummary(product, state.products[product.reference]);
 
