@@ -13,6 +13,8 @@ const IMAGE_TYPE_FOLDERS = {
   liqueur: 'liqueur',
 };
 const DRIVE_THUMBNAIL_SIZE = 'w1200';
+const PRODUCT_URL_DISCOVERY_VERSION = 'official-search-fr-en-jp-v1';
+const PRODUCT_URL_NOT_FOUND_MESSAGE = 'No official product page with exact reference was verified.';
 const MASTER_COLUMNS = {
   reference: 'Tリファレンス番号',
   name: '現在の公式名',
@@ -173,7 +175,16 @@ function isDiscoveryNotFoundResult(discovery) {
   const status = normalizeProductUrlStatus(discovery?.status);
   if (status === 'not_found') return true;
   return status === 'error' &&
-    normalizeText(discovery?.error_message) === 'No official product page with exact reference was verified.';
+    normalizeText(discovery?.error_message) === PRODUCT_URL_NOT_FOUND_MESSAGE;
+}
+
+function isCurrentDiscoveryNotFoundResult(discovery) {
+  return isDiscoveryNotFoundResult(discovery) &&
+    normalizeText(discovery?.discovery_version) === PRODUCT_URL_DISCOVERY_VERSION;
+}
+
+function hasLegacyDiscoveryNotFoundResult(discovery) {
+  return isDiscoveryNotFoundResult(discovery) && !isCurrentDiscoveryNotFoundResult(discovery);
 }
 
 function gasJsonpUrl(baseUrl) {
@@ -484,6 +495,22 @@ function isColorLiqueurCandidate(candidate) {
     /color_liqueur/i.test(candidateHaystack(candidate));
 }
 
+function candidateContextText(candidate) {
+  return [
+    candidate.alt,
+    candidate.title,
+    candidate.id,
+    candidate.className,
+    candidate.closestText,
+    candidate.sectionText,
+  ].join(' ').toLowerCase();
+}
+
+function isProductContextLiqueurCandidate(candidate) {
+  if (!isColorLiqueurCandidate(candidate)) return false;
+  return /liqueur|liquor|liquore|couleur de la liqueur|color of the liqueur|水色/.test(candidateContextText(candidate));
+}
+
 function isCatalogProductCandidate(candidate) {
   return /media\/catalog\/product/i.test(candidate.url || '') ||
     /media\/catalog\/product/i.test(candidateHaystack(candidate));
@@ -606,7 +633,7 @@ function loadDiscoveryCache(filePath) {
 function discoveryCacheCandidates(cache, product) {
   const reference = String(product.reference || '').toUpperCase();
   return Object.values(cache.images || {})
-    .filter((entry) => entry.reference === reference && ['url_ref_exact', 'current_verified_page'].includes(entry.verification_status))
+    .filter((entry) => entry.reference === reference && ['url_ref_exact', 'current_verified_product_page'].includes(entry.verification_status))
     .map((entry) => ({
       sourceKind: 'discovery_cache',
       url: entry.source_url,
@@ -631,8 +658,9 @@ function updateDiscoveryCache({ cache, candidates, product, pageUrl, masterRefer
     let reference = info.reference;
     let verificationStatus = 'url_ref_exact';
     if (info.imageType === 'liqueur') {
+      if (!isProductContextLiqueurCandidate(candidate)) continue;
       reference = String(product.reference || '').toUpperCase();
-      verificationStatus = 'current_verified_page';
+      verificationStatus = 'current_verified_product_page';
     }
     if (!reference || !masterReferences.has(reference)) continue;
 
@@ -755,6 +783,7 @@ async function discoverProductPageUrl(context, product, config, debug) {
           return {
             success: false,
             status: 'error',
+            discovery_version: PRODUCT_URL_DISCOVERY_VERSION,
             method: 'official_search',
             searched_queries: queries,
             attempted_urls: attempted,
@@ -796,6 +825,7 @@ async function discoverProductPageUrl(context, product, config, debug) {
             return {
               success: false,
               status: 'error',
+              discovery_version: PRODUCT_URL_DISCOVERY_VERSION,
               method: 'official_search',
               searched_queries: queries,
               attempted_urls: attempted,
@@ -808,6 +838,7 @@ async function discoverProductPageUrl(context, product, config, debug) {
             return {
               success: true,
               status: 'available',
+              discovery_version: PRODUCT_URL_DISCOVERY_VERSION,
               method: 'official_search',
               url: finalUrl,
               source_url: searchUrl,
@@ -825,16 +856,18 @@ async function discoverProductPageUrl(context, product, config, debug) {
     return {
       success: false,
       status: 'not_found',
+      discovery_version: PRODUCT_URL_DISCOVERY_VERSION,
       method: 'official_search',
       searched_queries: queries,
       attempted_urls: attempted,
       acquired_at: startedAt,
-      error_message: 'No official product page with exact reference was verified.',
+      error_message: PRODUCT_URL_NOT_FOUND_MESSAGE,
     };
   } catch (error) {
     return {
       success: false,
       status: 'error',
+      discovery_version: PRODUCT_URL_DISCOVERY_VERSION,
       method: 'official_search',
       searched_queries: queries,
       attempted_urls: attempted,
@@ -1339,14 +1372,20 @@ function selectProducts(config, state, refs, sourceProducts = null) {
   for (const product of merged) {
     const localStatus = product.status || '';
     const masterStatus = product.master_status || 'pending';
-    const urlDiscoveryStatus = isDiscoveryNotFoundResult(product.urlDiscovery)
+    const currentUrlNotFound = isCurrentDiscoveryNotFoundResult(product.urlDiscovery);
+    const legacyUrlNotFound = hasLegacyDiscoveryNotFoundResult(product.urlDiscovery);
+    const urlDiscoveryStatus = currentUrlNotFound
       ? 'not_found'
-      : normalizeProductUrlStatus(product.urlDiscovery?.status) || product.master?.productUrlStatus || '';
+      : legacyUrlNotFound
+        ? ''
+        : normalizeProductUrlStatus(product.urlDiscovery?.status) || '';
     const status = hasMasterProducts && masterStatus !== 'complete' && localStatus === 'complete'
       ? masterStatus
-      : localStatus || masterStatus;
+      : legacyUrlNotFound
+        ? masterStatus
+        : localStatus || masterStatus;
     const retryCount = product.retry_count || 0;
-    if (!hasValue(product.productUrl) && (urlDiscoveryStatus === 'not_found' || localStatus === 'not_found')) continue;
+    if (!hasValue(product.productUrl) && (urlDiscoveryStatus === 'not_found' || (localStatus === 'not_found' && currentUrlNotFound))) continue;
     if (status === 'complete' || status === 'not_found') continue;
 
     const isRetry = status === 'retry' || status === 'error';
@@ -1374,11 +1413,12 @@ function selectProducts(config, state, refs, sourceProducts = null) {
 function productScheduleStatus(product) {
   const localStatus = product.status || '';
   const masterStatus = product.master_status || productImageStatus(product);
-  const urlDiscoveryStatus = isDiscoveryNotFoundResult(product.urlDiscovery)
+  if (hasLegacyDiscoveryNotFoundResult(product.urlDiscovery)) return 'legacy_not_found_recheck';
+  const urlDiscoveryStatus = isCurrentDiscoveryNotFoundResult(product.urlDiscovery)
     ? 'not_found'
-    : normalizeProductUrlStatus(product.urlDiscovery?.status) || product.master?.productUrlStatus || '';
+    : normalizeProductUrlStatus(product.urlDiscovery?.status) || '';
   if (masterStatus === 'complete' || localStatus === 'complete') return 'complete';
-  if (localStatus === 'not_found') return 'not_found';
+  if (localStatus === 'not_found' && isCurrentDiscoveryNotFoundResult(product.urlDiscovery)) return 'not_found';
   if (!hasValue(product.productUrl) && urlDiscoveryStatus === 'not_found') return 'not_found';
   if (localStatus === 'retry') return 'retry';
   if (localStatus === 'error') return 'error';
@@ -1411,6 +1451,7 @@ function buildStatusSummary(config, state, master, products, discoveryCache = nu
     complete: 0,
     pending: 0,
     not_found: 0,
+    legacy_not_found_recheck: 0,
     retry: 0,
     error: 0,
     partial: 0,
@@ -1438,7 +1479,10 @@ function buildStatusSummary(config, state, master, products, discoveryCache = nu
       product_url: product.productUrl || '',
       master_status: product.master_status || 'pending',
       state_status: state.products?.[product.reference]?.status || '',
-      url_discovery_status: normalizeProductUrlStatus(product.urlDiscovery?.status) || product.master?.productUrlStatus || '',
+      url_discovery_status: hasLegacyDiscoveryNotFoundResult(product.urlDiscovery)
+        ? 'legacy_not_found_recheck'
+        : normalizeProductUrlStatus(product.urlDiscovery?.status) || product.master?.productUrlStatus || '',
+      discovery_version: normalizeText(product.urlDiscovery?.discovery_version),
     })),
   };
 }
@@ -1448,14 +1492,15 @@ async function normalizeNotFoundProductUrlWriteBacks({ config, baseDir, state, m
   for (const product of master.products) {
     const localState = state.products?.[product.reference];
     const masterUrlStatus = normalizeProductUrlStatus(product.master?.productUrlStatus);
-    if (hasValue(product.master?.productUrl) || masterUrlStatus === 'not_found' || !isDiscoveryNotFoundResult(localState?.urlDiscovery)) {
+    if (hasValue(product.master?.productUrl) || masterUrlStatus === 'not_found' || !isCurrentDiscoveryNotFoundResult(localState?.urlDiscovery)) {
       continue;
     }
     const discovery = {
       success: false,
       status: 'not_found',
+      discovery_version: PRODUCT_URL_DISCOVERY_VERSION,
       url: '',
-      error_message: localState.urlDiscovery?.error_message || 'No official product page with exact reference was verified.',
+      error_message: localState.urlDiscovery?.error_message || PRODUCT_URL_NOT_FOUND_MESSAGE,
     };
     try {
       await writeBackProductPageUrl({ config, baseDir, product, discovery, debug });
@@ -1738,6 +1783,7 @@ async function main() {
           ? {
               success: true,
               status: 'available',
+              discovery_version: PRODUCT_URL_DISCOVERY_VERSION,
               method: 'local_state',
               url: product.productUrl,
               source_url: '',

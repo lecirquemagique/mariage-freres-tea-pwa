@@ -131,7 +131,8 @@ Selection rules:
 - Rows with some resolved images are treated as `partial`.
 - Rows with no resolved images are treated as `pending`.
 - Rows without `公式商品ページURL` are still eligible. The collector first searches the official site and writes the verified URL before collecting images.
-- If `公式商品ページURL状態` is `not_found`, the row is skipped in normal runs until the status is manually cleared, changed, or a future explicit rediscovery mode is used.
+- `not_found` results are versioned in local state. Rows marked `not_found` by an older discovery method are treated as `legacy_not_found_recheck` and are searched once with the current FR+EN+JP method before being skipped again.
+- If the current discovery method has already stored `not_found`, the row is skipped in normal runs until the status is manually cleared, changed, or a future explicit rediscovery mode is used.
 - Product URL discovery writes `not_found` on the first attempt when the official search was readable but no exact T reference match was verified. It retries only technical failures such as browser verification, HTTP errors, timeouts, CDP disconnects, DOM read failures, or other exceptions.
 - Local `collector-state.json` can also mark a reference as `complete`, `partial`, `not_found`, `retry`, or `error`.
 - Each run processes at most `maxPerRun` products, default `5`.
@@ -160,7 +161,7 @@ While opening official pages, the collector records opportunistic image discover
 
 - `media/catalog/product/.../tNNNN.jpg` as `tea`
 - `media/catalog/product/.../tNNNN-270p.jpg` as `teaThumbnail`
-- `media/contentmanager/content/...color_liqueur/...` as `liqueur` for the currently verified page
+- `media/contentmanager/content/...color_liqueur/...` as `liqueur` only when it is found in the product-page liqueur context for the currently verified page
 
 Images such as tins, boxes, teabags, sweets, teaware, banners, logos, icons, and unrelated SKUs are ignored. `TCNNNN`, `TFGNNNN`, and `TBNNNN` product images are not treated as `TNNNN` tea-leaf images unless the loaded image URL itself is an exact `tNNNN` or `tNNNN-270p` tea-leaf asset.
 
@@ -191,6 +192,8 @@ Product URL discovery status values for `公式商品ページURL状態`:
 - `not_found`: the current discovery method could not verify an official product page after the retry limit. This does not mean the official page does not exist.
 - `pending`: not processed yet.
 - `error`: attempted but failed and can still be retried until the retry limit.
+
+Local state also stores `discovery_version` for URL discovery. A `not_found` without the current `official-search-fr-en-jp-v1` version is displayed as `legacy_not_found_recheck` and remains eligible for one rediscovery pass.
 
 The collector can POST acquired local images to a GAS endpoint. GAS saves the files to Drive, avoids duplicate file names according to `duplicatePolicy`, generates URLs such as:
 

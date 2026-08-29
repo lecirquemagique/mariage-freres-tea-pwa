@@ -7,6 +7,7 @@ param(
 $ErrorActionPreference = "Continue"
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ProductUrlDiscoveryVersion = "official-search-fr-en-jp-v1"
 
 try {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -46,6 +47,14 @@ function Test-DiscoveryNotFoundResult($Entry) {
   return $UrlStatus -eq "error" -and [string]$Entry.urlDiscovery.error_message -eq "No official product page with exact reference was verified."
 }
 
+function Test-CurrentDiscoveryNotFoundResult($Entry) {
+  return (Test-DiscoveryNotFoundResult $Entry) -and [string]$Entry.urlDiscovery.discovery_version -eq $ProductUrlDiscoveryVersion
+}
+
+function Test-LegacyDiscoveryNotFoundResult($Entry) {
+  return (Test-DiscoveryNotFoundResult $Entry) -and -not (Test-CurrentDiscoveryNotFoundResult $Entry)
+}
+
 function Get-EffectiveLocalStatus($Entry) {
   if ($null -eq $Entry) {
     return "pending"
@@ -53,8 +62,11 @@ function Get-EffectiveLocalStatus($Entry) {
   if ([string]$Entry.status -eq "complete") {
     return "complete"
   }
-  if (Test-DiscoveryNotFoundResult $Entry) {
+  if (Test-CurrentDiscoveryNotFoundResult $Entry) {
     return "not_found"
+  }
+  if (Test-LegacyDiscoveryNotFoundResult $Entry) {
+    return "legacy_not_found_recheck"
   }
   if ([string]$Entry.status -eq "partial") {
     return "partial"
@@ -85,7 +97,7 @@ function Show-MasterSummary($Root, $NodeExe) {
     }
     $Summary = ([string]$JsonLine[-1]) | ConvertFrom-Json -ErrorAction Stop
     Write-Host ("Master rows: {0}" -f $Summary.master_rows)
-    Write-Host ("Master status: complete={0} pending={1} not_found={2} retry={3} error={4} partial={5}" -f $Summary.counts.complete, $Summary.counts.pending, $Summary.counts.not_found, $Summary.counts.retry, $Summary.counts.error, $Summary.counts.partial)
+    Write-Host ("Master status: complete={0} pending={1} not_found={2} legacy_not_found_recheck={3} retry={4} error={5} partial={6}" -f $Summary.counts.complete, $Summary.counts.pending, $Summary.counts.not_found, $Summary.counts.legacy_not_found_recheck, $Summary.counts.retry, $Summary.counts.error, $Summary.counts.partial)
     if ($null -ne $Summary.opportunistic_cache) {
       Write-Host ("Opportunistic cache: images={0} unapplied={1}" -f $Summary.opportunistic_cache.image_count, $Summary.opportunistic_cache.unapplied_image_count)
     }
@@ -137,7 +149,8 @@ if (Test-Path $StateFile) {
     $Retry = @($Products | Where-Object { (Get-EffectiveLocalStatus $_.Value) -eq "retry" }).Count
     $ErrorCount = @($Products | Where-Object { (Get-EffectiveLocalStatus $_.Value) -eq "error" }).Count
     $NotFound = @($Products | Where-Object { (Get-EffectiveLocalStatus $_.Value) -eq "not_found" }).Count
-    Write-Host "Local state products: $($Products.Count) complete=$Complete partial=$Partial retry=$Retry error=$ErrorCount not_found=$NotFound"
+    $LegacyNotFound = @($Products | Where-Object { (Get-EffectiveLocalStatus $_.Value) -eq "legacy_not_found_recheck" }).Count
+    Write-Host "Local state products: $($Products.Count) complete=$Complete partial=$Partial retry=$Retry error=$ErrorCount not_found=$NotFound legacy_not_found_recheck=$LegacyNotFound"
     Write-Host "Recent local state:"
     $Products |
       Sort-Object { $_.Value.updated_at } -Descending |
@@ -146,7 +159,7 @@ if (Test-Path $StateFile) {
         $EffectiveStatus = Get-EffectiveLocalStatus $_.Value
         $UrlStatus = ""
         if ($null -ne $_.Value.urlDiscovery) {
-          $UrlStatus = if (Test-DiscoveryNotFoundResult $_.Value) { "not_found" } else { Normalize-ProductUrlStatus $_.Value.urlDiscovery.status }
+          $UrlStatus = if (Test-CurrentDiscoveryNotFoundResult $_.Value) { "not_found" } elseif (Test-LegacyDiscoveryNotFoundResult $_.Value) { "legacy_not_found_recheck" } else { Normalize-ProductUrlStatus $_.Value.urlDiscovery.status }
         }
         Write-Host ("  {0}: {1} url={2} raw={3} updated={4}" -f $_.Name, $EffectiveStatus, $UrlStatus, $_.Value.status, $_.Value.updated_at)
       }
