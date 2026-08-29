@@ -262,7 +262,10 @@ async function writeBackImageResults({ config, baseDir, product, result, debug }
   };
 
   if (debug) {
-    console.log(`[writeback] ${product.reference} uploading ${images.map((image) => image.file_name).join(', ')}`);
+    const imageLabels = images
+      .map((image) => `${image.image_type}:${image.folder_key || image.image_type}/${image.file_name}`)
+      .join(', ');
+    console.log(`[writeback] ${product.reference} uploading ${imageLabels}`);
   }
 
   const response = await fetch(settings.gasApiUrl, {

@@ -57,7 +57,9 @@ if (-not $SkipInitialRun) {
   $LogDir = Join-Path $Root "logs"
   New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
   $InitialLog = Join-Path $LogDir ("start-initial-run-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+  $LASTEXITCODE = 0
   $InitialOutput = & (Join-Path $Root "collector\run-cdp-once.ps1") -Root $Root -CdpEndpoint $CdpEndpoint -NodeExe $NodeExe -WriteBack 2>&1 | Tee-Object -FilePath $InitialLog
+  $InitialExitCode = $LASTEXITCODE
   $InitialText = $InitialOutput -join "`n"
 
   if ($InitialText -match "browser verification|Cloudflare|verify you are human|vérifiez que vous êtes humain") {
@@ -69,9 +71,9 @@ if (-not $SkipInitialRun) {
     exit 1
   }
 
-  if ($InitialText -match '"error"\s*:\s*"[^"]+') {
+  if ($InitialExitCode -ne 0 -or $InitialText -match "MF_COLLECTOR_WRITE_SECRET is not set|Chrome CDP endpoint is not available|Master GAS API returned|No GAS API URL is configured|writeBack.enabled is true, but no GAS API URL") {
     Write-Host ""
-    Write-Host "The initial collector run reported an error. The hourly task was not registered."
+    Write-Host "The initial collector run failed before normal product processing could continue."
     Write-Host "Initial run log: $InitialLog"
     exit 1
   }
@@ -79,6 +81,13 @@ if (-not $SkipInitialRun) {
 
 Write-Host "Registering hourly collector task..."
 & (Join-Path $Root "collector\register-hourly-cdp-task.ps1") -TaskName $TaskName -Root $Root -CdpEndpoint $CdpEndpoint -NodeExe $NodeExe -WriteBack
+
+$RegisteredTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+$RegisteredInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
+Write-Host ""
+Write-Host "Verified scheduled task: $TaskName"
+Write-Host "State: $($RegisteredTask.State)"
+Write-Host "NextRunTime: $($RegisteredInfo.NextRunTime)"
 
 Write-Host ""
 Write-Host "Image collector is started. It will process at most 5 products per run."
