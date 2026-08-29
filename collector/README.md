@@ -313,6 +313,33 @@ If `config.json` does not contain `masterSource.gasApiUrl` and `writeBack.gasApi
 
 Do not implement an infinite loop inside Node. Let Task Scheduler handle the hourly cadence.
 
+## Manual Start And Stop
+
+For day-to-day operation, use the batch files in the repository root:
+
+```text
+画像回収_開始.bat
+画像回収_停止.bat
+画像回収_完全終了.bat
+画像回収_ステータス.bat
+```
+
+`画像回収_開始.bat` checks whether the CDP Chrome endpoint is available. If it is not available, it starts the dedicated collector Chrome profile and waits for you to complete any Cloudflare verification. It then runs one collector pass immediately and registers the hourly scheduled task.
+
+`画像回収_停止.bat` disables the scheduled task so future hourly runs stop. It does not forcibly close the dedicated Chrome window and does not kill an active collector run by default; an active run can finish the current product safely.
+
+`画像回収_完全終了.bat` disables future runs and also closes only the collector Chrome process that was started with the repository's `chrome-cdp-profile` and CDP port.
+
+`画像回収_ステータス.bat` shows the scheduled task state, last/next run times, CDP Chrome availability, and a compact summary of recent local collector state.
+
+Safety behavior:
+
+- If CDP Chrome is not available, `run-cdp-once.ps1` exits before starting Node and before touching Sheets.
+- If a previous collector run is still active, the next run exits without starting a second collector process.
+- The scheduled task uses `MultipleInstances IgnoreNew`.
+- If the PC is asleep, Task Scheduler can run the missed task after wake because `StartWhenAvailable` is enabled.
+- If Cloudflare verification appears again, the product is marked as an error for that run; the collector does not loop or repeatedly reload forever.
+
 ## Result Logs
 
 Each processed image writes a JSONL row with:

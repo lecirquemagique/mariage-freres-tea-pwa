@@ -9,6 +9,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$Mutex = New-Object System.Threading.Mutex($false, "MFImageCollectorRun")
+$LockTaken = $false
+
+try {
+  $LockTaken = $Mutex.WaitOne(0)
+  if (-not $LockTaken) {
+    Write-Host "Another MF image collector run is already active. Skipping this run."
+    exit 0
+  }
+
 if ([string]::IsNullOrWhiteSpace($Root)) {
   $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 }
@@ -34,3 +44,9 @@ if ($WriteBack) {
 }
 
 & $NodeExe @args
+} finally {
+  if ($LockTaken) {
+    $Mutex.ReleaseMutex()
+  }
+  $Mutex.Dispose()
+}
