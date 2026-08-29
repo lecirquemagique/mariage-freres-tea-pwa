@@ -783,10 +783,8 @@ function fillTeaTypes(){
   );
 
   TEA_TYPE_ORDER.forEach(x=>{
-    if(values.has(x)){
-      e.add(new Option(x,x));
-      values.delete(x);
-    }
+    e.add(new Option(x,x));
+    values.delete(x);
   });
 
   [...values]
