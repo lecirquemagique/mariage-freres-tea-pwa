@@ -165,6 +165,22 @@ function driveThumbnailUrl(fileId, size = DRIVE_THUMBNAIL_SIZE) {
   return `https://drive.google.com/thumbnail?id=${encodeURIComponent(fileId)}&sz=${encodeURIComponent(size)}`;
 }
 
+function responsePreview(text, maxLength = 300) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function formatWriteBackResponseError(message, settings, response, text) {
+  const details = {
+    post_url: settings.gasApiUrl,
+    final_url: response.url,
+    http_status: response.status,
+    content_type: response.headers.get('content-type') || '',
+    redirected: response.redirected,
+    response_start: responsePreview(text),
+  };
+  return `${message}: ${JSON.stringify(details)}`;
+}
+
 function getWriteBackSettings(config, baseDir) {
   const writeBack = config.writeBack || {};
   if (writeBack.enabled !== true) return null;
@@ -250,10 +266,10 @@ async function writeBackImageResults({ config, baseDir, product, result, debug }
   try {
     data = JSON.parse(text);
   } catch {
-    throw new Error(`Writeback did not return JSON. HTTP ${response.status}: ${text.slice(0, 300)}`);
+    throw new Error(formatWriteBackResponseError('Writeback did not return JSON', settings, response, text));
   }
   if (!response.ok || data.ok === false) {
-    throw new Error(`Writeback failed. HTTP ${response.status}: ${data.error || text.slice(0, 300)}`);
+    throw new Error(formatWriteBackResponseError(`Writeback failed: ${data.error || responsePreview(text)}`, settings, response, text));
   }
 
   for (const image of data.images || []) {
