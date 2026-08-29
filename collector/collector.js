@@ -50,6 +50,7 @@ function parseArgs(argv) {
     writeBack: null,
     useConfigProducts: false,
     discoverUrlsOnly: false,
+    statusJson: false,
     refs: null,
   };
   for (let i = 2; i < argv.length; i += 1) {
@@ -69,6 +70,7 @@ function parseArgs(argv) {
     else if (arg === '--no-write-back') args.writeBack = false;
     else if (arg === '--use-config-products') args.useConfigProducts = true;
     else if (arg === '--discover-urls-only') args.discoverUrlsOnly = true;
+    else if (arg === '--status-json') args.statusJson = true;
     else if (arg === '--config') args.config = argv[++i];
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
     else if (arg === '--refs') args.refs = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
@@ -1217,6 +1219,54 @@ function selectProducts(config, state, refs, sourceProducts = null) {
   return filtered.slice(0, refs?.length ? refs.length : config.maxPerRun || 5);
 }
 
+function productScheduleStatus(product) {
+  const localStatus = product.status || '';
+  const masterStatus = product.master_status || productImageStatus(product);
+  const urlDiscoveryStatus = normalizeProductUrlStatus(product.urlDiscovery?.status) || product.master?.productUrlStatus || '';
+  if (masterStatus === 'complete' || localStatus === 'complete') return 'complete';
+  if (!hasValue(product.productUrl) && urlDiscoveryStatus === 'not_found') return 'not_found';
+  if (localStatus === 'retry') return 'retry';
+  if (localStatus === 'error') return 'error';
+  if (masterStatus === 'partial' || localStatus === 'partial') return 'partial';
+  return 'pending';
+}
+
+function buildStatusSummary(config, state, master, products) {
+  const counts = {
+    complete: 0,
+    pending: 0,
+    not_found: 0,
+    retry: 0,
+    error: 0,
+    partial: 0,
+  };
+  const sourceProducts = master?.products || config.products || [];
+  for (const product of sourceProducts) {
+    const localState = state.products?.[product.reference] || {};
+    const merged = {
+      ...product,
+      master_status: productImageStatus(product),
+      ...localState,
+      productUrl: product.productUrl || localState.productUrl,
+    };
+    const status = productScheduleStatus(merged);
+    counts[status] = (counts[status] || 0) + 1;
+  }
+  return {
+    master_rows: master?.rowCount || 0,
+    product_count: sourceProducts.length,
+    counts,
+    next_candidates: products.map((product) => ({
+      reference: product.reference,
+      name: product.name || '',
+      product_url: product.productUrl || '',
+      master_status: product.master_status || 'pending',
+      state_status: state.products?.[product.reference]?.status || '',
+      url_discovery_status: normalizeProductUrlStatus(product.urlDiscovery?.status) || product.master?.productUrlStatus || '',
+    })),
+  };
+}
+
 function writeBackRequired(config) {
   return config.writeBack?.enabled === true;
 }
@@ -1378,6 +1428,11 @@ async function main() {
     throw new Error('Master products are required for normal collector runs. Use --use-config-products only for explicit local tests.');
   }
   const products = selectProducts(config, state, args.refs, master?.products || null);
+
+  if (args.statusJson) {
+    console.log(JSON.stringify(buildStatusSummary(config, state, master, products)));
+    return;
+  }
 
   if (products.length === 0) {
     console.log('No pending products selected.');
