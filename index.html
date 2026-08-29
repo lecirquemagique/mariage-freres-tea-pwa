@@ -1072,6 +1072,23 @@ function renderDetailChips(){
 }
 
 
+function hasSearchCriteria(){
+  return Boolean(
+    $('q').value.trim() ||
+    $('tea').value ||
+    $('origin').value ||
+    timeSel ||
+    aromaSel.size ||
+    detailSel.size ||
+    $('milk').checked ||
+    $('smoke').checked ||
+    $('cold').checked ||
+    $('iced').checked ||
+    $('theine').checked
+  );
+}
+
+
 function matches(r){
   const q=n(
     $('q').value
@@ -1273,6 +1290,19 @@ function activeText(){
 
 
 function render(){
+
+  if(!hasSearchCriteria()){
+
+    $('meta').textContent='';
+
+    $('active').textContent='';
+
+    $('list').innerHTML=
+      '<div class="empty">検索または条件を選択してください。</div>';
+
+    return;
+  }
+
   const a=
     R.filter(matches);
 
