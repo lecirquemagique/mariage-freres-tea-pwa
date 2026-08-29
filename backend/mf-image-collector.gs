@@ -38,7 +38,7 @@ function mfImageCollectorUploadImageResults_(payload) {
     throw new Error('Unexpected Drive folder ID.');
   }
 
-  var folder = DriveApp.getFolderById(folderId);
+  var rootFolder = DriveApp.getFolderById(folderId);
   var duplicatePolicy = String(payload.duplicate_policy || 'skip').toLowerCase();
   var urlSize = String(payload.url_size || 'w1200');
   var uploaded = [];
@@ -55,11 +55,17 @@ function mfImageCollectorUploadImageResults_(payload) {
     var base64 = String(image.data_base64 || '');
     if (!base64) throw new Error('data_base64 is required.');
 
-    var fileResult = mfImageCollectorUpsertFile_(folder, fileName, mimeType, base64, duplicatePolicy);
+    var targetFolder = mfImageCollectorGetOrCreateSubfolder_(rootFolder, imageType);
+    var fileResult = mfImageCollectorUpsertFile_(targetFolder, fileName, mimeType, base64, duplicatePolicy);
+    if (imageType === 'liqueur') {
+      mfImageCollectorTrashLegacyLiqueurFiles_(rootFolder, reference);
+      mfImageCollectorTrashLegacyLiqueurFiles_(targetFolder, reference);
+    }
     uploaded.push({
       image_type: imageType,
       file_id: fileResult.file.getId(),
       name: fileResult.file.getName(),
+      folder: imageType,
       mime_type: mimeType,
       action: fileResult.action,
       url: mfImageCollectorThumbnailUrl_(fileResult.file.getId(), urlSize)
@@ -95,6 +101,26 @@ function mfImageCollectorUpsertFile_(folder, fileName, mimeType, base64, duplica
   var file = folder.createFile(blob);
   mfImageCollectorMakeDisplayable_(file);
   return { file: file, action: existing.length ? 'replaced' : 'created' };
+}
+
+function mfImageCollectorGetOrCreateSubfolder_(rootFolder, name) {
+  var folders = rootFolder.getFoldersByName(name);
+  if (folders.hasNext()) return folders.next();
+  return rootFolder.createFolder(name);
+}
+
+function mfImageCollectorTrashLegacyLiqueurFiles_(folder, reference) {
+  var names = [
+    reference + '_liqueur.jpg',
+    reference + '_liqueur.jpeg',
+    reference + '_liqueur.png',
+    reference + '_liqueur.webp',
+    reference + '_liqueur.avif'
+  ];
+  for (var i = 0; i < names.length; i += 1) {
+    var files = folder.getFilesByName(names[i]);
+    while (files.hasNext()) files.next().setTrashed(true);
+  }
 }
 
 function mfImageCollectorMakeDisplayable_(file) {

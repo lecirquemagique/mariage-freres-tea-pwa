@@ -8,6 +8,15 @@ Official MARIAGE FRERES image URLs are kept only in local audit logs. The tea ma
 192M8W9aopop-k0H_xHMJBWkEVy3fK4eX
 ```
 
+Images are organized by type:
+
+```text
+tea/T2301.jpg
+liqueur/TheBlanc1-Cream_1.png
+```
+
+Liqueur images are shared color swatches, not per-reference product photos. URLs containing `color_liqueur` are the primary liqueur candidates. Product catalog images such as `media/catalog/product/...-270p.jpg` are not liqueur images for the tea master.
+
 By default `config.example.json` uses Playwright's `channel: "chrome"` so Windows can launch the locally installed Google Chrome. The profile directory is `browser-profile` inside the collector working folder; it does not use or modify your normal Chrome profile.
 
 ## Setup
@@ -182,24 +191,16 @@ npm run collect:images:cdp:writeback
 
 `duplicatePolicy: "skip"` reuses an existing same-name file ID. `duplicatePolicy: "replace"` trashes same-name files and creates one replacement file, then rewrites the sheet URL to the new file ID.
 
-For files that were uploaded before this GAS helper was installed, run this in Apps Script to repair display sharing:
-
-```javascript
-mfImageCollectorMakeFilesDisplayable([
-  '160QxKNVXlCykueIiLeoFFmXreN4GiUwY',
-  '122387L-Kie1iOmoie1_edXxANxL0FxY9'
-]);
-```
-
 Confirmed one-reference proof on 2026-08-29:
 
 - T2301 images were acquired locally.
-- `T2301_tea.jpg` was uploaded to Drive file ID `160QxKNVXlCykueIiLeoFFmXreN4GiUwY`.
-- `T2301_liqueur.jpg` was uploaded to Drive file ID `122387L-Kie1iOmoie1_edXxANxL0FxY9`.
+- `tea/T2301.jpg` was uploaded to Drive file ID `1xRiAKAz88A64m3rHmZzZXn89JyJe8w6O`.
+- `liqueur/TheBlanc1-Cream_1.png` was uploaded to Drive file ID `1RZBle9GhPieELWibwcWQ2HzWDktBfMPZ`.
 - The master row for T2301 was updated:
-  - `茶葉画像URL`: `https://drive.google.com/thumbnail?id=160QxKNVXlCykueIiLeoFFmXreN4GiUwY&sz=w1200`
-  - `水色画像URL`: `https://drive.google.com/thumbnail?id=122387L-Kie1iOmoie1_edXxANxL0FxY9&sz=w1200`
+  - `茶葉画像URL`: `https://drive.google.com/thumbnail?id=1xRiAKAz88A64m3rHmZzZXn89JyJe8w6O&sz=w1200`
+  - `水色画像URL`: `https://drive.google.com/thumbnail?id=1RZBle9GhPieELWibwcWQ2HzWDktBfMPZ&sz=w1200`
 - The PWA reads these URLs into the T2301 image elements. Anonymous visual loading still requires Drive link-sharing to be enabled on the files.
+- The previous incorrect `T2301_liqueur.jpg` file was renamed to `legacy_wrong_T2301_liqueur_catalog_270p.jpg`.
 
 Recommended optional audit columns, not required for the current writeback:
 

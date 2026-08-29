@@ -111,6 +111,15 @@ function extensionForMime(mimeType, fallbackUrl = '') {
   return match ? `.${match[1].toLowerCase().replace('jpeg', 'jpg')}` : '.bin';
 }
 
+function basenameFromUrl(rawUrl) {
+  try {
+    const pathname = new URL(rawUrl).pathname;
+    return path.basename(decodeURIComponent(pathname)).replace(/[^A-Za-z0-9._-]+/g, '_');
+  } catch {
+    return '';
+  }
+}
+
 function normalizeUrl(raw, baseUrl) {
   if (!raw) return '';
   try {
@@ -169,6 +178,7 @@ function encodeImageForWriteBack(row, imageType) {
   if (!row?.success || !row.file_path || !fs.existsSync(row.file_path)) return null;
   return {
     image_type: imageType,
+    folder_key: imageType,
     file_name: path.basename(row.file_path),
     mime_type: row.mime_type || 'application/octet-stream',
     width: row.width || 0,
@@ -335,10 +345,8 @@ function candidateHasConflictingReference(candidate, product) {
   return candidateReferenceTokens(candidate).some((token) => token !== expected);
 }
 
-function classifyCandidate(candidate, product, imageType) {
-  const reference = String(product.reference || '').toLowerCase();
-  const name = String(product.name || '').toLowerCase();
-  const hay = [
+function candidateHaystack(candidate) {
+  return [
     candidate.url,
     candidate.sourceUrl,
     candidate.alt,
@@ -349,22 +357,40 @@ function classifyCandidate(candidate, product, imageType) {
     candidate.sectionText,
     candidate.sourceKind,
   ].join(' ').toLowerCase();
+}
+
+function isColorLiqueurCandidate(candidate) {
+  return /(^|\/|_)color_liqueur(\/|_|$)/i.test(candidate.url || '') ||
+    /color_liqueur/i.test(candidateHaystack(candidate));
+}
+
+function isCatalogProductCandidate(candidate) {
+  return /media\/catalog\/product/i.test(candidate.url || '') ||
+    /media\/catalog\/product/i.test(candidateHaystack(candidate));
+}
+
+function classifyCandidate(candidate, product, imageType) {
+  const reference = String(product.reference || '').toLowerCase();
+  const name = String(product.name || '').toLowerCase();
+  const hay = candidateHaystack(candidate);
 
   let score = 0;
   let reject = 0;
 
-  if (candidateHasConflictingReference(candidate, product)) reject += 50;
-  if (candidateHasExactReference(candidate, product)) score += 10;
+  if (imageType !== 'liqueur' && candidateHasConflictingReference(candidate, product)) reject += 50;
+  if (candidateHasExactReference(candidate, product)) score += imageType === 'liqueur' ? 1 : 10;
   if (name && hay.includes(name)) score += 2;
-  if (hay.includes('media/catalog/product')) score += 4;
   if (hay.includes('/cache/')) score += 1;
   if ((candidate.width || 0) >= 180 && (candidate.height || 0) >= 180) score += 2;
   if ((candidate.naturalWidth || 0) >= 180 && (candidate.naturalHeight || 0) >= 180) score += 2;
 
   if (imageType === 'liqueur') {
+    if (isColorLiqueurCandidate(candidate)) score += 100;
     if (/liqueur|liquor|liquore/.test(hay)) score += 10;
-    if (/color_liqueur|liqueur/.test(hay)) score += 8;
+    if (isCatalogProductCandidate(candidate)) reject += 80;
+    if (/\/t\/\d\/t\d{2,5}-\d+p\.(jpe?g|png|webp|avif)(?:[?#]|$)/i.test(candidate.url || '')) reject += 100;
   } else {
+    if (hay.includes('media/catalog/product')) score += 4;
     if (/liqueur|liquor|liquore|color_liqueur/.test(hay)) reject += 8;
     if (/thes-au-poids|tea-by-the-weight|te-al-peso/.test(hay)) score += 2;
     if (candidateHasExactReference(candidate, product) && /t\d{2,5}(-\d+p)?\.(jpe?g|png|webp|avif)/.test(hay)) score += 5;
@@ -378,13 +404,28 @@ function classifyCandidate(candidate, product, imageType) {
 }
 
 function pickCandidate(candidates, product, imageType) {
+  const dimensionsByUrl = new Map();
+  for (const candidate of candidates) {
+    if (!candidate.url) continue;
+    const previous = dimensionsByUrl.get(candidate.url) || {};
+    dimensionsByUrl.set(candidate.url, {
+      width: Math.max(previous.width || 0, candidate.width || 0),
+      height: Math.max(previous.height || 0, candidate.height || 0),
+      naturalWidth: Math.max(previous.naturalWidth || 0, candidate.naturalWidth || 0),
+      naturalHeight: Math.max(previous.naturalHeight || 0, candidate.naturalHeight || 0),
+    });
+  }
   const scoredAll = candidates
     .map((candidate) => ({
       ...candidate,
+      ...dimensionsByUrl.get(candidate.url),
       score: classifyCandidate(candidate, product, imageType),
     }))
     .filter((candidate) => candidate.url && candidate.score > 0)
     .sort((a, b) => b.score - a.score);
+  if (imageType === 'liqueur') {
+    return scoredAll.find((candidate) => isColorLiqueurCandidate(candidate)) || null;
+  }
   const exact = scoredAll.filter((candidate) => candidateHasExactReference(candidate, product));
   return exact[0] || null;
 }
@@ -594,9 +635,13 @@ async function screenshotCandidateElement(page, candidate) {
 async function saveImage({ baseDir, imageType, product, pageUrl, candidate, acquired, method, logFile }) {
   const mimeType = acquired.mimeType || candidate.mimeType || '';
   const ext = extensionForMime(mimeType, candidate.url);
-  const fileName = `${sanitizeReference(product.reference)}_${imageType}${ext}`;
-  const filePath = path.join(baseDir, fileName);
-  fs.mkdirSync(baseDir, { recursive: true });
+  const typeDir = imageType === 'liqueur' ? 'liqueur' : 'tea';
+  const liqueurName = basenameFromUrl(acquired.resolvedUrl || candidate.url);
+  const fileName = imageType === 'liqueur' && liqueurName
+    ? liqueurName
+    : `${sanitizeReference(product.reference)}${ext}`;
+  const filePath = path.join(baseDir, typeDir, fileName);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, acquired.buffer);
 
   const row = {
