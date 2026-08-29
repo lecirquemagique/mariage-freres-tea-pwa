@@ -25,6 +25,17 @@ if ([string]::IsNullOrWhiteSpace($Root)) {
 
 Set-Location $Root
 
+if ($WriteBack -and [string]::IsNullOrWhiteSpace($env:MF_COLLECTOR_WRITE_SECRET)) {
+  $UserSecret = [Environment]::GetEnvironmentVariable("MF_COLLECTOR_WRITE_SECRET", "User")
+  if (-not [string]::IsNullOrWhiteSpace($UserSecret)) {
+    $env:MF_COLLECTOR_WRITE_SECRET = $UserSecret
+  }
+}
+
+if ($WriteBack -and [string]::IsNullOrWhiteSpace($env:MF_COLLECTOR_WRITE_SECRET)) {
+  throw "MF_COLLECTOR_WRITE_SECRET is not set. Set the user environment variable before running write-back."
+}
+
 try {
   Invoke-RestMethod -Uri "$CdpEndpoint/json/version" -Method Get -TimeoutSec 3 | Out-Null
 } catch {

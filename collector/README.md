@@ -326,6 +326,8 @@ For day-to-day operation, use the batch files in the repository root:
 
 `画像回収_開始.bat` checks whether the CDP Chrome endpoint is available. If it is not available, it starts the dedicated collector Chrome profile and waits for you to complete any Cloudflare verification. It then runs one collector pass immediately and registers the hourly scheduled task.
 
+Before write-back starts, the launcher reads `MF_COLLECTOR_WRITE_SECRET` from the current process or the Windows user environment. If the secret is missing, it stops before processing images or touching Sheets.
+
 `画像回収_停止.bat` disables the scheduled task so future hourly runs stop. It does not forcibly close the dedicated Chrome window and does not kill an active collector run by default; an active run can finish the current product safely.
 
 `画像回収_完全終了.bat` disables future runs and also closes only the collector Chrome process that was started with the repository's `chrome-cdp-profile` and CDP port.
@@ -339,6 +341,7 @@ Safety behavior:
 - The scheduled task uses `MultipleInstances IgnoreNew`.
 - If the PC is asleep, Task Scheduler can run the missed task after wake because `StartWhenAvailable` is enabled.
 - If Cloudflare verification appears again, the product is marked as an error for that run; the collector does not loop or repeatedly reload forever.
+- During manual start, if the initial run reports Cloudflare verification or another collector error, the hourly task is not registered. Complete verification in the dedicated Chrome window and run `画像回収_開始.bat` again.
 
 ## Result Logs
 
