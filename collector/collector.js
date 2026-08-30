@@ -729,7 +729,7 @@ function findSimilarMasterCandidates(reference, officialName, masterProducts = [
   const normalizedOfficialName = normalizeNameForCompare(officialName);
   if (!normalizedOfficialName) return [];
   const officialTokens = normalizedOfficialName.split(/\s+/).filter((token) => token.length >= 4);
-  const scored = [];
+  const scoredByReference = new Map();
   for (const product of masterProducts || []) {
     if (!product?.reference || product.reference === reference) continue;
     const productName = product.name || '';
@@ -742,14 +742,18 @@ function findSimilarMasterCandidates(reference, officialName, masterProducts = [
       if (normalizedProductName.split(/\s+/).includes(token)) score += 8;
     }
     if (score <= 0) continue;
-    scored.push({
+    const candidate = {
       reference: product.reference,
       version_key: product.master?.versionKey || '',
       name: productName,
       score,
-    });
+    };
+    const existing = scoredByReference.get(candidate.reference);
+    if (!existing || candidate.score > existing.score || (candidate.score === existing.score && candidate.version_key.localeCompare(existing.version_key) < 0)) {
+      scoredByReference.set(candidate.reference, candidate);
+    }
   }
-  return scored
+  return [...scoredByReference.values()]
     .sort((a, b) => b.score - a.score || a.reference.localeCompare(b.reference))
     .slice(0, 5);
 }
@@ -820,7 +824,7 @@ function cacheReviewCandidate(cache, candidate) {
       official_names_by_language: mergeObjectValues(existing.official_names_by_language, item.official_names_by_language),
       description_snippets_by_language: mergeObjectValues(existing.description_snippets_by_language, item.description_snippets_by_language),
       discovery_sources: mergeArrayValues(existing.discovery_sources, item.discovery_sources, (entry) => `${entry.source || ''}|${entry.url || ''}`),
-      similar_master_candidates: mergeArrayValues(existing.similar_master_candidates, item.similar_master_candidates, (entry) => `${entry.reference || ''}|${entry.version_key || ''}`).slice(0, 5),
+      similar_master_candidates: mergeArrayValues(existing.similar_master_candidates, item.similar_master_candidates, (entry) => entry.reference || entry.version_key || JSON.stringify(entry)).slice(0, 5),
       official_name_differences: mergeUniqueTextLines(existing.official_name_differences, item.official_name_differences),
       description_excerpt: mergeUniqueTextLines(existing.description_excerpt, item.description_excerpt),
       evidence: mergeUniqueTextLines(existing.evidence, item.evidence),
@@ -2035,6 +2039,20 @@ function extractSalesSkuReferences(text) {
   return [...out];
 }
 
+function isJpRetailSkuLikeTeaReference(reference, facts) {
+  const ref = String(reference || '').toUpperCase();
+  const url = String(facts?.url || facts?.canonical || '');
+  if (sourceLanguageFromUrl(url) !== 'JP') return false;
+  const digits = ref.match(/^T(\d+)$/)?.[1] || '';
+  if (digits.length < 6) return false;
+  const productText = `${facts?.title || ''}\n${facts?.h1 || ''}\n${facts?.snippet || ''}\n${facts?.bodyText || ''}`;
+  return /\d+\s*g|￥|カートに追加|Buy|ロゴ袋入り|商品について問い合わせる/i.test(productText);
+}
+
+function extractVerifiedProductTeaReferences(text, facts) {
+  return extractTeaReferences(text).filter((reference) => !isJpRetailSkuLikeTeaReference(reference, facts));
+}
+
 function extractUrlsFromText(text) {
   return [...new Set([...String(text || '').matchAll(/https?:\/\/[^\s<>"']+/gi)].map((match) => match[0].replace(/[),.;]+$/, '')))];
 }
@@ -2203,8 +2221,9 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
             throw new Error('Discovery page is blocked by browser verification.');
           }
 
-          const pageRefs = new Set(extractTeaReferences(combinedText));
-          const pageSalesSkus = new Set(extractSalesSkuReferences(combinedText));
+          const pageIsProduct = looksLikeProductUrl(facts.url) || looksLikeProductUrl(facts.canonical || '');
+          const pageRefs = new Set(pageIsProduct ? extractVerifiedProductTeaReferences(combinedText, facts) : []);
+          const pageSalesSkus = new Set(pageIsProduct ? extractSalesSkuReferences(combinedText) : []);
           const productLinks = [];
           const listLinks = [];
           for (const foundUrl of extractUrlsFromText(combinedText)) {
@@ -2213,8 +2232,10 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
           }
           for (const link of facts.links || []) {
             const linkText = `${link.href}\n${link.text}\n${link.closestText}`;
-            for (const ref of extractTeaReferences(linkText)) pageRefs.add(ref);
-            for (const sku of extractSalesSkuReferences(linkText)) pageSalesSkus.add(sku);
+            if (pageIsProduct) {
+              for (const ref of extractVerifiedProductTeaReferences(linkText, facts)) pageRefs.add(ref);
+              for (const sku of extractSalesSkuReferences(linkText)) pageSalesSkus.add(sku);
+            }
             if (looksLikeProductUrl(link.href)) productLinks.push(link.href);
             else if (isDiscoveryListUrl(link.href)) listLinks.push(link.href);
           }
@@ -2228,9 +2249,7 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
             enqueueDiscoveryUrl(sourceState, facts.canonical, maxQueue);
           }
 
-          const pageIsProduct = looksLikeProductUrl(facts.url) || looksLikeProductUrl(facts.canonical || '');
-          const canRecordPageRefs = pageIsProduct || source.source !== 'sitemap';
-          if (canRecordPageRefs) {
+          if (pageIsProduct) {
             for (const ref of pageRefs) {
               if (masterReferences.has(ref)) {
                 existingReferences += 1;
