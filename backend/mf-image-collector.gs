@@ -68,6 +68,13 @@ function mfImageCollectorDoPost(e) {
       mfImageCollectorAssertSecret_(payload);
       return mfImageCollectorJson_(mfImageCollectorGetReviewSummary());
     }
+    if (payload.action === 'getReviewItems') {
+      mfImageCollectorAssertSecret_(payload);
+      return mfImageCollectorJson_({
+        ok: true,
+        items: mfImageCollectorGetReviewItems(String(payload.status || '要確認'))
+      });
+    }
     return mfImageCollectorJson_({ ok: false, error: 'Unsupported action.' });
   } catch (error) {
     return mfImageCollectorJson_({ ok: false, error: String(error && error.message || error) });
