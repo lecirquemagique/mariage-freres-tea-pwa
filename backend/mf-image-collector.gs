@@ -652,10 +652,12 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
   if (versionCol < 0 || refCol < 0 || nameCol < 0) throw new Error('Master columns required for approved review are missing.');
 
   if (decision === '新規銘柄として追加' || decision === '既存銘柄の新バージョンとして追加') {
-    var versionKey = targetVersionKey || mfImageCollectorNextVersionKey_(values, headers, String(review['Tリファレンス番号'] || ''));
+    var reference = String(review['Tリファレンス番号'] || '').trim().toUpperCase();
+    var versionKey = String(targetVersionKey || mfImageCollectorNextVersionKey_(values, headers, reference)).trim().toUpperCase();
+    mfImageCollectorAssertAppendVersionKey_(values, headers, reference, versionKey);
     var newRow = headers.map(function(header) {
       if (header === 'VersionKey') return versionKey;
-      if (header === 'Tリファレンス番号') return review['Tリファレンス番号'] || '';
+      if (header === 'Tリファレンス番号') return reference;
       if (header === '現在の公式名') return review['公式名'] || '';
       if (header === '公式商品ページURL') return review['公式URL'] || '';
       if (header === '公式商品ページURL状態') return review['公式URL'] ? 'available' : 'pending';
@@ -685,15 +687,35 @@ function mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, ver
 
 function mfImageCollectorNextVersionKey_(values, headers, reference) {
   var versionCol = headers.indexOf('VersionKey');
-  var prefix = String(reference || '').trim() + '-N';
+  if (versionCol < 0) throw new Error('VersionKey column is missing.');
+  var ref = String(reference || '').trim().toUpperCase();
+  if (!/^T\d+$/.test(ref)) throw new Error('Invalid T reference for VersionKey: ' + reference);
+  var prefix = ref + '-B';
   var max = 0;
   for (var i = 1; i < values.length; i += 1) {
     var value = String(values[i][versionCol] || '');
-    if (value.indexOf(prefix) !== 0) continue;
-    var number = Number(value.slice(prefix.length));
+    var match = value.match(new RegExp('^' + ref + '-B(\\d{2})$'));
+    if (!match) continue;
+    var number = Number(match[1]);
     if (number > max) max = number;
   }
   return prefix + ('0' + (max + 1)).slice(-2);
+}
+
+function mfImageCollectorAssertAppendVersionKey_(values, headers, reference, versionKey) {
+  var versionCol = headers.indexOf('VersionKey');
+  if (versionCol < 0) throw new Error('VersionKey column is missing.');
+  var ref = String(reference || '').trim().toUpperCase();
+  var key = String(versionKey || '').trim().toUpperCase();
+  if (!/^T\d+$/.test(ref)) throw new Error('Invalid T reference: ' + reference);
+  if (!new RegExp('^' + ref + '-B\\d{2}$').test(key)) {
+    throw new Error('VersionKey must use the B-series for this reference: ' + ref + '-B##');
+  }
+  for (var i = 1; i < values.length; i += 1) {
+    if (String(values[i][versionCol] || '').trim().toUpperCase() === key) {
+      throw new Error('VersionKey already exists: ' + key);
+    }
+  }
 }
 
 function mfImageCollectorReviewHtml_() {

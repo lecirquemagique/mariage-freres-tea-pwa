@@ -248,6 +248,16 @@ After replacing `backend/mf-image-collector.gs` and redeploying the web app, rel
 
 Only an explicit review decision can append or update semantic master rows. `販売SKUとして追加`, `既存銘柄と同一`, `終売情報として更新`, `誤検出`, and `保留` do not automatically append a master row in the current implementation.
 
+### VersionKey Rule
+
+Approved master rows use only the B-series VersionKey format:
+
+- `B01` is the first canonical row for a T reference.
+- `B02`, `B03`, and later values are successor/content-change versions for the same T reference.
+- `N01`, `N02`, and other N-series keys are not generated.
+
+When a review decision appends a new master row, Apps Script generates the next key from existing `TNNNN-B##` rows for that exact T reference. Existing N-series or malformed keys are ignored for new numbering. If no B-series row exists, the new row becomes `TNNNN-B01`; otherwise it becomes the current maximum B number plus one. A manually supplied `対象VersionKey` for append decisions must match `TNNNN-B##` and must not already exist.
+
 ### Safe Review API Validation
 
 Use `validateReviewCandidate` to test the deployed GAS endpoint, secret, payload validation, and dedupe lookup without writing to Sheets:
@@ -290,7 +300,7 @@ npm run collect:discover:dry-run
 npm run collect:discover:writeback
 ```
 
-Discovery starts from official sitemap and listing/category pages, queues product/list links, extracts tea references with exact `T` + digits matching, and excludes sales SKU prefixes such as `TB`, `TC`, `TP`, `TA`, `TF`, `TFG`, `TJ`, and `TJC` from tea-reference matching. Sales SKUs may be recorded as `sales_sku_detected` review candidates, but they are never treated as tea references. Each run limits both the total page count and the per-source page count so sitemap traversal cannot starve the FR/EN/JP listing sources.
+Discovery starts from official sitemap and listing/category pages, queues product/list links, and records unregistered tea references only after a product-page context verifies the exact `T` + digits reference. Listing/category pages are used to discover links; their whole-page body text is not treated as authoritative tea-reference evidence. JP retail product pages can contain sales-item strings such as package size and price next to a `T` token, so six-digit JP retail SKU-like tokens are filtered out of tea-reference review candidates. Sales SKU prefixes such as `TB`, `TC`, `TP`, `TA`, `TF`, `TFG`, `TJ`, and `TJC` are also excluded from tea-reference matching. Sales SKUs may be recorded as `sales_sku_detected` review candidates, but they are never treated as tea references. Each run limits both the total page count and the per-source page count so sitemap traversal cannot starve the FR/EN/JP listing sources.
 
 Default discovery entry points:
 
