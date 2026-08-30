@@ -310,6 +310,15 @@ Discovery state is stored in `new-reference-discovery-state.json` and is separat
 
 Discovery review dedupe merges FR/EN/JP evidence for the same unregistered T into a single pending review candidate by using a T-level `unregistered_reference|TNNNN` detection key. It never appends to `銘柄マスター`; it posts only to `recordReviewCandidate`.
 
+Review identity keys are stable per detection type and do not include mutable review content such as URL, official name, language, description, or diff text:
+
+- `unregistered_reference`: `unregistered_reference|TNNNN`
+- `unregistered_reference_image`: `unregistered_reference_image|TNNNN`
+- `sales_sku_detected`: `sales_sku_detected|SKU`
+- `official_name_changed`: `official_name_changed|TNNNN|VersionKey`
+
+Apps Script also checks existing review rows by `検出種別 + Tリファレンス番号` as a compatibility fallback for older content-hash rows. If it finds a pending/held legacy row, it updates that row instead of creating a duplicate and migrates its `検出ID` to the stable key. Existing duplicate rows are not merged or deleted automatically.
+
 For daily scheduling, use:
 
 ```powershell

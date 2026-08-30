@@ -657,14 +657,19 @@ function discoveryCacheKey(reference, imageType, sourceUrl) {
 }
 
 function reviewCandidateKey(candidate) {
-  return crypto.createHash('sha1').update([
-    candidate.reference || '',
-    candidate.detection_type || '',
-    candidate.official_url || '',
-    candidate.official_name || '',
-    candidate.source_language || '',
-    candidate.diff_summary || '',
-  ].join('|')).digest('hex');
+  return crypto.createHash('sha1').update(reviewCandidateIdentity(candidate)).digest('hex');
+}
+
+function reviewCandidateIdentity(candidate) {
+  const type = normalizeText(candidate?.detection_type || 'review_candidate');
+  const reference = normalizeText(candidate?.reference || '').toUpperCase();
+  if (type === 'unregistered_reference') return `${type}|${reference}`;
+  if (type === 'unregistered_reference_image') return `${type}|${reference}`;
+  if (type === 'sales_sku_detected') return `${type}|${reference}`;
+  if (type === 'official_name_changed') {
+    return `${type}|${reference}|${normalizeText(candidate?.existing_version_key || candidate?.target_version_key || '')}`;
+  }
+  return `${type}|${reference}|${normalizeText(candidate?.existing_version_key || '')}`;
 }
 
 function sourceLanguageFromUrl(rawUrl) {
@@ -2127,7 +2132,7 @@ function buildUnregisteredReferenceReview({ reference, facts, url, source, sourc
     target_version_key: '',
     comment: '',
   };
-  candidate.detection_id = crypto.createHash('sha1').update(`unregistered_reference|${reference}`).digest('hex');
+  candidate.detection_id = reviewCandidateKey(candidate);
   return candidate;
 }
 
@@ -2149,7 +2154,7 @@ function buildSalesSkuReview({ sku, facts, url, source, sourceLanguage, discover
     target_version_key: '',
     comment: '',
   };
-  candidate.detection_id = crypto.createHash('sha1').update(`sales_sku_detected|${sku}|${url}`).digest('hex');
+  candidate.detection_id = reviewCandidateKey(candidate);
   return candidate;
 }
 

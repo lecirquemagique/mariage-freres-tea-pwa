@@ -344,14 +344,20 @@ function mfImageCollectorRecordReviewCandidate_(payload) {
 
   var sheet = mfImageCollectorGetOrCreateReviewSheet_();
   var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(value) { return String(value).trim(); });
-  var detectionId = String(candidate.detection_id || '').trim() || mfImageCollectorReviewDedupeKey_(candidate);
+  var detectionId = mfImageCollectorReviewDedupeKey_(candidate);
   var existingRow = mfImageCollectorFindReviewRow_(sheet, headers, detectionId);
+  var matchedByIdentity = false;
+  if (existingRow < 0) {
+    existingRow = mfImageCollectorFindReviewRowByIdentity_(sheet, headers, candidate);
+    matchedByIdentity = existingRow > 0;
+  }
   var rowValues = mfImageCollectorReviewCandidateToRow_(candidate, detectionId);
 
   if (existingRow > 0) {
     var status = String(sheet.getRange(existingRow, headers.indexOf('ステータス') + 1).getValue() || '');
     if (status === '要確認' || status === '保留') {
       mfImageCollectorSetReviewRowValues_(sheet, existingRow, {
+        '検出ID': matchedByIdentity ? detectionId : undefined,
         '検出日時': rowValues['検出日時'],
         '公式名': rowValues['公式名'],
         '公式URL': rowValues['公式URL'],
@@ -389,7 +395,7 @@ function mfImageCollectorValidateReviewCandidate_(payload) {
   var ss = mfImageCollectorOpenSpreadsheet_();
   var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_REVIEW_SHEET_NAME);
   if (!sheet || sheet.getLastRow() < 1 || sheet.getLastColumn() < 1) {
-    var fallbackDetectionId = String(candidate.detection_id || '').trim() || mfImageCollectorReviewDedupeKey_(candidate);
+    var fallbackDetectionId = mfImageCollectorReviewDedupeKey_(candidate);
     return {
       ok: true,
       valid: true,
@@ -402,8 +408,11 @@ function mfImageCollectorValidateReviewCandidate_(payload) {
     };
   }
   var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(value) { return String(value).trim(); });
-  var detectionId = String(candidate.detection_id || '').trim() || mfImageCollectorReviewDedupeKey_(candidate);
+  var detectionId = mfImageCollectorReviewDedupeKey_(candidate);
   var existingRow = mfImageCollectorFindReviewRow_(sheet, headers, detectionId);
+  if (existingRow < 0) {
+    existingRow = mfImageCollectorFindReviewRowByIdentity_(sheet, headers, candidate);
+  }
   var existingStatus = '';
   if (existingRow > 0) {
     existingStatus = String(sheet.getRange(existingRow, headers.indexOf('ステータス') + 1).getValue() || '');
@@ -537,19 +546,24 @@ function mfImageCollectorStableJson_(value) {
 }
 
 function mfImageCollectorReviewDedupeKey_(candidate) {
-  var raw = [
-    candidate.reference || '',
-    candidate.detection_type || '',
-    candidate.official_url || '',
-    candidate.official_name || '',
-    candidate.source_language || '',
-    candidate.diff_summary || ''
-  ].join('|');
+  var raw = mfImageCollectorReviewIdentity_(candidate);
   var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_1, raw, Utilities.Charset.UTF_8);
   return digest.map(function(byte) {
     var value = byte < 0 ? byte + 256 : byte;
     return ('0' + value.toString(16)).slice(-2);
   }).join('');
+}
+
+function mfImageCollectorReviewIdentity_(candidate) {
+  var type = String(candidate.detection_type || 'review_candidate').trim();
+  var reference = String(candidate.reference || '').trim().toUpperCase();
+  if (type === 'unregistered_reference') return type + '|' + reference;
+  if (type === 'unregistered_reference_image') return type + '|' + reference;
+  if (type === 'sales_sku_detected') return type + '|' + reference;
+  if (type === 'official_name_changed') {
+    return type + '|' + reference + '|' + String(candidate.existing_version_key || candidate.target_version_key || '').trim();
+  }
+  return type + '|' + reference + '|' + String(candidate.existing_version_key || '').trim();
 }
 
 function mfImageCollectorFindReviewRow_(sheet, headers, detectionId) {
@@ -562,9 +576,34 @@ function mfImageCollectorFindReviewRow_(sheet, headers, detectionId) {
   return -1;
 }
 
+function mfImageCollectorFindReviewRowByIdentity_(sheet, headers, candidate) {
+  if (sheet.getLastRow() < 2) return -1;
+  var refCol = headers.indexOf('Tリファレンス番号');
+  var typeCol = headers.indexOf('検出種別');
+  var versionCol = headers.indexOf('DB既存VersionKey');
+  if (refCol < 0 || typeCol < 0) return -1;
+
+  var type = String(candidate.detection_type || '').trim();
+  var reference = String(candidate.reference || '').trim().toUpperCase();
+  var versionKey = String(candidate.existing_version_key || candidate.target_version_key || '').trim();
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  for (var i = 0; i < values.length; i += 1) {
+    var rowType = String(values[i][typeCol] || '').trim();
+    var rowReference = String(values[i][refCol] || '').trim().toUpperCase();
+    if (rowType !== type || rowReference !== reference) continue;
+    if (type === 'official_name_changed') {
+      var rowVersion = versionCol >= 0 ? String(values[i][versionCol] || '').trim() : '';
+      if (rowVersion !== versionKey) continue;
+    }
+    return i + 2;
+  }
+  return -1;
+}
+
 function mfImageCollectorSetReviewRowValues_(sheet, rowNumber, updates) {
   var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(value) { return String(value).trim(); });
   Object.keys(updates).forEach(function(header) {
+    if (typeof updates[header] === 'undefined') return;
     var col = headers.indexOf(header);
     if (col >= 0) sheet.getRange(rowNumber, col + 1).setValue(updates[header]);
   });

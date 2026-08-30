@@ -12,4 +12,5 @@ logs/
 collector-state.json
 opportunistic-discoveries.json
 new-reference-discovery-state.json
+tmp/
 *.local.json
