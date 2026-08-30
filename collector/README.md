@@ -211,14 +211,42 @@ function doPost(e) {
 }
 ```
 
-Do not add separate action branches to `doPost(e)`. `mfImageCollectorDoPost(e)` handles both collector POST actions internally:
+Do not add separate action branches to `doPost(e)`. `mfImageCollectorDoPost(e)` handles collector POST actions internally:
 
 ```text
 uploadImageResults
 updateProductPageUrl
+recordReviewCandidate
+getReviewSummary
 ```
 
 If `茶葉サムネイルURL`, `公式商品ページURL状態`, or the status columns are missing, the helper appends them once at the end of the master sheet.
+
+## Human Review Workflow
+
+The collector does not automatically create new master rows or decide semantic master changes. It may update safe mechanical fields for an existing exact T reference, but human-review changes go to a separate `変更候補レビュー` sheet.
+
+Review-only detections include:
+
+- unregistered T references discovered from official image assets
+- official name differences for an existing T reference
+- future semantic changes such as SKU/form changes, revival, discontinuation, or version decisions
+
+The review sheet columns are:
+
+```text
+検出ID, 検出日時, Tリファレンス番号, 公式名, 検出種別, 公式URL, 言語, DB既存T, DB既存VersionKey, DB既存名, 差分概要, Collectorが取得した根拠, ステータス, 人間判定, 対象VersionKey, コメント, 処理日時
+```
+
+Repeated detections use a dedupe key so an existing `要確認` or `保留` review row is updated instead of duplicated.
+
+After replacing `backend/mf-image-collector.gs` and redeploying the web app, reload the spreadsheet. The custom menu `MARIAGE FRÈRES 管理` provides:
+
+- `変更レビュー`
+- `要確認件数を表示`
+- `レビュー更新`
+
+Only an explicit review decision can append or update semantic master rows. `販売SKUとして追加`, `既存銘柄と同一`, `終売情報として更新`, `誤検出`, and `保留` do not automatically append a master row in the current implementation.
 
 In Apps Script project settings, set this Script Property:
 

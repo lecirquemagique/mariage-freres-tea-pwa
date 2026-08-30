@@ -3,15 +3,50 @@
  *
  * Replace the existing mf-image-collector.gs file with this whole file.
  * Keep exactly one top-level doPost(e); mfImageCollectorDoPost(e) handles
- * both uploadImageResults and updateProductPageUrl actions.
+ * collector POST actions internally.
  */
 
 var MF_IMAGE_COLLECTOR_FOLDER_ID = '192M8W9aopop-k0H_xHMJBWkEVy3fK4eX';
 var MF_IMAGE_COLLECTOR_SHEET_NAME = '銘柄マスター';
+var MF_IMAGE_COLLECTOR_REVIEW_SHEET_NAME = '変更候補レビュー';
 var MF_IMAGE_COLLECTOR_SECRET_PROPERTY = 'MF_COLLECTOR_WRITE_SECRET';
+var MF_IMAGE_COLLECTOR_REVIEW_HEADERS = [
+  '検出ID',
+  '検出日時',
+  'Tリファレンス番号',
+  '公式名',
+  '検出種別',
+  '公式URL',
+  '言語',
+  'DB既存T',
+  'DB既存VersionKey',
+  'DB既存名',
+  '差分概要',
+  'Collectorが取得した根拠',
+  'ステータス',
+  '人間判定',
+  '対象VersionKey',
+  'コメント',
+  '処理日時'
+];
+var MF_IMAGE_COLLECTOR_REVIEW_STATUSES = ['要確認', '承認', '保留', '却下', '反映済み'];
+var MF_IMAGE_COLLECTOR_REVIEW_DECISIONS = [
+  '新規銘柄として追加',
+  '既存銘柄を更新',
+  '既存銘柄の新バージョンとして追加',
+  '販売SKUとして追加',
+  '既存銘柄と同一',
+  '終売情報として更新',
+  '誤検出',
+  '保留'
+];
 
 function doPost(e) {
   return mfImageCollectorDoPost(e);
+}
+
+function onOpen(e) {
+  mfImageCollectorOnOpen(e);
 }
 
 function mfImageCollectorDoPost(e) {
@@ -22,6 +57,13 @@ function mfImageCollectorDoPost(e) {
     }
     if (payload.action === 'updateProductPageUrl') {
       return mfImageCollectorJson_(mfImageCollectorUpdateProductPageUrl_(payload));
+    }
+    if (payload.action === 'recordReviewCandidate') {
+      return mfImageCollectorJson_(mfImageCollectorRecordReviewCandidate_(payload));
+    }
+    if (payload.action === 'getReviewSummary') {
+      mfImageCollectorAssertSecret_(payload);
+      return mfImageCollectorJson_(mfImageCollectorGetReviewSummary());
     }
     return mfImageCollectorJson_({ ok: false, error: 'Unsupported action.' });
   } catch (error) {
@@ -172,6 +214,111 @@ function mfImageCollectorMakeFilesDisplayable(fileIds) {
   return updated;
 }
 
+function mfImageCollectorOnOpen(e) {
+  SpreadsheetApp.getUi()
+    .createMenu('MARIAGE FRÈRES 管理')
+    .addItem('変更レビュー', 'mfImageCollectorShowReviewDialog')
+    .addItem('要確認件数を表示', 'mfImageCollectorShowReviewSummary')
+    .addItem('レビュー更新', 'mfImageCollectorRefreshReviewSheet')
+    .addToUi();
+}
+
+function mfImageCollectorShowReviewSummary() {
+  var summary = mfImageCollectorGetReviewSummary();
+  SpreadsheetApp.getUi().alert(
+    '変更候補レビュー',
+    '要確認: ' + summary.pending_count + '件\n最古の未処理: ' + (summary.oldest_pending_at || 'なし'),
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+function mfImageCollectorShowReviewDialog() {
+  var html = HtmlService.createHtmlOutput(mfImageCollectorReviewHtml_())
+    .setWidth(820)
+    .setHeight(720);
+  SpreadsheetApp.getUi().showModalDialog(html, 'MARIAGE FRÈRES 変更レビュー');
+}
+
+function mfImageCollectorRefreshReviewSheet() {
+  mfImageCollectorGetOrCreateReviewSheet_();
+  mfImageCollectorShowReviewSummary();
+}
+
+function mfImageCollectorGetReviewItems(status) {
+  var sheet = mfImageCollectorGetOrCreateReviewSheet_();
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var statusCol = headers.indexOf('ステータス');
+  var items = [];
+  for (var i = 1; i < values.length; i += 1) {
+    var row = values[i];
+    if (status && String(row[statusCol] || '') !== status) continue;
+    var item = { row_number: i + 1 };
+    for (var j = 0; j < headers.length; j += 1) item[headers[j]] = row[j];
+    items.push(item);
+  }
+  return items;
+}
+
+function mfImageCollectorApplyReviewDecision(rowNumber, decision, targetVersionKey, comment) {
+  var sheet = mfImageCollectorGetOrCreateReviewSheet_();
+  var row = Number(rowNumber);
+  if (!row || row < 2 || row > sheet.getLastRow()) throw new Error('Invalid review row.');
+  var values = sheet.getRange(row, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(value) { return String(value).trim(); });
+  var review = {};
+  for (var i = 0; i < headers.length; i += 1) review[headers[i]] = values[i];
+
+  if (MF_IMAGE_COLLECTOR_REVIEW_DECISIONS.indexOf(decision) < 0) throw new Error('Unsupported review decision.');
+  var finalStatus = '反映済み';
+  if (decision === '保留') finalStatus = '保留';
+  if (decision === '誤検出') finalStatus = '却下';
+
+  if (finalStatus === '反映済み') {
+    mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey);
+  }
+
+  mfImageCollectorSetReviewRowValues_(sheet, row, {
+    'ステータス': finalStatus,
+    '人間判定': decision,
+    '対象VersionKey': targetVersionKey || review['対象VersionKey'] || '',
+    'コメント': comment || review['コメント'] || '',
+    '処理日時': new Date()
+  });
+  return { ok: true, row_number: row, status: finalStatus, decision: decision };
+}
+
+function mfImageCollectorRecordReviewCandidate_(payload) {
+  mfImageCollectorAssertSecret_(payload);
+  var candidate = payload.candidate || {};
+  var reference = String(candidate.reference || '').trim();
+  if (!reference) throw new Error('candidate.reference is required.');
+
+  var sheet = mfImageCollectorGetOrCreateReviewSheet_();
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(value) { return String(value).trim(); });
+  var detectionId = String(candidate.detection_id || '').trim() || mfImageCollectorReviewDedupeKey_(candidate);
+  var existingRow = mfImageCollectorFindReviewRow_(sheet, headers, detectionId);
+  var rowValues = mfImageCollectorReviewCandidateToRow_(candidate, detectionId);
+
+  if (existingRow > 0) {
+    var status = String(sheet.getRange(existingRow, headers.indexOf('ステータス') + 1).getValue() || '');
+    if (status === '要確認' || status === '保留') {
+      mfImageCollectorSetReviewRowValues_(sheet, existingRow, {
+        '検出日時': rowValues['検出日時'],
+        'Collectorが取得した根拠': rowValues['Collectorが取得した根拠'],
+        'コメント': rowValues['コメント']
+      });
+      return { ok: true, action: 'updated_existing', detection_id: detectionId, sheet_row: existingRow };
+    }
+    return { ok: true, action: 'skipped_existing_final', detection_id: detectionId, sheet_row: existingRow };
+  }
+
+  sheet.appendRow(MF_IMAGE_COLLECTOR_REVIEW_HEADERS.map(function(header) { return rowValues[header] || ''; }));
+  mfImageCollectorApplyReviewValidation_(sheet);
+  return { ok: true, action: 'created', detection_id: detectionId, sheet_row: sheet.getLastRow() };
+}
+
 function mfImageCollectorOpenSpreadsheet_() {
   var spreadsheetId = PropertiesService.getScriptProperties().getProperty('MF_MASTER_SPREADSHEET_ID');
   if (!spreadsheetId && typeof SPREADSHEET_ID !== 'undefined') {
@@ -180,6 +327,192 @@ function mfImageCollectorOpenSpreadsheet_() {
   var ss = spreadsheetId ? SpreadsheetApp.openById(spreadsheetId) : SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) throw new Error('Spreadsheet not found. Bind this script, define SPREADSHEET_ID, or set MF_MASTER_SPREADSHEET_ID.');
   return ss;
+}
+
+function mfImageCollectorGetOrCreateReviewSheet_() {
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_REVIEW_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(MF_IMAGE_COLLECTOR_REVIEW_SHEET_NAME);
+    sheet.getRange(1, 1, 1, MF_IMAGE_COLLECTOR_REVIEW_HEADERS.length).setValues([MF_IMAGE_COLLECTOR_REVIEW_HEADERS]);
+    sheet.setFrozenRows(1);
+  } else {
+    var headers = sheet.getLastColumn() > 0
+      ? sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(value) { return String(value).trim(); })
+      : [];
+    for (var i = 0; i < MF_IMAGE_COLLECTOR_REVIEW_HEADERS.length; i += 1) {
+      if (headers.indexOf(MF_IMAGE_COLLECTOR_REVIEW_HEADERS[i]) < 0) {
+        sheet.insertColumnAfter(sheet.getLastColumn());
+        sheet.getRange(1, sheet.getLastColumn()).setValue(MF_IMAGE_COLLECTOR_REVIEW_HEADERS[i]);
+      }
+    }
+  }
+  mfImageCollectorApplyReviewValidation_(sheet);
+  return sheet;
+}
+
+function mfImageCollectorApplyReviewValidation_(sheet) {
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(value) { return String(value).trim(); });
+  var statusCol = headers.indexOf('ステータス') + 1;
+  var decisionCol = headers.indexOf('人間判定') + 1;
+  var maxRows = Math.max(sheet.getMaxRows() - 1, 1);
+  if (statusCol > 0) {
+    sheet.getRange(2, statusCol, maxRows, 1).setDataValidation(
+      SpreadsheetApp.newDataValidation().requireValueInList(MF_IMAGE_COLLECTOR_REVIEW_STATUSES, true).setAllowInvalid(false).build()
+    );
+  }
+  if (decisionCol > 0) {
+    sheet.getRange(2, decisionCol, maxRows, 1).setDataValidation(
+      SpreadsheetApp.newDataValidation().requireValueInList(MF_IMAGE_COLLECTOR_REVIEW_DECISIONS, true).setAllowInvalid(false).build()
+    );
+  }
+}
+
+function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
+  return {
+    '検出ID': detectionId,
+    '検出日時': candidate.detected_at ? new Date(candidate.detected_at) : new Date(),
+    'Tリファレンス番号': String(candidate.reference || '').trim(),
+    '公式名': String(candidate.official_name || '').trim(),
+    '検出種別': String(candidate.detection_type || '').trim(),
+    '公式URL': String(candidate.official_url || '').trim(),
+    '言語': String(candidate.source_language || '').trim(),
+    'DB既存T': String(candidate.existing_reference || '').trim(),
+    'DB既存VersionKey': String(candidate.existing_version_key || '').trim(),
+    'DB既存名': String(candidate.existing_name || '').trim(),
+    '差分概要': String(candidate.diff_summary || '').trim(),
+    'Collectorが取得した根拠': String(candidate.evidence || '').trim(),
+    'ステータス': String(candidate.status || '要確認').trim(),
+    '人間判定': String(candidate.human_decision || '').trim(),
+    '対象VersionKey': String(candidate.target_version_key || '').trim(),
+    'コメント': String(candidate.comment || '').trim(),
+    '処理日時': ''
+  };
+}
+
+function mfImageCollectorReviewDedupeKey_(candidate) {
+  var raw = [
+    candidate.reference || '',
+    candidate.detection_type || '',
+    candidate.official_url || '',
+    candidate.official_name || '',
+    candidate.source_language || '',
+    candidate.diff_summary || ''
+  ].join('|');
+  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_1, raw, Utilities.Charset.UTF_8);
+  return digest.map(function(byte) {
+    var value = byte < 0 ? byte + 256 : byte;
+    return ('0' + value.toString(16)).slice(-2);
+  }).join('');
+}
+
+function mfImageCollectorFindReviewRow_(sheet, headers, detectionId) {
+  var idCol = headers.indexOf('検出ID');
+  if (idCol < 0 || sheet.getLastRow() < 2) return -1;
+  var values = sheet.getRange(2, idCol + 1, sheet.getLastRow() - 1, 1).getValues();
+  for (var i = 0; i < values.length; i += 1) {
+    if (String(values[i][0] || '') === detectionId) return i + 2;
+  }
+  return -1;
+}
+
+function mfImageCollectorSetReviewRowValues_(sheet, rowNumber, updates) {
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(value) { return String(value).trim(); });
+  Object.keys(updates).forEach(function(header) {
+    var col = headers.indexOf(header);
+    if (col >= 0) sheet.getRange(rowNumber, col + 1).setValue(updates[header]);
+  });
+}
+
+function mfImageCollectorGetReviewSummary() {
+  var sheet = mfImageCollectorGetOrCreateReviewSheet_();
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) return { ok: true, pending_count: 0, hold_count: 0, oldest_pending_at: '' };
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var statusCol = headers.indexOf('ステータス');
+  var detectedAtCol = headers.indexOf('検出日時');
+  var pendingCount = 0;
+  var holdCount = 0;
+  var oldest = null;
+  for (var i = 1; i < values.length; i += 1) {
+    var status = String(values[i][statusCol] || '');
+    if (status === '要確認') {
+      pendingCount += 1;
+      var detected = values[i][detectedAtCol];
+      if (detected && (!oldest || detected < oldest)) oldest = detected;
+    }
+    if (status === '保留') holdCount += 1;
+  }
+  return {
+    ok: true,
+    pending_count: pendingCount,
+    hold_count: holdCount,
+    oldest_pending_at: oldest ? Utilities.formatDate(new Date(oldest), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss') : ''
+  };
+}
+
+function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey) {
+  if (decision === '誤検出' || decision === '保留') return;
+  if (decision === '販売SKUとして追加' || decision === '既存銘柄と同一' || decision === '終売情報として更新') return;
+
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var versionCol = headers.indexOf('VersionKey');
+  var refCol = headers.indexOf('Tリファレンス番号');
+  var nameCol = headers.indexOf('現在の公式名');
+  var urlCol = headers.indexOf('公式商品ページURL');
+  if (versionCol < 0 || refCol < 0 || nameCol < 0) throw new Error('Master columns required for approved review are missing.');
+
+  if (decision === '新規銘柄として追加' || decision === '既存銘柄の新バージョンとして追加') {
+    var versionKey = targetVersionKey || mfImageCollectorNextVersionKey_(values, headers, String(review['Tリファレンス番号'] || ''));
+    var newRow = headers.map(function(header) {
+      if (header === 'VersionKey') return versionKey;
+      if (header === 'Tリファレンス番号') return review['Tリファレンス番号'] || '';
+      if (header === '現在の公式名') return review['公式名'] || '';
+      if (header === '公式商品ページURL') return review['公式URL'] || '';
+      if (header === '公式商品ページURL状態') return review['公式URL'] ? 'available' : 'pending';
+      return '';
+    });
+    sheet.appendRow(newRow);
+    return;
+  }
+
+  if (decision === '既存銘柄を更新') {
+    var row = mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, targetVersionKey, String(review['Tリファレンス番号'] || ''));
+    if (row < 2) throw new Error('Target master row was not found.');
+    if (review['公式名']) sheet.getRange(row, nameCol + 1).setValue(review['公式名']);
+    if (urlCol >= 0 && review['公式URL']) sheet.getRange(row, urlCol + 1).setValue(review['公式URL']);
+  }
+}
+
+function mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, versionKey, reference) {
+  var versionCol = headers.indexOf('VersionKey');
+  var refCol = headers.indexOf('Tリファレンス番号');
+  for (var i = 1; i < values.length; i += 1) {
+    if (versionKey && versionCol >= 0 && String(values[i][versionCol] || '') === String(versionKey)) return i + 1;
+    if (reference && refCol >= 0 && String(values[i][refCol] || '') === String(reference)) return i + 1;
+  }
+  return -1;
+}
+
+function mfImageCollectorNextVersionKey_(values, headers, reference) {
+  var versionCol = headers.indexOf('VersionKey');
+  var prefix = String(reference || '').trim() + '-N';
+  var max = 0;
+  for (var i = 1; i < values.length; i += 1) {
+    var value = String(values[i][versionCol] || '');
+    if (value.indexOf(prefix) !== 0) continue;
+    var number = Number(value.slice(prefix.length));
+    if (number > max) max = number;
+  }
+  return prefix + ('0' + (max + 1)).slice(-2);
+}
+
+function mfImageCollectorReviewHtml_() {
+  return '<!doctype html><html><head><base target="_top"><style>body{font-family:Arial,sans-serif;margin:20px}button,select,input,textarea{font:inherit;margin:4px 0}.item{border:1px solid #ddd;padding:12px;margin:12px 0}.muted{color:#666}.url{word-break:break-all}</style></head><body><h2>変更候補レビュー</h2><div id="summary"></div><div id="items"></div><script>function esc(s){return String(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}function load(){google.script.run.withSuccessHandler(render).mfImageCollectorGetReviewItems("要確認");google.script.run.withSuccessHandler(s=>document.getElementById("summary").textContent="要確認 "+s.pending_count+"件 / 最古 "+(s.oldest_pending_at||"なし")).mfImageCollectorGetReviewSummary();}function render(items){document.getElementById("items").innerHTML=(items||[]).map((it,idx)=>`<div class="item"><b>${esc(it["Tリファレンス番号"])}</b> ${esc(it["公式名"])}<div class="muted">${esc(it["検出種別"])} / ${esc(it["言語"])}</div><div>DB: ${esc(it["DB既存VersionKey"])} ${esc(it["DB既存名"])}</div><div>${esc(it["差分概要"])}</div><div class="url"><a href="${esc(it["公式URL"])}" target="_blank">${esc(it["公式URL"])}</a></div><div><select id="d${idx}"><option>保留</option><option>新規銘柄として追加</option><option>既存銘柄を更新</option><option>既存銘柄の新バージョンとして追加</option><option>販売SKUとして追加</option><option>既存銘柄と同一</option><option>終売情報として更新</option><option>誤検出</option></select><input id="v${idx}" placeholder="対象VersionKey"><textarea id="c${idx}" placeholder="コメント"></textarea><button onclick="apply(${idx},${it.row_number})">反映</button></div></div>`).join("")||"要確認はありません";}function apply(idx,row){google.script.run.withSuccessHandler(load).withFailureHandler(e=>alert(e.message||e)).mfImageCollectorApplyReviewDecision(row,document.getElementById("d"+idx).value,document.getElementById("v"+idx).value,document.getElementById("c"+idx).value);}load();</script></body></html>';
 }
 
 function mfImageCollectorUpdateProductPageUrl_(payload) {

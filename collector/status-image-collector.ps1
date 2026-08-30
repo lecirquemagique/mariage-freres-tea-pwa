@@ -100,6 +100,7 @@ function Show-MasterSummary($Root, $NodeExe) {
     Write-Host ("Master status: complete={0} pending={1} not_found={2} legacy_not_found_recheck={3} retry={4} error={5} partial={6}" -f $Summary.counts.complete, $Summary.counts.pending, $Summary.counts.not_found, $Summary.counts.legacy_not_found_recheck, $Summary.counts.retry, $Summary.counts.error, $Summary.counts.partial)
     if ($null -ne $Summary.opportunistic_cache) {
       Write-Host ("Opportunistic cache: images={0} unapplied={1}" -f $Summary.opportunistic_cache.image_count, $Summary.opportunistic_cache.unapplied_image_count)
+      Write-Host ("Review cache: candidates={0} unposted={1}" -f $Summary.opportunistic_cache.review_candidate_count, $Summary.opportunistic_cache.unposted_review_candidate_count)
     }
     Write-Host "Next candidates:"
     $Candidates = @($Summary.next_candidates)

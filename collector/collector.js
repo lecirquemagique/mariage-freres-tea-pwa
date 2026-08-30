@@ -3,6 +3,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { chromium } = require('playwright');
 
 const DEFAULT_CONFIG = 'config.json';
@@ -27,6 +28,7 @@ const MASTER_COLUMNS = {
   liqueurImageStatus: '水色画像状態',
   productUrl: '公式商品ページURL',
   productUrlStatus: '公式商品ページURL状態',
+  versionKey: 'VersionKey',
 };
 const MIME_EXT = {
   'image/jpeg': '.jpg',
@@ -366,6 +368,37 @@ async function writeBackProductPageUrl({ config, baseDir, product, discovery, de
   };
 }
 
+async function writeBackReviewCandidate({ config, baseDir, candidate, debug }) {
+  const settings = getWriteBackSettings(config, baseDir);
+  if (!settings) return null;
+
+  const payload = {
+    action: 'recordReviewCandidate',
+    secret: settings.secret,
+    candidate,
+  };
+  if (debug) {
+    console.log(`[review-writeback] ${candidate.reference} ${candidate.detection_type} ${candidate.detection_id || ''}`);
+  }
+
+  const response = await fetch(settings.gasApiUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(formatWriteBackResponseError('Review candidate writeback did not return JSON', settings, response, text));
+  }
+  if (!response.ok || data.ok === false) {
+    throw new Error(formatWriteBackResponseError(`Review candidate writeback failed: ${data.error || responsePreview(text)}`, settings, response, text));
+  }
+  return data;
+}
+
 function parseJsonp(text, callbackName = '__mfCollectorCb') {
   const trimmed = text.trim();
   const prefix = `${callbackName}(`;
@@ -425,6 +458,7 @@ async function fetchMasterProducts(config, baseDir, debug) {
           teaImageStatus: normalizeImageStatus(row[MASTER_COLUMNS.teaImageStatus]),
           teaThumbnailStatus: normalizeImageStatus(row[MASTER_COLUMNS.teaThumbnailStatus]),
           liqueurImageStatus: normalizeImageStatus(row[MASTER_COLUMNS.liqueurImageStatus]),
+          versionKey: normalizeText(row[MASTER_COLUMNS.versionKey]),
         },
       };
     })
@@ -620,9 +654,103 @@ function discoveryCacheKey(reference, imageType, sourceUrl) {
   return `${String(reference || '').toUpperCase()}|${imageType}|${sourceUrl}`;
 }
 
+function reviewCandidateKey(candidate) {
+  return crypto.createHash('sha1').update([
+    candidate.reference || '',
+    candidate.detection_type || '',
+    candidate.official_url || '',
+    candidate.official_name || '',
+    candidate.source_language || '',
+    candidate.diff_summary || '',
+  ].join('|')).digest('hex');
+}
+
+function sourceLanguageFromUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (url.hostname.endsWith('co.jp')) return 'JP';
+    if (url.pathname.startsWith('/en/')) return 'EN';
+    if (url.pathname.startsWith('/fr/')) return 'FR';
+  } catch {
+  }
+  return '';
+}
+
+function normalizeNameForCompare(value) {
+  return normalizeText(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[®™'’`´.,:;!?\-_/()[\]{}]/g, ' ')
+    .replace(/\b(the|tea|thes|au|poids|mariage|freres)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+}
+
+async function extractOfficialName(page) {
+  return page.evaluate(() => {
+    const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const selectors = [
+      'h1.page-title span',
+      'h1.page-title',
+      '.page-title-wrapper h1 span',
+      '.page-title-wrapper h1',
+      'h1',
+      '[itemprop="name"]',
+    ];
+    for (const selector of selectors) {
+      const value = clean(document.querySelector(selector)?.textContent);
+      if (value) return value;
+    }
+    return clean(document.title).replace(/\s*\|\s*MARIAGE\s+FR[ÈE]RES.*$/i, '');
+  }).catch(() => '');
+}
+
+function officialNameReviewCandidate(product, officialName, pageUrl) {
+  const existingName = normalizeText(product.name);
+  if (!existingName || !officialName) return null;
+  if (normalizeNameForCompare(existingName) === normalizeNameForCompare(officialName)) return null;
+  const candidate = {
+    detected_at: nowIso(),
+    reference: product.reference,
+    official_name: officialName,
+    detection_type: 'official_name_changed',
+    official_url: pageUrl,
+    source_language: sourceLanguageFromUrl(pageUrl),
+    existing_reference: product.reference,
+    existing_version_key: product.master?.versionKey || '',
+    existing_name: existingName,
+    diff_summary: `Official name differs from the current master name: "${existingName}" -> "${officialName}".`,
+    evidence: `verified_product_page=${pageUrl}; exact_reference=${product.reference}`,
+    status: '要確認',
+    human_decision: '',
+    target_version_key: product.master?.versionKey || '',
+    comment: '',
+  };
+  candidate.detection_id = reviewCandidateKey(candidate);
+  return candidate;
+}
+
+function cacheReviewCandidate(cache, candidate) {
+  if (!cache) return false;
+  const item = { ...candidate };
+  item.detection_id = item.detection_id || reviewCandidateKey(item);
+  if (cache.review_candidates[item.detection_id]) {
+    cache.review_candidates[item.detection_id] = {
+      ...cache.review_candidates[item.detection_id],
+      detected_at: item.detected_at || cache.review_candidates[item.detection_id].detected_at,
+      evidence: item.evidence || cache.review_candidates[item.detection_id].evidence,
+    };
+    return false;
+  }
+  cache.review_candidates[item.detection_id] = item;
+  return true;
+}
+
 function ensureDiscoveryCacheShape(cache) {
   const shaped = cache && typeof cache === 'object' ? cache : {};
   shaped.images = shaped.images && typeof shaped.images === 'object' ? shaped.images : {};
+  shaped.review_candidates = shaped.review_candidates && typeof shaped.review_candidates === 'object' ? shaped.review_candidates : {};
   return shaped;
 }
 
@@ -651,6 +779,7 @@ function discoveryCacheCandidates(cache, product) {
 function updateDiscoveryCache({ cache, candidates, product, pageUrl, masterReferences, debug }) {
   const detectedAt = nowIso();
   let added = 0;
+  let reviewAdded = 0;
   for (const candidate of candidates) {
     const info = imageInfoFromOfficialUrl(candidate.url);
     if (!info) continue;
@@ -662,7 +791,30 @@ function updateDiscoveryCache({ cache, candidates, product, pageUrl, masterRefer
       reference = String(product.reference || '').toUpperCase();
       verificationStatus = 'current_verified_product_page';
     }
-    if (!reference || !masterReferences.has(reference)) continue;
+    if (!reference) continue;
+    if (!masterReferences.has(reference)) {
+      if (info.imageType !== 'liqueur') {
+        const review = {
+          detected_at: detectedAt,
+          reference,
+          official_name: '',
+          detection_type: 'unregistered_reference_image',
+          official_url: candidate.url,
+          source_language: sourceLanguageFromUrl(pageUrl),
+          existing_reference: '',
+          existing_version_key: '',
+          existing_name: '',
+          diff_summary: `Unregistered ${reference} ${info.imageType} image was discovered while collecting an official page.`,
+          evidence: `image_type=${info.imageType}; image_url=${candidate.url}; discovered_from_page=${pageUrl}`,
+          status: '要確認',
+          human_decision: '',
+          target_version_key: '',
+          comment: '',
+        };
+        if (cacheReviewCandidate(cache, review)) reviewAdded += 1;
+      }
+      continue;
+    }
 
     const key = discoveryCacheKey(reference, info.imageType, candidate.url);
     if (cache.images[key]) {
@@ -689,7 +841,7 @@ function updateDiscoveryCache({ cache, candidates, product, pageUrl, masterRefer
     };
     added += 1;
   }
-  if (debug && added) console.log(`[opportunistic] cached ${added} image candidate(s) from ${product.reference}`);
+  if (debug && (added || reviewAdded)) console.log(`[opportunistic] cached ${added} image candidate(s), ${reviewAdded} review candidate(s) from ${product.reference}`);
   return added;
 }
 
@@ -762,7 +914,7 @@ async function collectProductSearchCandidates(page) {
   });
 }
 
-async function discoverProductPageUrl(context, product, config, debug) {
+async function discoverProductPageUrl(context, product, config, debug, discoveryCache = null, masterReferences = new Set()) {
   const page = await context.newPage();
   const queries = productSearchQueries(product);
   const seen = new Set();
@@ -797,6 +949,29 @@ async function discoverProductPageUrl(context, product, config, debug) {
         }
 
         const candidates = await collectProductSearchCandidates(page);
+        for (const candidate of candidates) {
+          for (const token of candidateReferenceTokens(candidate)) {
+            if (token === String(product.reference || '').toUpperCase()) continue;
+            if (masterReferences.has(token)) continue;
+            cacheReviewCandidate(discoveryCache, {
+              detected_at: nowIso(),
+              reference: token,
+              official_name: candidate.text || '',
+              detection_type: 'unregistered_reference_search_result',
+              official_url: candidate.href,
+              source_language: sourceLanguageFromUrl(candidate.href || searchUrl),
+              existing_reference: '',
+              existing_version_key: '',
+              existing_name: '',
+              diff_summary: `Unregistered ${token} was discovered in official search results.`,
+              evidence: `search_url=${searchUrl}; query=${query}; result_text=${candidate.text || candidate.closestText || ''}`,
+              status: '要確認',
+              human_decision: '',
+              target_version_key: '',
+              comment: '',
+            });
+          }
+        }
         const urls = candidates
           .map((candidate) => candidate.href)
           .filter((url) => looksLikeProductUrl(url))
@@ -1206,7 +1381,7 @@ async function processProduct({
   const pageUrl = product.productUrl;
   const cdp = await createCdpNetworkCapture(page, debug);
   const startedAt = Date.now();
-  const result = { reference: product.reference, pageUrl, images: {}, successCount: 0 };
+  const result = { reference: product.reference, pageUrl, images: {}, successCount: 0, reviewCandidates: [] };
 
   try {
     if (debug) console.log(`[open] ${product.reference} ${pageUrl}`);
@@ -1230,6 +1405,9 @@ async function processProduct({
     if (blocked) {
       throw new Error('Page appears to be blocked by browser verification. Run with --headed and complete the verification in the persistent profile.');
     }
+    const officialName = await extractOfficialName(page);
+    const nameReview = officialNameReviewCandidate(product, officialName, page.url());
+    if (nameReview) result.reviewCandidates.push(nameReview);
 
     const domCandidates = await collectDomCandidates(page, pageUrl);
     const cacheCandidates = await collectCacheApiCandidates(page);
@@ -1435,6 +1613,7 @@ function masterImageResolved(product, imageType) {
 
 function discoveryCacheStats(cache, masterProducts = []) {
   const entries = Object.values(cache?.images || {});
+  const reviewEntries = Object.values(cache?.review_candidates || {});
   const masterByReference = new Map(masterProducts.map((product) => [product.reference, product]));
   const unapplied = entries.filter((entry) => {
     const product = masterByReference.get(entry.reference);
@@ -1443,7 +1622,34 @@ function discoveryCacheStats(cache, masterProducts = []) {
   return {
     image_count: entries.length,
     unapplied_image_count: unapplied.length,
+    review_candidate_count: reviewEntries.length,
+    unposted_review_candidate_count: reviewEntries.filter((entry) => !entry.write_back_success).length,
   };
+}
+
+async function writeBackReviewCandidates({ config, baseDir, candidates, debug }) {
+  if (!writeBackRequired(config) || !candidates?.length) return [];
+  const results = [];
+  for (const candidate of candidates) {
+    try {
+      const result = await writeBackReviewCandidate({ config, baseDir, candidate, debug });
+      results.push({ detection_id: candidate.detection_id, success: true, result });
+    } catch (error) {
+      results.push({ detection_id: candidate.detection_id, success: false, error_message: error.message });
+      if (debug) console.log(`[review-writeback-failed] ${candidate.reference} ${candidate.detection_type} ${error.message}`);
+    }
+  }
+  return results;
+}
+
+function markReviewWriteBackResults(discoveryCache, results) {
+  for (const result of results || []) {
+    const entry = discoveryCache?.review_candidates?.[result.detection_id];
+    if (!entry) continue;
+    entry.last_write_back_at = nowIso();
+    entry.write_back_success = result.success;
+    entry.write_back_error = result.error_message || '';
+  }
 }
 
 function buildStatusSummary(config, state, master, products, discoveryCache = null) {
@@ -1792,7 +1998,7 @@ async function main() {
               acquired_at: nowIso(),
               error_message: '',
             }
-          : await discoverProductPageUrl(context, product, config, args.debug);
+          : await discoverProductPageUrl(context, product, config, args.debug, discoveryCache, masterReferences);
         const previous = state.products?.[product.reference] || {};
         const maxRetries = Number.isFinite(config.maxRetries) ? config.maxRetries : 3;
         const normalizedDiscoveryStatus = normalizeProductUrlStatus(discovery.status);
@@ -1858,7 +2064,13 @@ async function main() {
             images: previous.images || {},
             writeBack: previous.writeBack || null,
           };
+          if (discoveryCache && writeBackRequired(config)) {
+            const pendingReviewCandidates = Object.values(discoveryCache.review_candidates || {}).filter((candidate) => !candidate.write_back_success);
+            const reviewWriteBacks = await writeBackReviewCandidates({ config, baseDir, candidates: pendingReviewCandidates, debug: args.debug });
+            markReviewWriteBackResults(discoveryCache, reviewWriteBacks);
+          }
           writeJson(paths.stateFile, state);
+          writeJson(paths.discoveryCacheFile, discoveryCache);
           logUrlDiscoverySummary(product, { ...discoveryResult, status });
           if (i < products.length - 1) {
             const waitMs = randomDelay(config.pageDelayMs);
@@ -1887,6 +2099,16 @@ async function main() {
         result.writeBack = { success: false, error_message: error.message, updated_at: nowIso() };
         result.error = result.error ? `${result.error} | writeback: ${error.message}` : `writeback: ${error.message}`;
         if (args.debug) console.log(`[writeback-failed] ${product.reference} ${error.message}`);
+      }
+      if (discoveryCache && result.reviewCandidates?.length) {
+        for (const candidate of result.reviewCandidates) {
+          cacheReviewCandidate(discoveryCache, candidate);
+        }
+      }
+      if (discoveryCache && writeBackRequired(config)) {
+        const pendingReviewCandidates = Object.values(discoveryCache.review_candidates || {}).filter((candidate) => !candidate.write_back_success);
+        const reviewWriteBacks = await writeBackReviewCandidates({ config, baseDir, candidates: pendingReviewCandidates, debug: args.debug });
+        markReviewWriteBackResults(discoveryCache, reviewWriteBacks);
       }
       updateState(state, product, result, Number.isFinite(config.maxRetries) ? config.maxRetries : 3, config);
       writeJson(paths.stateFile, state);
