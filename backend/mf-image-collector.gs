@@ -27,7 +27,17 @@ var MF_IMAGE_COLLECTOR_REVIEW_HEADERS = [
   '人間判定',
   '対象VersionKey',
   'コメント',
-  '処理日時'
+  '処理日時',
+  'FR公式URL',
+  'EN公式URL',
+  'JP公式URL',
+  '確認言語',
+  '公式名称差',
+  '公式説明抜粋',
+  'DB存在確認',
+  'DB類似候補',
+  'Discovery source',
+  '公式情報JSON'
 ];
 var MF_IMAGE_COLLECTOR_REVIEW_STATUSES = ['要確認', '承認', '保留', '却下', '反映済み'];
 var MF_IMAGE_COLLECTOR_REVIEW_DECISIONS = [
@@ -325,8 +335,22 @@ function mfImageCollectorRecordReviewCandidate_(payload) {
     if (status === '要確認' || status === '保留') {
       mfImageCollectorSetReviewRowValues_(sheet, existingRow, {
         '検出日時': rowValues['検出日時'],
+        '公式名': rowValues['公式名'],
+        '公式URL': rowValues['公式URL'],
+        '言語': rowValues['言語'],
+        '差分概要': rowValues['差分概要'],
         'Collectorが取得した根拠': rowValues['Collectorが取得した根拠'],
-        'コメント': rowValues['コメント']
+        'コメント': rowValues['コメント'],
+        'FR公式URL': rowValues['FR公式URL'],
+        'EN公式URL': rowValues['EN公式URL'],
+        'JP公式URL': rowValues['JP公式URL'],
+        '確認言語': rowValues['確認言語'],
+        '公式名称差': rowValues['公式名称差'],
+        '公式説明抜粋': rowValues['公式説明抜粋'],
+        'DB存在確認': rowValues['DB存在確認'],
+        'DB類似候補': rowValues['DB類似候補'],
+        'Discovery source': rowValues['Discovery source'],
+        '公式情報JSON': rowValues['公式情報JSON']
       });
       return { ok: true, action: 'updated_existing', detection_id: detectionId, sheet_row: existingRow };
     }
@@ -401,8 +425,10 @@ function mfImageCollectorGetOrCreateReviewSheet_() {
       : [];
     for (var i = 0; i < MF_IMAGE_COLLECTOR_REVIEW_HEADERS.length; i += 1) {
       if (headers.indexOf(MF_IMAGE_COLLECTOR_REVIEW_HEADERS[i]) < 0) {
-        sheet.insertColumnAfter(sheet.getLastColumn());
-        sheet.getRange(1, sheet.getLastColumn()).setValue(MF_IMAGE_COLLECTOR_REVIEW_HEADERS[i]);
+        var lastColumn = Math.max(sheet.getLastColumn(), 1);
+        sheet.insertColumnAfter(lastColumn);
+        sheet.getRange(1, lastColumn + 1).setValue(MF_IMAGE_COLLECTOR_REVIEW_HEADERS[i]);
+        headers.push(MF_IMAGE_COLLECTOR_REVIEW_HEADERS[i]);
       }
     }
   }
@@ -428,6 +454,13 @@ function mfImageCollectorApplyReviewValidation_(sheet) {
 }
 
 function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
+  var officialInfo = {
+    urls_by_language: candidate.official_urls_by_language || {},
+    names_by_language: candidate.official_names_by_language || {},
+    description_snippets_by_language: candidate.description_snippets_by_language || {},
+    master_absence_confirmed: candidate.master_absence_confirmed === true,
+    similar_master_candidates: candidate.similar_master_candidates || []
+  };
   return {
     '検出ID': detectionId,
     '検出日時': candidate.detected_at ? new Date(candidate.detected_at) : new Date(),
@@ -445,8 +478,24 @@ function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
     '人間判定': String(candidate.human_decision || '').trim(),
     '対象VersionKey': String(candidate.target_version_key || '').trim(),
     'コメント': String(candidate.comment || '').trim(),
-    '処理日時': ''
+    '処理日時': '',
+    'FR公式URL': String(candidate.fr_official_url || (candidate.official_urls_by_language && candidate.official_urls_by_language.FR) || '').trim(),
+    'EN公式URL': String(candidate.en_official_url || (candidate.official_urls_by_language && candidate.official_urls_by_language.EN) || '').trim(),
+    'JP公式URL': String(candidate.jp_official_url || (candidate.official_urls_by_language && candidate.official_urls_by_language.JP) || '').trim(),
+    '確認言語': String(candidate.source_language || '').trim(),
+    '公式名称差': String(candidate.official_name_differences || '').trim(),
+    '公式説明抜粋': String(candidate.description_excerpt || '').trim(),
+    'DB存在確認': candidate.master_absence_confirmed === true ? '銘柄マスターに存在しない' : '',
+    'DB類似候補': mfImageCollectorStableJson_(candidate.similar_master_candidates || []),
+    'Discovery source': mfImageCollectorStableJson_(candidate.discovery_sources || []),
+    '公式情報JSON': mfImageCollectorStableJson_(officialInfo)
   };
+}
+
+function mfImageCollectorStableJson_(value) {
+  if (value === null || typeof value === 'undefined') return '';
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
 }
 
 function mfImageCollectorReviewDedupeKey_(candidate) {
@@ -571,7 +620,7 @@ function mfImageCollectorNextVersionKey_(values, headers, reference) {
 }
 
 function mfImageCollectorReviewHtml_() {
-  return '<!doctype html><html><head><base target="_top"><style>body{font-family:Arial,sans-serif;margin:20px;color:#222}button,select,input,textarea{font:inherit;margin:4px 0}textarea{display:block;width:100%;min-height:56px}.item{border:1px solid #ddd;padding:12px;margin:12px 0}.muted{color:#666}.url{word-break:break-all}.error{background:#fff2f2;border:1px solid #f2b8b8;color:#8a1f1f;padding:10px;margin:10px 0}</style></head><body><h2>変更候補レビュー</h2><div id="summary">読み込み中...</div><div id="items">読み込み中...</div><script>function esc(s){return String(s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c]));}function fail(where,e){document.getElementById(where).innerHTML=`<div class="error">${esc((e&&e.message)||e||"読み込みエラー")}</div>`;}function load(){google.script.run.withSuccessHandler(render).withFailureHandler(e=>fail("items",e)).mfImageCollectorGetReviewItems("要確認");google.script.run.withSuccessHandler(s=>document.getElementById("summary").textContent="要確認 "+s.pending_count+"件 / 最古 "+(s.oldest_pending_at||"なし")).withFailureHandler(e=>fail("summary",e)).mfImageCollectorGetReviewSummary();}function render(items){document.getElementById("items").innerHTML=(items||[]).map((it,idx)=>`<div class="item"><b>${esc(it["Tリファレンス番号"])}</b> ${esc(it["公式名"])}<div class="muted">${esc(it["検出種別"])} / ${esc(it["言語"])} / ${esc(it["検出日時"])}</div><div>未登録T: ${esc(it["DB既存T"]||"DB既存データなし")}</div><div>DB VersionKey: ${esc(it["DB既存VersionKey"]||"なし")}</div><div>DB Name: ${esc(it["DB既存名"]||"なし")}</div><div>${esc(it["差分概要"])}</div><div class="url"><a href="${esc(it["公式URL"])}" target="_blank">${esc(it["公式URL"])}</a></div><div><b>根拠</b><br>${esc(it["Collectorが取得した根拠"])}</div><div><select id="d${idx}"><option>保留</option><option>新規銘柄として追加</option><option>既存銘柄を更新</option><option>既存銘柄の新バージョンとして追加</option><option>販売SKUとして追加</option><option>既存銘柄と同一</option><option>終売情報として更新</option><option>誤検出</option></select><input id="v${idx}" placeholder="対象VersionKey"><textarea id="c${idx}" placeholder="コメント"></textarea><button onclick="apply(${idx},${it.row_number})">反映</button></div></div>`).join("")||"要確認はありません";}function apply(idx,row){google.script.run.withSuccessHandler(load).withFailureHandler(e=>alert((e&&e.message)||e)).mfImageCollectorApplyReviewDecision(row,document.getElementById("d"+idx).value,document.getElementById("v"+idx).value,document.getElementById("c"+idx).value);}load();</script></body></html>';
+  return '<!doctype html><html><head><base target="_top"><style>body{font-family:Arial,sans-serif;margin:20px;color:#222}button,select,input,textarea{font:inherit;margin:4px 0}textarea{display:block;width:100%;min-height:56px}.item{border:1px solid #ddd;padding:12px;margin:12px 0}.head{font-size:18px;font-weight:700}.section{border-top:1px solid #eee;margin-top:10px;padding-top:10px}.section h3{font-size:13px;margin:0 0 6px;color:#555}.muted{color:#666}.url{word-break:break-all}.kv{margin:3px 0}.error{background:#fff2f2;border:1px solid #f2b8b8;color:#8a1f1f;padding:10px;margin:10px 0}</style></head><body><h2>変更候補レビュー</h2><div id="summary">読み込み中...</div><div id="items">読み込み中...</div><script>function esc(s){return String(s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c]));}function fail(where,e){document.getElementById(where).innerHTML=`<div class="error">${esc((e&&e.message)||e||"読み込みエラー")}</div>`;}function link(label,url){return url?`<div class="url"><b>${esc(label)}</b>: <a href="${esc(url)}" target="_blank">${esc(url)}</a></div>`:"";}function load(){google.script.run.withSuccessHandler(render).withFailureHandler(e=>fail("items",e)).mfImageCollectorGetReviewItems("要確認");google.script.run.withSuccessHandler(s=>document.getElementById("summary").textContent="要確認 "+s.pending_count+"件 / 最古 "+(s.oldest_pending_at||"なし")).withFailureHandler(e=>fail("summary",e)).mfImageCollectorGetReviewSummary();}function render(items){document.getElementById("items").innerHTML=(items||[]).map((it,idx)=>`<div class="item"><div class="head">${esc(it["Tリファレンス番号"])} ${esc(it["公式名"])}</div><div class="muted">${esc(it["検出種別"])} / ${esc(it["確認言語"]||it["言語"])} / ${esc(it["検出日時"])} / ${esc(it["ステータス"])}</div><div class="section"><h3>現在の公式情報</h3><div class="kv">公式名: ${esc(it["公式名"])}</div><div class="kv">確認言語: ${esc(it["確認言語"]||it["言語"])}</div>${link("FR",it["FR公式URL"])}${link("EN",it["EN公式URL"])}${link("JP",it["JP公式URL"])}${link("代表URL",it["公式URL"])}<div class="kv">名称差: ${esc(it["公式名称差"]||"")}</div><div class="kv">説明: ${esc(it["公式説明抜粋"]||"")}</div></div><div class="section"><h3>DBの現在情報</h3><div class="kv">${esc(it["DB存在確認"]||"DB既存データなし")}</div><div class="kv">DB既存T: ${esc(it["DB既存T"]||"なし")}</div><div class="kv">DB VersionKey: ${esc(it["DB既存VersionKey"]||"なし")}</div><div class="kv">DB Name: ${esc(it["DB既存名"]||"なし")}</div><div class="kv">類似候補: ${esc(it["DB類似候補"]||"[]")}</div></div><div class="section"><h3>差分・根拠</h3><div class="kv">${esc(it["差分概要"])}</div><div class="kv"><b>根拠</b><br>${esc(it["Collectorが取得した根拠"])}</div><div class="kv">Discovery source: ${esc(it["Discovery source"]||"")}</div></div><div class="section"><h3>判定</h3><select id="d${idx}"><option>保留</option><option>新規銘柄として追加</option><option>既存銘柄を更新</option><option>既存銘柄の新バージョンとして追加</option><option>販売SKUとして追加</option><option>既存銘柄と同一</option><option>終売情報として更新</option><option>誤検出</option></select><input id="v${idx}" placeholder="対象VersionKey"><textarea id="c${idx}" placeholder="コメント"></textarea><button onclick="apply(${idx},${it.row_number})">反映</button></div></div>`).join("")||"要確認はありません";}function apply(idx,row){google.script.run.withSuccessHandler(load).withFailureHandler(e=>alert((e&&e.message)||e)).mfImageCollectorApplyReviewDecision(row,document.getElementById("d"+idx).value,document.getElementById("v"+idx).value,document.getElementById("c"+idx).value);}load();</script></body></html>';
 }
 
 function mfImageCollectorUpdateProductPageUrl_(payload) {

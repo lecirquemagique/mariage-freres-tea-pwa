@@ -270,6 +270,15 @@ Use `validateReviewCandidate` to test the deployed GAS endpoint, secret, payload
 The response includes `wouldCreate`, `wouldUpdate`, `dedupeKey`, and `writePerformed:false`.
 It reads the existing review sheet for dedupe information but does not append rows, update master rows, or create the review sheet.
 
+When testing GAS review actions from Windows PowerShell, send UTF-8 bytes rather than a plain string body. Windows PowerShell 5.1 can otherwise encode non-ASCII JSON using the active code page before the request reaches Apps Script.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\collector\invoke-review-api.ps1 -Action getReviewItems
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\collector\invoke-review-api.ps1 -Action validateReviewCandidate
+```
+
+Node.js collector write-back uses `fetch()` with `content-type: application/json; charset=utf-8`; JSON request bodies are sent as UTF-8, so Japanese review text is preserved in normal Discovery write-back.
+
 ## New Reference Discovery
 
 Run official-site discovery separately from the hourly image collector:

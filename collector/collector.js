@@ -299,7 +299,7 @@ async function writeBackImageResults({ config, baseDir, product, result, debug }
 
   const response = await fetch(settings.gasApiUrl, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json; charset=utf-8' },
     body: JSON.stringify(payload),
   });
   const text = await response.text();
@@ -348,7 +348,7 @@ async function writeBackProductPageUrl({ config, baseDir, product, discovery, de
 
   const response = await fetch(settings.gasApiUrl, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json; charset=utf-8' },
     body: JSON.stringify(payload),
   });
   const text = await response.text();
@@ -385,7 +385,7 @@ async function writeBackReviewCandidate({ config, baseDir, candidate, debug }) {
 
   const response = await fetch(settings.gasApiUrl, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json; charset=utf-8' },
     body: JSON.stringify(payload),
   });
   const text = await response.text();
@@ -689,6 +689,66 @@ function normalizeNameForCompare(value) {
     .toUpperCase();
 }
 
+function compactSnippet(value, maxLength = 500) {
+  return normalizeText(value).replace(/\s+/g, ' ').slice(0, maxLength);
+}
+
+function mergeUniqueTextLines(...values) {
+  const out = [];
+  for (const value of values) {
+    for (const line of String(value || '').split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed && !out.includes(trimmed)) out.push(trimmed);
+    }
+  }
+  return out.join('\n');
+}
+
+function mergeObjectValues(left, right) {
+  return { ...(left && typeof left === 'object' ? left : {}), ...(right && typeof right === 'object' ? right : {}) };
+}
+
+function mergeArrayValues(left, right, keyFn = (item) => JSON.stringify(item)) {
+  const out = [];
+  const seen = new Set();
+  for (const item of [...(Array.isArray(left) ? left : []), ...(Array.isArray(right) ? right : [])]) {
+    const key = keyFn(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function findSimilarMasterCandidates(reference, officialName, masterProducts = []) {
+  const normalizedOfficialName = normalizeNameForCompare(officialName);
+  if (!normalizedOfficialName) return [];
+  const officialTokens = normalizedOfficialName.split(/\s+/).filter((token) => token.length >= 4);
+  const scored = [];
+  for (const product of masterProducts || []) {
+    if (!product?.reference || product.reference === reference) continue;
+    const productName = product.name || '';
+    const normalizedProductName = normalizeNameForCompare(productName);
+    if (!normalizedProductName) continue;
+    let score = 0;
+    if (normalizedProductName === normalizedOfficialName) score += 100;
+    if (normalizedProductName.includes(normalizedOfficialName) || normalizedOfficialName.includes(normalizedProductName)) score += 50;
+    for (const token of officialTokens) {
+      if (normalizedProductName.split(/\s+/).includes(token)) score += 8;
+    }
+    if (score <= 0) continue;
+    scored.push({
+      reference: product.reference,
+      version_key: product.master?.versionKey || '',
+      name: productName,
+      score,
+    });
+  }
+  return scored
+    .sort((a, b) => b.score - a.score || a.reference.localeCompare(b.reference))
+    .slice(0, 5);
+}
+
 async function extractOfficialName(page) {
   return page.evaluate(() => {
     const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -741,10 +801,6 @@ function cacheReviewCandidate(cache, candidate) {
   if (existing) {
     const languages = new Set(String(existing.source_language || '').split(/[,+\s]+/).filter(Boolean));
     for (const lang of String(item.source_language || '').split(/[,+\s]+/).filter(Boolean)) languages.add(lang);
-    const evidence = [existing.evidence, item.evidence]
-      .filter(Boolean)
-      .filter((value, index, values) => values.indexOf(value) === index)
-      .join('\n');
     cache.review_candidates[item.detection_id] = {
       ...existing,
       official_name: existing.official_name || item.official_name,
@@ -752,7 +808,17 @@ function cacheReviewCandidate(cache, candidate) {
       source_language: [...languages].join('+') || existing.source_language || item.source_language || '',
       detected_at: existing.detected_at || item.detected_at,
       last_seen_at: item.detected_at || nowIso(),
-      evidence: evidence || existing.evidence || item.evidence || '',
+      fr_official_url: existing.fr_official_url || item.fr_official_url || '',
+      en_official_url: existing.en_official_url || item.en_official_url || '',
+      jp_official_url: existing.jp_official_url || item.jp_official_url || '',
+      official_urls_by_language: mergeObjectValues(existing.official_urls_by_language, item.official_urls_by_language),
+      official_names_by_language: mergeObjectValues(existing.official_names_by_language, item.official_names_by_language),
+      description_snippets_by_language: mergeObjectValues(existing.description_snippets_by_language, item.description_snippets_by_language),
+      discovery_sources: mergeArrayValues(existing.discovery_sources, item.discovery_sources, (entry) => `${entry.source || ''}|${entry.url || ''}`),
+      similar_master_candidates: mergeArrayValues(existing.similar_master_candidates, item.similar_master_candidates, (entry) => `${entry.reference || ''}|${entry.version_key || ''}`).slice(0, 5),
+      official_name_differences: mergeUniqueTextLines(existing.official_name_differences, item.official_name_differences),
+      description_excerpt: mergeUniqueTextLines(existing.description_excerpt, item.description_excerpt),
+      evidence: mergeUniqueTextLines(existing.evidence, item.evidence),
     };
     return false;
   }
@@ -2025,20 +2091,37 @@ async function collectDiscoveryPageFacts(page, pageUrl) {
   }, pageUrl);
 }
 
-function buildUnregisteredReferenceReview({ reference, facts, url, source, sourceLanguage, discoverySource, snippet }) {
+function buildUnregisteredReferenceReview({ reference, facts, url, source, sourceLanguage, discoverySource, snippet, masterProducts }) {
   const officialName = facts?.h1 || facts?.title || '';
+  const language = sourceLanguage || sourceLanguageFromUrl(url);
+  const descriptionExcerpt = compactSnippet(snippet || facts?.snippet || facts?.description || facts?.bodyText || '', 700);
+  const officialUrlsByLanguage = language ? { [language]: url } : {};
+  const officialNamesByLanguage = language && officialName ? { [language]: officialName } : {};
+  const descriptionSnippetsByLanguage = language && descriptionExcerpt ? { [language]: descriptionExcerpt } : {};
+  const similarMasterCandidates = findSimilarMasterCandidates(reference, officialName, masterProducts);
   const candidate = {
     detected_at: nowIso(),
     reference,
     official_name: officialName,
     detection_type: 'unregistered_reference',
     official_url: url,
-    source_language: sourceLanguage || sourceLanguageFromUrl(url),
+    source_language: language,
     existing_reference: '',
     existing_version_key: '',
     existing_name: '',
     diff_summary: `Official ${reference} was found but is not present in the current master.`,
     evidence: `discovery_source=${discoverySource}; source=${source.id}; url=${url}; snippet=${snippet || facts?.snippet || ''}`,
+    fr_official_url: language === 'FR' ? url : '',
+    en_official_url: language === 'EN' ? url : '',
+    jp_official_url: language === 'JP' ? url : '',
+    official_urls_by_language: officialUrlsByLanguage,
+    official_names_by_language: officialNamesByLanguage,
+    description_snippets_by_language: descriptionSnippetsByLanguage,
+    discovery_sources: [{ source: source.id, source_type: source.source, discovery_source: discoverySource, language, url }],
+    official_name_differences: Object.entries(officialNamesByLanguage).map(([lang, name]) => `${lang}: ${name}`).join('\n'),
+    description_excerpt: descriptionExcerpt,
+    master_absence_confirmed: true,
+    similar_master_candidates: similarMasterCandidates,
     status: '要確認',
     human_decision: '',
     target_version_key: '',
@@ -2073,7 +2156,8 @@ function buildSalesSkuReview({ sku, facts, url, source, sourceLanguage, discover
 async function runNewReferenceDiscovery({ context, config, paths, master, discoveryCache, baseDir, args }) {
   const sources = config.newReferenceDiscovery?.sources || defaultNewReferenceDiscoverySources();
   const state = normalizeNewReferenceDiscoveryState(readJson(paths.newReferenceDiscoveryStateFile, {}), sources);
-  const masterReferences = new Set((master?.products || []).map((product) => product.reference).filter(Boolean));
+  const masterProducts = master?.products || [];
+  const masterReferences = new Set(masterProducts.map((product) => product.reference).filter(Boolean));
   const maxPages = Number.isFinite(config.newReferenceDiscovery?.maxPagesPerRun) ? config.newReferenceDiscovery.maxPagesPerRun : 8;
   const maxPagesPerSource = Number.isFinite(config.newReferenceDiscovery?.maxPagesPerSourcePerRun)
     ? config.newReferenceDiscovery.maxPagesPerSourcePerRun
@@ -2155,14 +2239,17 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
                 sourceLanguage: source.language,
                 discoverySource: pageIsProduct ? 'product_page' : source.source,
                 snippet: facts.snippet,
+                masterProducts,
               });
               if (cacheReviewCandidate(discoveryCache, review)) createdOrQueuedReviews += 1;
+              const previousDiscovery = state.discovered_references[ref] || {};
               state.discovered_references[ref] = {
                 reference: ref,
-                first_seen_at: state.discovered_references[ref]?.first_seen_at || nowIso(),
+                first_seen_at: previousDiscovery.first_seen_at || nowIso(),
                 last_seen_at: nowIso(),
-                source_language: review.source_language,
-                official_url: review.official_url,
+                source_language: mergeUniqueTextLines(previousDiscovery.source_language, review.source_language).replace(/\n/g, '+'),
+                official_url: previousDiscovery.official_url || review.official_url,
+                official_urls_by_language: mergeObjectValues(previousDiscovery.official_urls_by_language, review.official_urls_by_language),
                 review_detection_id: review.detection_id,
                 in_master: false,
               };
