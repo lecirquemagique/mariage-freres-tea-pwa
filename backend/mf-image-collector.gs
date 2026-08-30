@@ -55,8 +55,26 @@ function doPost(e) {
   return mfImageCollectorDoPost(e);
 }
 
+function doGet(e) {
+  return mfImageCollectorDoGet(e);
+}
+
 function onOpen(e) {
   mfImageCollectorOnOpen(e);
+}
+
+function mfImageCollectorDoGet(e) {
+  try {
+    var params = e && e.parameter ? e.parameter : {};
+    var action = String(params.action || 'teaData');
+    if (action === 'teaData') {
+      return mfImageCollectorJsonOrJsonp_(mfImageCollectorGetTeaData_(), params.callback);
+    }
+    return mfImageCollectorJsonOrJsonp_({ ok: false, error: 'Unsupported action.' }, params.callback);
+  } catch (error) {
+    var callback = e && e.parameter ? e.parameter.callback : '';
+    return mfImageCollectorJsonOrJsonp_({ ok: false, error: String(error && error.message || error) }, callback);
+  }
 }
 
 function mfImageCollectorDoPost(e) {
@@ -410,6 +428,26 @@ function mfImageCollectorOpenSpreadsheet_() {
   var ss = spreadsheetId ? SpreadsheetApp.openById(spreadsheetId) : SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) throw new Error('Spreadsheet not found. Bind this script, define SPREADSHEET_ID, or set MF_MASTER_SPREADSHEET_ID.');
   return ss;
+}
+
+function mfImageCollectorGetTeaData_() {
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  if (!values.length) return { ok: true, rows: [], updatedAt: new Date().toISOString() };
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var rows = [];
+  for (var i = 1; i < values.length; i += 1) {
+    var row = {};
+    var hasValue = false;
+    for (var j = 0; j < headers.length; j += 1) {
+      row[headers[j]] = mfImageCollectorClientValue_(values[i][j]);
+      if (row[headers[j]]) hasValue = true;
+    }
+    if (hasValue) rows.push(row);
+  }
+  return { ok: true, rows: rows, updatedAt: new Date().toISOString() };
 }
 
 function mfImageCollectorGetOrCreateReviewSheet_() {
@@ -780,4 +818,20 @@ function mfImageCollectorJson_(data) {
   return ContentService
     .createTextOutput(JSON.stringify(data))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+function mfImageCollectorJsonOrJsonp_(data, callback) {
+  var json = JSON.stringify(data);
+  var callbackName = String(callback || '').trim();
+  if (callbackName) {
+    if (!/^[A-Za-z_$][0-9A-Za-z_$]*$/.test(callbackName)) {
+      callbackName = '';
+    }
+  }
+  if (callbackName) {
+    return ContentService
+      .createTextOutput(callbackName + '(' + json + ');')
+      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  return mfImageCollectorJson_(data);
 }
