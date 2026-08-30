@@ -406,6 +406,24 @@
       margin:10px 0
     }
 
+    .sales-format-icons{
+      display:flex;
+      gap:6px;
+      flex-wrap:wrap;
+      align-items:center;
+      margin:9px 0 0
+    }
+
+    .sales-format-icon{
+      width:30px;
+      height:30px;
+      object-fit:contain;
+      display:block;
+      border:1px solid #4d3c23;
+      border-radius:5px;
+      background:#14110d
+    }
+
     .name-ja{
       margin:5px 0 0;
       font-size:12px;
@@ -722,6 +740,15 @@ const TEA_TYPE_ORDER=[
 
 const C=window.MF_APP_CONFIG||{};
 
+const SALES_FORMAT_ICON_BASE='assets/mf-sales-format-icons/';
+
+const SALES_FORMAT_CODE_FIELDS=[
+  '販売形態コード',
+  '販売形態',
+  '販売形態タグ',
+  '販売コード'
+];
+
 const $=x=>document.getElementById(x);
 
 const sp=s=>
@@ -751,6 +778,58 @@ const esc=s=>
 const uniq=a=>
   [...new Set(a.filter(Boolean))]
     .sort((a,b)=>a.localeCompare(b,'ja'));
+
+
+function salesFormatCodes(row){
+  return uniq(
+    SALES_FORMAT_CODE_FIELDS
+      .flatMap(key=>
+        sp(row[key])
+      )
+      .map(x=>
+        String(x||'').trim()
+      )
+      .filter(x=>
+        /^[a-z0-9-]+$/i.test(x)
+      )
+  );
+}
+
+
+function salesFormatIconPath(code){
+  return (
+    SALES_FORMAT_ICON_BASE+
+    'format-'+
+    String(code||'').toLowerCase()+
+    '.png'
+  );
+}
+
+
+function renderSalesFormatIcons(row){
+  const codes=salesFormatCodes(row);
+
+  if(!codes.length){
+    return '';
+  }
+
+  return `
+    <div class="sales-format-icons">
+      ${
+        codes.map(code=>`
+          <img
+            class="sales-format-icon"
+            loading="lazy"
+            src="${esc(salesFormatIconPath(code))}"
+            alt="${esc('販売形態 '+code)}"
+            title="${esc(code)}"
+            onerror="this.hidden=true"
+          >
+        `).join('')
+      }
+    </div>
+  `;
+}
 
 
 function fill(id,a){
@@ -1462,6 +1541,8 @@ function render(){
               }
 
             </div>
+
+            ${renderSalesFormatIcons(r)}
 
             <div class="desc">
               ${
