@@ -61,6 +61,9 @@ function mfImageCollectorDoPost(e) {
     if (payload.action === 'recordReviewCandidate') {
       return mfImageCollectorJson_(mfImageCollectorRecordReviewCandidate_(payload));
     }
+    if (payload.action === 'validateReviewCandidate') {
+      return mfImageCollectorJson_(mfImageCollectorValidateReviewCandidate_(payload));
+    }
     if (payload.action === 'getReviewSummary') {
       mfImageCollectorAssertSecret_(payload);
       return mfImageCollectorJson_(mfImageCollectorGetReviewSummary());
@@ -317,6 +320,46 @@ function mfImageCollectorRecordReviewCandidate_(payload) {
   sheet.appendRow(MF_IMAGE_COLLECTOR_REVIEW_HEADERS.map(function(header) { return rowValues[header] || ''; }));
   mfImageCollectorApplyReviewValidation_(sheet);
   return { ok: true, action: 'created', detection_id: detectionId, sheet_row: sheet.getLastRow() };
+}
+
+function mfImageCollectorValidateReviewCandidate_(payload) {
+  mfImageCollectorAssertSecret_(payload);
+  var candidate = payload.candidate || {};
+  var reference = String(candidate.reference || '').trim();
+  if (!reference) throw new Error('candidate.reference is required.');
+
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_REVIEW_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 1 || sheet.getLastColumn() < 1) {
+    var fallbackDetectionId = String(candidate.detection_id || '').trim() || mfImageCollectorReviewDedupeKey_(candidate);
+    return {
+      ok: true,
+      valid: true,
+      wouldCreate: true,
+      wouldUpdate: false,
+      existingRow: 0,
+      existingStatus: '',
+      dedupeKey: fallbackDetectionId,
+      writePerformed: false
+    };
+  }
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(value) { return String(value).trim(); });
+  var detectionId = String(candidate.detection_id || '').trim() || mfImageCollectorReviewDedupeKey_(candidate);
+  var existingRow = mfImageCollectorFindReviewRow_(sheet, headers, detectionId);
+  var existingStatus = '';
+  if (existingRow > 0) {
+    existingStatus = String(sheet.getRange(existingRow, headers.indexOf('ステータス') + 1).getValue() || '');
+  }
+  return {
+    ok: true,
+    valid: true,
+    wouldCreate: existingRow < 0,
+    wouldUpdate: existingRow > 0 && (existingStatus === '要確認' || existingStatus === '保留'),
+    existingRow: existingRow > 0 ? existingRow : 0,
+    existingStatus: existingStatus,
+    dedupeKey: detectionId,
+    writePerformed: false
+  };
 }
 
 function mfImageCollectorOpenSpreadsheet_() {

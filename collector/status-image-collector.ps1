@@ -102,6 +102,9 @@ function Show-MasterSummary($Root, $NodeExe) {
       Write-Host ("Opportunistic cache: images={0} unapplied={1}" -f $Summary.opportunistic_cache.image_count, $Summary.opportunistic_cache.unapplied_image_count)
       Write-Host ("Review cache: candidates={0} unposted={1}" -f $Summary.opportunistic_cache.review_candidate_count, $Summary.opportunistic_cache.unposted_review_candidate_count)
     }
+    if ($null -ne $Summary.new_reference_discovery) {
+      Write-Host ("New reference discovery: sources={0} queued={1} visited={2} discovered={3} full_rescans={4} last_success={5}" -f $Summary.new_reference_discovery.source_count, $Summary.new_reference_discovery.queued_url_count, $Summary.new_reference_discovery.visited_url_count, $Summary.new_reference_discovery.discovered_reference_count, $Summary.new_reference_discovery.full_rescan_count, $Summary.new_reference_discovery.last_success_at)
+    }
     Write-Host "Next candidates:"
     $Candidates = @($Summary.next_candidates)
     if ($Candidates.Count -eq 0) {

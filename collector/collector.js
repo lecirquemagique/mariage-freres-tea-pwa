@@ -54,6 +54,7 @@ function parseArgs(argv) {
     writeBack: null,
     useConfigProducts: false,
     discoverUrlsOnly: false,
+    discoverNewReferences: false,
     statusJson: false,
     refs: null,
   };
@@ -74,6 +75,7 @@ function parseArgs(argv) {
     else if (arg === '--no-write-back') args.writeBack = false;
     else if (arg === '--use-config-products') args.useConfigProducts = true;
     else if (arg === '--discover-urls-only') args.discoverUrlsOnly = true;
+    else if (arg === '--discover-new-references') args.discoverNewReferences = true;
     else if (arg === '--status-json') args.statusJson = true;
     else if (arg === '--config') args.config = argv[++i];
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
@@ -735,11 +737,22 @@ function cacheReviewCandidate(cache, candidate) {
   if (!cache) return false;
   const item = { ...candidate };
   item.detection_id = item.detection_id || reviewCandidateKey(item);
-  if (cache.review_candidates[item.detection_id]) {
+  const existing = cache.review_candidates[item.detection_id];
+  if (existing) {
+    const languages = new Set(String(existing.source_language || '').split(/[,+\s]+/).filter(Boolean));
+    for (const lang of String(item.source_language || '').split(/[,+\s]+/).filter(Boolean)) languages.add(lang);
+    const evidence = [existing.evidence, item.evidence]
+      .filter(Boolean)
+      .filter((value, index, values) => values.indexOf(value) === index)
+      .join('\n');
     cache.review_candidates[item.detection_id] = {
-      ...cache.review_candidates[item.detection_id],
-      detected_at: item.detected_at || cache.review_candidates[item.detection_id].detected_at,
-      evidence: item.evidence || cache.review_candidates[item.detection_id].evidence,
+      ...existing,
+      official_name: existing.official_name || item.official_name,
+      official_url: existing.official_url || item.official_url,
+      source_language: [...languages].join('+') || existing.source_language || item.source_language || '',
+      detected_at: existing.detected_at || item.detected_at,
+      last_seen_at: item.detected_at || nowIso(),
+      evidence: evidence || existing.evidence || item.evidence || '',
     };
     return false;
   }
@@ -1627,6 +1640,20 @@ function discoveryCacheStats(cache, masterProducts = []) {
   };
 }
 
+function newReferenceDiscoveryStats(state) {
+  const sources = Object.values(state?.sources || {});
+  return {
+    source_count: sources.length,
+    queued_url_count: sources.reduce((sum, source) => sum + (source.queue?.length || 0), 0),
+    visited_url_count: sources.reduce((sum, source) => sum + Object.keys(source.visited_urls || {}).length, 0),
+    discovered_reference_count: Object.keys(state?.discovered_references || {}).length,
+    last_started_at: state?.last_started_at || '',
+    last_success_at: state?.last_success_at || '',
+    last_full_rescan_started_at: state?.last_full_rescan_started_at || '',
+    full_rescan_count: state?.full_rescan_count || 0,
+  };
+}
+
 async function writeBackReviewCandidates({ config, baseDir, candidates, debug }) {
   if (!writeBackRequired(config) || !candidates?.length) return [];
   const results = [];
@@ -1652,7 +1679,7 @@ function markReviewWriteBackResults(discoveryCache, results) {
   }
 }
 
-function buildStatusSummary(config, state, master, products, discoveryCache = null) {
+function buildStatusSummary(config, state, master, products, discoveryCache = null, newReferenceDiscoveryState = null) {
   const counts = {
     complete: 0,
     pending: 0,
@@ -1679,6 +1706,7 @@ function buildStatusSummary(config, state, master, products, discoveryCache = nu
     product_count: sourceProducts.length,
     counts,
     opportunistic_cache: discoveryCacheStats(discoveryCache, sourceProducts),
+    new_reference_discovery: newReferenceDiscoveryStats(newReferenceDiscoveryState),
     next_candidates: products.map((product) => ({
       reference: product.reference,
       name: product.name || '',
@@ -1842,6 +1870,365 @@ async function runAuthSetup({ context, products, config, debug, keepPageOpen = f
   if (!keepPageOpen) await page.close().catch(() => {});
 }
 
+function defaultNewReferenceDiscoverySources() {
+  return [
+    {
+      id: 'official-sitemaps',
+      language: '',
+      source: 'sitemap',
+      seedUrls: [
+        'https://www.mariagefreres.com/sitemap.xml',
+        'https://www.mariagefreres.co.jp/sitemap.xml',
+      ],
+    },
+    {
+      id: 'jp-all-products',
+      language: 'JP',
+      source: 'category',
+      seedUrls: [
+        'https://www.mariagefreres.co.jp/view/search',
+        'https://www.mariagefreres.co.jp/view/category/ct208',
+      ],
+    },
+    {
+      id: 'fr-main-categories',
+      language: 'FR',
+      source: 'category',
+      seedUrls: [
+        'https://www.mariagefreres.com/fr/the/les-moments-du-the.html',
+        'https://www.mariagefreres.com/fr/the/les-grandes-familles.html',
+        'https://www.mariagefreres.com/fr/the/les-thes-icones.html',
+      ],
+    },
+    {
+      id: 'en-main-categories',
+      language: 'EN',
+      source: 'category',
+      seedUrls: [
+        'https://www.mariagefreres.com/en/tea/fragrance.html',
+        'https://www.mariagefreres.com/en/collection',
+      ],
+    },
+  ];
+}
+
+function normalizeNewReferenceDiscoveryState(state, sources) {
+  const shaped = state && typeof state === 'object' ? state : {};
+  shaped.version = shaped.version || 'new-reference-discovery-v1';
+  shaped.sources = shaped.sources && typeof shaped.sources === 'object' ? shaped.sources : {};
+  shaped.discovered_references = shaped.discovered_references && typeof shaped.discovered_references === 'object' ? shaped.discovered_references : {};
+  shaped.full_rescan_count = Number.isFinite(shaped.full_rescan_count) ? shaped.full_rescan_count : 0;
+  for (const source of sources) {
+    const current = shaped.sources[source.id] && typeof shaped.sources[source.id] === 'object' ? shaped.sources[source.id] : {};
+    current.queue = Array.isArray(current.queue) ? current.queue : [...source.seedUrls];
+    current.visited_urls = current.visited_urls && typeof current.visited_urls === 'object' ? current.visited_urls : {};
+    current.errors = current.errors && typeof current.errors === 'object' ? current.errors : {};
+    shaped.sources[source.id] = current;
+  }
+  return shaped;
+}
+
+function resetNewReferenceDiscoveryQueues(state, sources, startedAt) {
+  for (const source of sources) {
+    state.sources[source.id] = {
+      ...(state.sources[source.id] || {}),
+      queue: [...source.seedUrls],
+      visited_urls: {},
+      errors: {},
+      full_rescan_started_at: startedAt,
+    };
+  }
+  state.last_full_rescan_started_at = startedAt;
+  state.full_rescan_count = (state.full_rescan_count || 0) + 1;
+}
+
+function shouldStartNewReferenceFullRescan(state, intervalDays) {
+  if (!Number.isFinite(intervalDays) || intervalDays <= 0) return false;
+  if (!state.last_full_rescan_started_at) return true;
+  const last = Date.parse(state.last_full_rescan_started_at);
+  if (!Number.isFinite(last)) return true;
+  return Date.now() - last >= intervalDays * 24 * 60 * 60 * 1000;
+}
+
+function extractTeaReferences(text) {
+  const out = new Set();
+  const pattern = /(^|[^A-Za-z0-9])(T\d{2,6})(?![A-Za-z0-9])/g;
+  for (const match of String(text || '').matchAll(pattern)) out.add(match[2].toUpperCase());
+  return [...out];
+}
+
+function extractSalesSkuReferences(text) {
+  const out = new Set();
+  const pattern = /(^|[^A-Za-z0-9])((?:TB|TC|TP|TA|TFG|TF|TJC|TJ)\d{2,6})(?![A-Za-z0-9])/g;
+  for (const match of String(text || '').matchAll(pattern)) out.add(match[2].toUpperCase());
+  return [...out];
+}
+
+function extractUrlsFromText(text) {
+  return [...new Set([...String(text || '').matchAll(/https?:\/\/[^\s<>"']+/gi)].map((match) => match[0].replace(/[),.;]+$/, '')))];
+}
+
+function isDiscoveryListUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (url.hostname === 'www.mariagefreres.com') {
+      if (url.pathname.includes('/catalogsearch/')) return true;
+      if (url.pathname.startsWith('/fr/the/') || url.pathname.startsWith('/en/tea/') || url.pathname.startsWith('/fr/collection') || url.pathname.startsWith('/en/collection')) return true;
+    }
+    if (url.hostname === 'www.mariagefreres.co.jp') {
+      if (url.pathname.startsWith('/view/search') || url.pathname.startsWith('/view/category/')) return true;
+    }
+  } catch {
+  }
+  return false;
+}
+
+function enqueueDiscoveryUrl(sourceState, url, limit) {
+  if (!url || sourceState.visited_urls[url]) return false;
+  if (sourceState.queue.includes(url)) return false;
+  if (sourceState.queue.length >= limit) return false;
+  sourceState.queue.push(url);
+  return true;
+}
+
+function prependDiscoveryUrl(sourceState, url, limit) {
+  if (!url || sourceState.visited_urls[url]) return false;
+  if (sourceState.queue.includes(url)) return false;
+  if (sourceState.queue.length >= limit) return false;
+  sourceState.queue.unshift(url);
+  return true;
+}
+
+async function collectDiscoveryPageFacts(page, pageUrl) {
+  return page.evaluate(() => {
+    const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const title = clean(document.title);
+    const h1 = clean(document.querySelector('h1')?.textContent);
+    const bodyText = clean(document.body?.innerText || document.body?.textContent || '');
+    const description = clean(document.querySelector('meta[name="description"]')?.content || '');
+    const canonical = document.querySelector('link[rel="canonical"]')?.href || '';
+    const links = [...document.querySelectorAll('a[href]')].map((anchor) => ({
+      href: anchor.href,
+      text: clean(anchor.innerText || anchor.textContent),
+      closestText: clean(anchor.closest('.product-item, li, article, .item, .product, .item-list, .prd-list')?.innerText || ''),
+    }));
+    return {
+      title,
+      h1,
+      bodyText: bodyText.slice(0, 50000),
+      description,
+      canonical,
+      links,
+      snippet: (description || bodyText).slice(0, 800),
+      url: location.href,
+    };
+  }, pageUrl);
+}
+
+function buildUnregisteredReferenceReview({ reference, facts, url, source, sourceLanguage, discoverySource, snippet }) {
+  const officialName = facts?.h1 || facts?.title || '';
+  const candidate = {
+    detected_at: nowIso(),
+    reference,
+    official_name: officialName,
+    detection_type: 'unregistered_reference',
+    official_url: url,
+    source_language: sourceLanguage || sourceLanguageFromUrl(url),
+    existing_reference: '',
+    existing_version_key: '',
+    existing_name: '',
+    diff_summary: `Official ${reference} was found but is not present in the current master.`,
+    evidence: `discovery_source=${discoverySource}; source=${source.id}; url=${url}; snippet=${snippet || facts?.snippet || ''}`,
+    status: '要確認',
+    human_decision: '',
+    target_version_key: '',
+    comment: '',
+  };
+  candidate.detection_id = crypto.createHash('sha1').update(`unregistered_reference|${reference}`).digest('hex');
+  return candidate;
+}
+
+function buildSalesSkuReview({ sku, facts, url, source, sourceLanguage, discoverySource, snippet }) {
+  const candidate = {
+    detected_at: nowIso(),
+    reference: sku,
+    official_name: facts?.h1 || facts?.title || '',
+    detection_type: 'sales_sku_detected',
+    official_url: url,
+    source_language: sourceLanguage || sourceLanguageFromUrl(url),
+    existing_reference: '',
+    existing_version_key: '',
+    existing_name: '',
+    diff_summary: `Official sales SKU ${sku} was detected. It is not treated as a tea reference.`,
+    evidence: `discovery_source=${discoverySource}; source=${source.id}; url=${url}; snippet=${snippet || facts?.snippet || ''}`,
+    status: '要確認',
+    human_decision: '',
+    target_version_key: '',
+    comment: '',
+  };
+  candidate.detection_id = crypto.createHash('sha1').update(`sales_sku_detected|${sku}|${url}`).digest('hex');
+  return candidate;
+}
+
+async function runNewReferenceDiscovery({ context, config, paths, master, discoveryCache, baseDir, args }) {
+  const sources = config.newReferenceDiscovery?.sources || defaultNewReferenceDiscoverySources();
+  const state = normalizeNewReferenceDiscoveryState(readJson(paths.newReferenceDiscoveryStateFile, {}), sources);
+  const masterReferences = new Set((master?.products || []).map((product) => product.reference).filter(Boolean));
+  const maxPages = Number.isFinite(config.newReferenceDiscovery?.maxPagesPerRun) ? config.newReferenceDiscovery.maxPagesPerRun : 8;
+  const maxPagesPerSource = Number.isFinite(config.newReferenceDiscovery?.maxPagesPerSourcePerRun)
+    ? config.newReferenceDiscovery.maxPagesPerSourcePerRun
+    : Math.max(1, Math.ceil(maxPages / Math.max(sources.length, 1)));
+  const maxQueue = Number.isFinite(config.newReferenceDiscovery?.maxQueuePerSource) ? config.newReferenceDiscovery.maxQueuePerSource : 200;
+  const startedAt = nowIso();
+  let processedPages = 0;
+  let createdOrQueuedReviews = 0;
+  let existingReferences = 0;
+  let salesSkus = 0;
+
+  state.last_started_at = startedAt;
+  const fullRescanIntervalDays = Number.isFinite(config.newReferenceDiscovery?.fullRescanIntervalDays)
+    ? config.newReferenceDiscovery.fullRescanIntervalDays
+    : 30;
+  if (shouldStartNewReferenceFullRescan(state, fullRescanIntervalDays)) {
+    resetNewReferenceDiscoveryQueues(state, sources, startedAt);
+  }
+  for (const source of sources) {
+      if (processedPages >= maxPages) break;
+      let sourceProcessedPages = 0;
+      const sourceState = state.sources[source.id];
+      if (!sourceState.queue.length) sourceState.queue.push(...source.seedUrls);
+      sourceState.last_started_at = nowIso();
+
+      while (sourceState.queue.length && processedPages < maxPages && sourceProcessedPages < maxPagesPerSource) {
+        const url = sourceState.queue.shift();
+        if (sourceState.visited_urls[url]) continue;
+        if (args.debug) console.log(`[discover-new] open ${source.id} ${url}`);
+        const page = await context.newPage();
+        try {
+          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
+          await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
+          await sleep(config.settleDelayMs || 2500);
+          const facts = await collectDiscoveryPageFacts(page, url);
+          const combinedText = `${facts.url}\n${facts.canonical}\n${facts.title}\n${facts.h1}\n${facts.description}\n${facts.bodyText}`;
+          if (/cloudflare|verify you are human|vérifiez que vous êtes humain|just a moment/i.test(combinedText)) {
+            throw new Error('Discovery page is blocked by browser verification.');
+          }
+
+          const pageRefs = new Set(extractTeaReferences(combinedText));
+          const pageSalesSkus = new Set(extractSalesSkuReferences(combinedText));
+          const productLinks = [];
+          const listLinks = [];
+          for (const foundUrl of extractUrlsFromText(combinedText)) {
+            if (looksLikeProductUrl(foundUrl)) productLinks.push(foundUrl);
+            else if (isDiscoveryListUrl(foundUrl)) listLinks.push(foundUrl);
+          }
+          for (const link of facts.links || []) {
+            const linkText = `${link.href}\n${link.text}\n${link.closestText}`;
+            for (const ref of extractTeaReferences(linkText)) pageRefs.add(ref);
+            for (const sku of extractSalesSkuReferences(linkText)) pageSalesSkus.add(sku);
+            if (looksLikeProductUrl(link.href)) productLinks.push(link.href);
+            else if (isDiscoveryListUrl(link.href)) listLinks.push(link.href);
+          }
+          for (const link of [...new Set(productLinks)].reverse()) {
+            prependDiscoveryUrl(sourceState, link, maxQueue);
+          }
+          for (const link of [...new Set(listLinks)]) {
+            enqueueDiscoveryUrl(sourceState, link, maxQueue);
+          }
+          if (facts.canonical && facts.canonical !== facts.url && (looksLikeProductUrl(facts.canonical) || isDiscoveryListUrl(facts.canonical))) {
+            enqueueDiscoveryUrl(sourceState, facts.canonical, maxQueue);
+          }
+
+          const pageIsProduct = looksLikeProductUrl(facts.url) || looksLikeProductUrl(facts.canonical || '');
+          const canRecordPageRefs = pageIsProduct || source.source !== 'sitemap';
+          if (canRecordPageRefs) {
+            for (const ref of pageRefs) {
+              if (masterReferences.has(ref)) {
+                existingReferences += 1;
+                continue;
+              }
+              const review = buildUnregisteredReferenceReview({
+                reference: ref,
+                facts,
+                url: facts.canonical || facts.url,
+                source,
+                sourceLanguage: source.language,
+                discoverySource: pageIsProduct ? 'product_page' : source.source,
+                snippet: facts.snippet,
+              });
+              if (cacheReviewCandidate(discoveryCache, review)) createdOrQueuedReviews += 1;
+              state.discovered_references[ref] = {
+                reference: ref,
+                first_seen_at: state.discovered_references[ref]?.first_seen_at || nowIso(),
+                last_seen_at: nowIso(),
+                source_language: review.source_language,
+                official_url: review.official_url,
+                review_detection_id: review.detection_id,
+                in_master: false,
+              };
+            }
+
+            for (const sku of pageSalesSkus) {
+              const review = buildSalesSkuReview({
+                sku,
+                facts,
+                url: facts.canonical || facts.url,
+                source,
+                sourceLanguage: source.language,
+                discoverySource: pageIsProduct ? 'product_page' : source.source,
+                snippet: facts.snippet,
+              });
+              if (cacheReviewCandidate(discoveryCache, review)) createdOrQueuedReviews += 1;
+              salesSkus += 1;
+            }
+          }
+
+          sourceState.visited_urls[url] = { visited_at: nowIso(), reference_count: pageRefs.size, product_page: pageIsProduct };
+          sourceState.last_success_at = nowIso();
+          processedPages += 1;
+          console.log(JSON.stringify({
+            discovery: 'new_references',
+            source: source.id,
+            url: facts.url,
+            refs_found: pageRefs.size,
+            existing_refs_seen: existingReferences,
+            review_candidates: createdOrQueuedReviews,
+            sales_skus_seen: salesSkus,
+            dry_run: args.dryRun,
+          }));
+        } catch (error) {
+          sourceState.errors[url] = { error_message: error.message, occurred_at: nowIso() };
+          console.log(JSON.stringify({ discovery: 'new_references', source: source.id, url, status: 'error', error: error.message }));
+          processedPages += 1;
+        } finally {
+          sourceProcessedPages += 1;
+          await page.close().catch(() => {});
+        }
+      }
+    }
+
+  if (!args.dryRun && writeBackRequired(config)) {
+    const pendingReviewCandidates = Object.values(discoveryCache.review_candidates || {}).filter((candidate) => !candidate.write_back_success);
+    const reviewWriteBacks = await writeBackReviewCandidates({ config, baseDir, candidates: pendingReviewCandidates, debug: args.debug });
+    markReviewWriteBackResults(discoveryCache, reviewWriteBacks);
+  }
+
+  state.last_finished_at = nowIso();
+  state.last_success_at = nowIso();
+  if (!args.dryRun) {
+    writeJson(paths.newReferenceDiscoveryStateFile, state);
+    writeJson(paths.discoveryCacheFile, discoveryCache);
+  }
+  console.log(JSON.stringify({
+    discovery: 'new_references_summary',
+    master_rows: master?.rowCount || 0,
+    processed_pages: processedPages,
+    review_cache: Object.keys(discoveryCache.review_candidates || {}).length,
+    unposted_review_cache: Object.values(discoveryCache.review_candidates || {}).filter((candidate) => !candidate.write_back_success).length,
+    dry_run: args.dryRun,
+  }));
+}
+
 async function connectBrowser(args) {
   const browser = await chromium.connectOverCDP(args.connectCdp);
   const context = browser.contexts()[0] || await browser.newContext();
@@ -1865,6 +2252,7 @@ async function main() {
     logsDir: resolveProjectPath(baseDir, config.logsDir || 'logs'),
     stateFile: resolveProjectPath(baseDir, config.stateFile || 'collector-state.json'),
     discoveryCacheFile: resolveProjectPath(baseDir, config.discoveryCacheFile || 'opportunistic-discoveries.json'),
+    newReferenceDiscoveryStateFile: resolveProjectPath(baseDir, config.newReferenceDiscoveryStateFile || 'new-reference-discovery-state.json'),
   };
   paths.resultLog = path.join(paths.logsDir, `results-${new Date().toISOString().slice(0, 10)}.jsonl`);
 
@@ -1875,6 +2263,8 @@ async function main() {
   const headless = args.authSetup ? false : args.headless === true ? true : args.headed ? false : config.headless !== false;
   const state = readJson(paths.stateFile, { products: {} });
   const discoveryCache = loadDiscoveryCache(paths.discoveryCacheFile);
+  const newReferenceDiscoverySources = config.newReferenceDiscovery?.sources || defaultNewReferenceDiscoverySources();
+  const newReferenceDiscoveryState = normalizeNewReferenceDiscoveryState(readJson(paths.newReferenceDiscoveryStateFile, {}), newReferenceDiscoverySources);
   const useConfigProducts = args.useConfigProducts || config.masterSource?.enabled === false;
   const master = useConfigProducts ? null : await fetchMasterProducts(config, baseDir, args.debug);
   if (!master && !useConfigProducts) {
@@ -1887,18 +2277,20 @@ async function main() {
   const masterReferences = new Set((master?.products || config.products || []).map((product) => product.reference).filter(Boolean));
 
   if (args.statusJson) {
-    console.log(JSON.stringify(buildStatusSummary(config, state, master, products, discoveryCache)));
+    console.log(JSON.stringify(buildStatusSummary(config, state, master, products, discoveryCache, newReferenceDiscoveryState)));
     return;
   }
 
-  if (products.length === 0) {
+  if (!args.discoverNewReferences && products.length === 0) {
     console.log('No pending products selected.');
     return;
   }
 
-  console.log(`Selected ${products.length} product(s)${master ? ` from master rows=${master.rowCount}` : ' from config'}.`);
+  if (!args.discoverNewReferences) {
+    console.log(`Selected ${products.length} product(s)${master ? ` from master rows=${master.rowCount}` : ' from config'}.`);
+  }
 
-  if (args.dryRun) {
+  if (args.dryRun && !args.discoverNewReferences) {
     for (const product of products) {
       console.log(JSON.stringify({
         reference: product.reference,
@@ -1958,6 +2350,11 @@ async function main() {
 
     if (args.authSetup) {
       await runAuthSetup({ context, products, config, debug: args.debug });
+      return;
+    }
+
+    if (args.discoverNewReferences) {
+      await runNewReferenceDiscovery({ context, config, paths, master, discoveryCache, baseDir, args });
       return;
     }
 

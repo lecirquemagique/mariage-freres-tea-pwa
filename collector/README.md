@@ -248,6 +248,67 @@ After replacing `backend/mf-image-collector.gs` and redeploying the web app, rel
 
 Only an explicit review decision can append or update semantic master rows. `販売SKUとして追加`, `既存銘柄と同一`, `終売情報として更新`, `誤検出`, and `保留` do not automatically append a master row in the current implementation.
 
+### Safe Review API Validation
+
+Use `validateReviewCandidate` to test the deployed GAS endpoint, secret, payload validation, and dedupe lookup without writing to Sheets:
+
+```json
+{
+  "action": "validateReviewCandidate",
+  "secret": "<from MF_COLLECTOR_WRITE_SECRET>",
+  "candidate": {
+    "reference": "T99999",
+    "detection_type": "unregistered_reference",
+    "official_url": "https://www.mariagefreres.com/fr/example-t99999-thes-au-poids.html",
+    "official_name": "EXAMPLE",
+    "source_language": "FR",
+    "diff_summary": "Validation only."
+  }
+}
+```
+
+The response includes `wouldCreate`, `wouldUpdate`, `dedupeKey`, and `writePerformed:false`.
+It reads the existing review sheet for dedupe information but does not append rows, update master rows, or create the review sheet.
+
+## New Reference Discovery
+
+Run official-site discovery separately from the hourly image collector:
+
+```powershell
+node collector\collector.js --discover-new-references --connect-cdp http://127.0.0.1:9222 --dry-run
+node collector\collector.js --discover-new-references --connect-cdp http://127.0.0.1:9222 --write-back
+npm run collect:discover:dry-run
+npm run collect:discover:writeback
+```
+
+Discovery starts from official sitemap and listing/category pages, queues product/list links, extracts tea references with exact `T` + digits matching, and excludes sales SKU prefixes such as `TB`, `TC`, `TP`, `TA`, `TF`, `TFG`, `TJ`, and `TJC` from tea-reference matching. Sales SKUs may be recorded as `sales_sku_detected` review candidates, but they are never treated as tea references. Each run limits both the total page count and the per-source page count so sitemap traversal cannot starve the FR/EN/JP listing sources.
+
+Default discovery entry points:
+
+- FR category/list pages: `https://www.mariagefreres.com/fr/the/les-moments-du-the.html`, `https://www.mariagefreres.com/fr/the/les-grandes-familles.html`, `https://www.mariagefreres.com/fr/the/les-thes-icones.html`
+- EN category/list pages: `https://www.mariagefreres.com/en/tea/fragrance.html`, `https://www.mariagefreres.com/en/collection`
+- JP all-products/category pages: `https://www.mariagefreres.co.jp/view/search`, `https://www.mariagefreres.co.jp/view/category/ct208`
+- Sitemap probes: `https://www.mariagefreres.com/sitemap.xml`, `https://www.mariagefreres.co.jp/sitemap.xml`
+
+Discovery state is stored in `new-reference-discovery-state.json` and is separate from `collector-state.json`. It contains:
+
+- `last_started_at`, `last_finished_at`, `last_success_at`
+- `sources.<source>.queue`
+- `sources.<source>.visited_urls`
+- `sources.<source>.errors`
+- `discovered_references`
+- `last_full_rescan_started_at`, `full_rescan_count`
+
+Discovery review dedupe merges FR/EN/JP evidence for the same unregistered T into a single pending review candidate by using a T-level `unregistered_reference|TNNNN` detection key. It never appends to `銘柄マスター`; it posts only to `recordReviewCandidate`.
+
+For daily scheduling, use:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\collector\register-daily-discovery-task.ps1 -WriteBack
+```
+
+This registers `MF New Tea Discovery`, separate from `MF Image Collector CDP`, with `MultipleInstances IgnoreNew` and one run per day.
+
 In Apps Script project settings, set this Script Property:
 
 ```text
