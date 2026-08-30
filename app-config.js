@@ -1,6 +1,6 @@
 window.MF_APP_CONFIG = {
   // GASを「ウェブアプリ」としてデプロイした後、/exec のURLをここへ貼り付けます。
-  GAS_API_URL: 'https://script.google.com/macros/s/AKfycbyQAoqDwFolqrp_-wQvxPbGGOj8YyjbXT5bp4dgyns_-DIBeyuF-3DblJFmQgpKhUvzcQ/exec',
+  GAS_API_URL: 'https://script.google.com/macros/s/AKfycbx23ug03uCC4LFcShQtVV01gsEIrfjmUR61VUezkLhWs72T_YVbPes8tXCIQUOGLOlWXQ/exec',
 
   // 任意。My Driveに置いた装飾画像の共有URLを貼れます。
   // 画像ファイル単体を「リンクを知っている全員：閲覧者」にしてください。
