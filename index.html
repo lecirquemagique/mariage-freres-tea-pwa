@@ -742,11 +742,14 @@ const C=window.MF_APP_CONFIG||{};
 
 const SALES_FORMAT_ICON_BASE='assets/mf-sales-format-icons/';
 
-const SALES_FORMAT_CODE_FIELDS=[
-  '販売形態コード',
-  '販売形態',
-  '販売形態タグ',
-  '販売コード'
+const SALES_FORMAT_REFERENCE_FIELDS=[
+  'Tリファレンス番号',
+  'TBリファレンス',
+  'TCリファレンス',
+  'TEリファレンス',
+  'TFリファレンス',
+  '水出し用リファレンス',
+  'TPリファレンス'
 ];
 
 const $=x=>document.getElementById(x);
@@ -782,19 +785,20 @@ const uniq=a=>
 
 function salesFormatCodes(row){
   return uniq(
-    SALES_FORMAT_CODE_FIELDS
+    SALES_FORMAT_REFERENCE_FIELDS
       .flatMap(key=>
         sp(row[key])
       )
       .map(x=>
-        String(x||'').trim()
+        String(x||'').trim().toUpperCase()
       )
-      .filter(x=>
-        /^[a-z0-9-]+$/i.test(x)
-      )
+      .map(ref=>{
+        const m=ref.match(/^(TFG|TJC|TB|TC|TE|TF|TP|TJ|TA|T)/);
+        return m ? m[1] : '';
+      })
+      .filter(Boolean)
   );
 }
-
 
 function salesFormatIconPath(code){
   return (
