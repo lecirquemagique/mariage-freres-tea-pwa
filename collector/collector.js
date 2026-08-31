@@ -725,6 +725,16 @@ function mergeArrayValues(left, right, keyFn = (item) => JSON.stringify(item)) {
   return out;
 }
 
+function reviewCandidateWriteBackFingerprint(candidate) {
+  const copy = { ...(candidate || {}) };
+  delete copy.detected_at;
+  delete copy.last_seen_at;
+  delete copy.last_write_back_at;
+  delete copy.write_back_success;
+  delete copy.write_back_error;
+  return JSON.stringify(copy);
+}
+
 function findSimilarMasterCandidates(reference, officialName, masterProducts = []) {
   const normalizedOfficialName = normalizeNameForCompare(officialName);
   if (!normalizedOfficialName) return [];
@@ -808,15 +818,20 @@ function cacheReviewCandidate(cache, candidate) {
   item.detection_id = item.detection_id || reviewCandidateKey(item);
   const existing = cache.review_candidates[item.detection_id];
   if (existing) {
+    const beforeFingerprint = reviewCandidateWriteBackFingerprint(existing);
     const languages = new Set(String(existing.source_language || '').split(/[,+\s]+/).filter(Boolean));
     for (const lang of String(item.source_language || '').split(/[,+\s]+/).filter(Boolean)) languages.add(lang);
-    cache.review_candidates[item.detection_id] = {
+    const merged = {
       ...existing,
       official_name: existing.official_name || item.official_name,
       official_url: existing.official_url || item.official_url,
       source_language: [...languages].join('+') || existing.source_language || item.source_language || '',
       detected_at: existing.detected_at || item.detected_at,
       last_seen_at: item.detected_at || nowIso(),
+      existing_reference: existing.existing_reference || item.existing_reference || '',
+      existing_version_key: existing.existing_version_key || item.existing_version_key || '',
+      existing_name: existing.existing_name || item.existing_name || '',
+      target_version_key: existing.target_version_key || item.target_version_key || '',
       fr_official_url: existing.fr_official_url || item.fr_official_url || '',
       en_official_url: existing.en_official_url || item.en_official_url || '',
       jp_official_url: existing.jp_official_url || item.jp_official_url || '',
@@ -829,6 +844,11 @@ function cacheReviewCandidate(cache, candidate) {
       description_excerpt: mergeUniqueTextLines(existing.description_excerpt, item.description_excerpt),
       evidence: mergeUniqueTextLines(existing.evidence, item.evidence),
     };
+    if (existing.write_back_success && reviewCandidateWriteBackFingerprint(merged) !== beforeFingerprint) {
+      merged.write_back_success = false;
+      merged.write_back_error = '';
+    }
+    cache.review_candidates[item.detection_id] = merged;
     return false;
   }
   cache.review_candidates[item.detection_id] = item;
@@ -1744,6 +1764,13 @@ async function writeBackReviewCandidates({ config, baseDir, candidates, debug })
   return results;
 }
 
+function reviewCandidateReadyForWriteBack(candidate) {
+  if (candidate?.detection_type === 'sales_sku_detected') {
+    return hasValue(candidate.existing_reference);
+  }
+  return true;
+}
+
 function markReviewWriteBackResults(discoveryCache, results) {
   for (const result of results || []) {
     const entry = discoveryCache?.review_candidates?.[result.detection_id];
@@ -2034,9 +2061,62 @@ function extractTeaReferences(text) {
 
 function extractSalesSkuReferences(text) {
   const out = new Set();
-  const pattern = /(^|[^A-Za-z0-9])((?:TB|TC|TP|TA|TFG|TF|TJC|TJ)\d{2,6})(?![A-Za-z0-9])/g;
-  for (const match of String(text || '').matchAll(pattern)) out.add(match[2].toUpperCase());
+
+  const pattern =
+    /(^|[^A-Za-z0-9])((?:TFG|TJC|TB|TC|TE|TF|TP|TA)\d{2,6}|TJ[A-Z0-9]{2,8})(?![A-Za-z0-9])/gi;
+
+  for (const match of String(text || '').matchAll(pattern)) {
+    out.add(match[2].toUpperCase());
+  }
+
   return [...out];
+}
+
+function salesSkuParts(sku) {
+  const normalized = String(sku || '').trim().toUpperCase();
+  const numeric = normalized.match(/^(TFG|TJC|TB|TC|TE|TF|TP|TA)(\d{2,6})$/);
+  if (numeric) {
+    return { sku: normalized, prefix: numeric[1], suffix: numeric[2], numericSuffix: true };
+  }
+  const tj = normalized.match(/^(TJ)([A-Z0-9]{2,8})$/);
+  if (tj) {
+    return { sku: normalized, prefix: tj[1], suffix: tj[2], numericSuffix: false };
+  }
+  return null;
+}
+
+function teaReferenceNumber(reference) {
+  return String(reference || '').trim().toUpperCase().match(/^T(\d+)$/)?.[1] || '';
+}
+
+function findMasterProductByReference(masterProducts, reference) {
+  const normalized = String(reference || '').trim().toUpperCase();
+  return (masterProducts || []).find((product) => String(product.reference || '').toUpperCase() === normalized) || null;
+}
+
+function resolveSalesSkuParent({ sku, pageRefs, masterProducts }) {
+  const parts = salesSkuParts(sku);
+  if (!parts) return null;
+  const refs = [...(pageRefs || [])].map((ref) => String(ref || '').toUpperCase()).filter((ref) => /^T\d+$/.test(ref));
+  if (!refs.length) return null;
+
+  let parentReference = '';
+  if (parts.numericSuffix) {
+    parentReference = refs.find((ref) => teaReferenceNumber(ref) === parts.suffix) || '';
+    if (!parentReference) return null;
+  } else if (refs.length === 1) {
+    parentReference = refs[0];
+  } else {
+    return null;
+  }
+
+  const product = findMasterProductByReference(masterProducts, parentReference);
+  return {
+    reference: parentReference,
+    versionKey: product?.master?.versionKey || '',
+    name: product?.name || '',
+    inMaster: Boolean(product),
+  };
 }
 
 function isJpRetailSkuLikeTeaReference(reference, facts) {
@@ -2154,7 +2234,7 @@ function buildUnregisteredReferenceReview({ reference, facts, url, source, sourc
   return candidate;
 }
 
-function buildSalesSkuReview({ sku, facts, url, source, sourceLanguage, discoverySource, snippet }) {
+function buildSalesSkuReview({ sku, facts, url, source, sourceLanguage, discoverySource, snippet, parent }) {
   const candidate = {
     detected_at: nowIso(),
     reference: sku,
@@ -2162,14 +2242,14 @@ function buildSalesSkuReview({ sku, facts, url, source, sourceLanguage, discover
     detection_type: 'sales_sku_detected',
     official_url: url,
     source_language: sourceLanguage || sourceLanguageFromUrl(url),
-    existing_reference: '',
-    existing_version_key: '',
-    existing_name: '',
-    diff_summary: `Official sales SKU ${sku} was detected. It is not treated as a tea reference.`,
-    evidence: `discovery_source=${discoverySource}; source=${source.id}; url=${url}; snippet=${snippet || facts?.snippet || ''}`,
+    existing_reference: parent?.reference || '',
+    existing_version_key: parent?.versionKey || '',
+    existing_name: parent?.name || '',
+    diff_summary: `Official sales SKU ${sku} was detected for ${parent?.reference || 'an unresolved tea reference'}. It is not treated as a tea reference.`,
+    evidence: `discovery_source=${discoverySource}; source=${source.id}; url=${url}; parent_reference=${parent?.reference || ''}; parent_in_master=${parent?.inMaster === true}; snippet=${snippet || facts?.snippet || ''}`,
     status: '要確認',
     human_decision: '',
-    target_version_key: '',
+    target_version_key: parent?.versionKey || '',
     comment: '',
   };
   candidate.detection_id = reviewCandidateKey(candidate);
@@ -2280,6 +2360,11 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
             }
 
             for (const sku of pageSalesSkus) {
+              const parent = resolveSalesSkuParent({ sku, pageRefs, masterProducts });
+              if (!parent) {
+                if (args.debug) console.log(`[sales-sku-skip] ${sku} did not match verified page reference(s): ${[...pageRefs].join(',')}`);
+                continue;
+              }
               const review = buildSalesSkuReview({
                 sku,
                 facts,
@@ -2288,6 +2373,7 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
                 sourceLanguage: source.language,
                 discoverySource: pageIsProduct ? 'product_page' : source.source,
                 snippet: facts.snippet,
+                parent,
               });
               if (cacheReviewCandidate(discoveryCache, review)) createdOrQueuedReviews += 1;
               salesSkus += 1;
@@ -2319,7 +2405,8 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
     }
 
   if (!args.dryRun && writeBackRequired(config)) {
-    const pendingReviewCandidates = Object.values(discoveryCache.review_candidates || {}).filter((candidate) => !candidate.write_back_success);
+    const pendingReviewCandidates = Object.values(discoveryCache.review_candidates || {})
+      .filter((candidate) => !candidate.write_back_success && reviewCandidateReadyForWriteBack(candidate));
     const reviewWriteBacks = await writeBackReviewCandidates({ config, baseDir, candidates: pendingReviewCandidates, debug: args.debug });
     markReviewWriteBackResults(discoveryCache, reviewWriteBacks);
   }
@@ -2573,7 +2660,8 @@ async function main() {
             writeBack: previous.writeBack || null,
           };
           if (discoveryCache && writeBackRequired(config)) {
-            const pendingReviewCandidates = Object.values(discoveryCache.review_candidates || {}).filter((candidate) => !candidate.write_back_success);
+            const pendingReviewCandidates = Object.values(discoveryCache.review_candidates || {})
+              .filter((candidate) => !candidate.write_back_success && reviewCandidateReadyForWriteBack(candidate));
             const reviewWriteBacks = await writeBackReviewCandidates({ config, baseDir, candidates: pendingReviewCandidates, debug: args.debug });
             markReviewWriteBackResults(discoveryCache, reviewWriteBacks);
           }
@@ -2614,7 +2702,8 @@ async function main() {
         }
       }
       if (discoveryCache && writeBackRequired(config)) {
-        const pendingReviewCandidates = Object.values(discoveryCache.review_candidates || {}).filter((candidate) => !candidate.write_back_success);
+        const pendingReviewCandidates = Object.values(discoveryCache.review_candidates || {})
+          .filter((candidate) => !candidate.write_back_success && reviewCandidateReadyForWriteBack(candidate));
         const reviewWriteBacks = await writeBackReviewCandidates({ config, baseDir, candidates: pendingReviewCandidates, debug: args.debug });
         markReviewWriteBackResults(discoveryCache, reviewWriteBacks);
       }
