@@ -638,7 +638,11 @@ function mfImageCollectorGetReviewSummary() {
 
 function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey) {
   if (decision === '誤検出' || decision === '保留') return;
-  if (decision === '販売SKUとして追加' || decision === '既存銘柄と同一' || decision === '終売情報として更新') return;
+  if (decision === '販売SKUとして追加') {
+    mfImageCollectorApplySalesSku_(review, targetVersionKey);
+    return;
+  }
+  if (decision === '既存銘柄と同一' || decision === '終売情報として更新') return;
 
   var ss = mfImageCollectorOpenSpreadsheet_();
   var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
@@ -673,6 +677,94 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
     if (review['公式名']) sheet.getRange(row, nameCol + 1).setValue(review['公式名']);
     if (urlCol >= 0 && review['公式URL']) sheet.getRange(row, urlCol + 1).setValue(review['公式URL']);
   }
+}
+
+function mfImageCollectorApplySalesSku_(review, targetVersionKey) {
+  var sku = String(review['Tリファレンス番号'] || '').trim().toUpperCase();
+  var skuInfo = mfImageCollectorSalesSkuInfo_(sku);
+  if (!skuInfo) throw new Error('Unsupported sales SKU reference: ' + sku);
+
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+
+  var values = sheet.getDataRange().getValues();
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var parentReference = mfImageCollectorResolveSalesSkuParentReference_(review, targetVersionKey, skuInfo);
+  var targetRow = mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, targetVersionKey || review['対象VersionKey'] || review['DB既存VersionKey'], parentReference);
+  if (targetRow < 2) throw new Error('Target master row was not found for sales SKU: ' + sku);
+
+  var mapping = mfImageCollectorSalesSkuColumns_(skuInfo.prefix);
+  if (!mapping) throw new Error('Unsupported sales SKU prefix: ' + skuInfo.prefix);
+
+  var evidence = mfImageCollectorSalesSkuEvidence_(review);
+  if (mapping.flag) mfImageCollectorSetCellByHeader_(sheet, headers, targetRow, mapping.flag, 'はい');
+  if (mapping.reference) mfImageCollectorAppendDelimitedCellByHeader_(sheet, headers, targetRow, mapping.reference, sku);
+  if (mapping.kind) mfImageCollectorAppendDelimitedCellByHeader_(sheet, headers, targetRow, mapping.kind, skuInfo.prefix);
+  if (mapping.evidence) mfImageCollectorAppendDelimitedCellByHeader_(sheet, headers, targetRow, mapping.evidence, evidence);
+}
+
+function mfImageCollectorSalesSkuInfo_(sku) {
+  var normalized = String(sku || '').trim().toUpperCase();
+  var numeric = normalized.match(/^(TFG|TJC|TB|TC|TE|TF|TP|TA)(\d{2,6})$/);
+  if (numeric) return { sku: normalized, prefix: numeric[1], suffix: numeric[2], numericSuffix: true };
+  var tj = normalized.match(/^(TJ)([A-Z0-9]{2,8})$/);
+  if (tj) return { sku: normalized, prefix: tj[1], suffix: tj[2], numericSuffix: false };
+  return null;
+}
+
+function mfImageCollectorSalesSkuColumns_(prefix) {
+  var map = {
+    TB: { flag: 'ティーバッグ版', reference: 'TBリファレンス', evidence: 'TB根拠／出典' },
+    TC: { flag: 'クラシック缶版', reference: 'TCリファレンス', evidence: 'TC根拠／出典' },
+    TE: { flag: 'トール缶版', reference: 'TEリファレンス', evidence: 'TE根拠／出典' },
+    TF: { flag: 'ガラスフラコン版', reference: 'TFリファレンス', evidence: 'TF根拠／出典' },
+    TFG: { flag: '水出し用ブレンド', reference: '水出し用リファレンス', evidence: '水出し用根拠／出典' },
+    TP: { flag: 'ティーパケット版', reference: 'TPリファレンス', evidence: 'TP根拠／出典' },
+    TA: { flag: 'TA装丁版', reference: 'TAリファレンス', evidence: 'TA根拠／出典' },
+    TJ: { flag: 'カリグラフィー缶版', reference: 'TJリファレンス', evidence: 'TJ根拠／出典' },
+    TJC: { flag: '和紙装丁缶版', reference: 'TJCリファレンス', evidence: 'TJC根拠／出典' }
+  };
+  return map[prefix] || null;
+}
+
+function mfImageCollectorResolveSalesSkuParentReference_(review, targetVersionKey, skuInfo) {
+  var existingReference = String(review['DB既存T'] || '').trim().toUpperCase();
+  if (/^T\d+$/.test(existingReference)) return existingReference;
+
+  var versionKey = String(targetVersionKey || review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim().toUpperCase();
+  var versionMatch = versionKey.match(/^(T\d+)-B\d{2}$/);
+  if (versionMatch) return versionMatch[1];
+
+  if (skuInfo.numericSuffix) return 'T' + skuInfo.suffix;
+  throw new Error('Parent T reference is required for sales SKU: ' + skuInfo.sku);
+}
+
+function mfImageCollectorSalesSkuEvidence_(review) {
+  var parts = [];
+  var officialUrl = String(review['公式URL'] || '').trim();
+  var evidence = String(review['Collectorが取得した根拠'] || '').trim();
+  if (officialUrl) parts.push('公式URL: ' + officialUrl);
+  if (evidence) parts.push(evidence);
+  return parts.join(' / ');
+}
+
+function mfImageCollectorSetCellByHeader_(sheet, headers, row, header, value) {
+  var col = headers.indexOf(header);
+  if (col < 0) throw new Error('Required sales SKU column is missing: ' + header);
+  sheet.getRange(row, col + 1).setValue(value);
+}
+
+function mfImageCollectorAppendDelimitedCellByHeader_(sheet, headers, row, header, value) {
+  var col = headers.indexOf(header);
+  if (col < 0) throw new Error('Required sales SKU column is missing: ' + header);
+  var range = sheet.getRange(row, col + 1);
+  var existing = String(range.getValue() || '').trim();
+  var incoming = String(value || '').trim();
+  if (!incoming) return;
+  var values = existing ? existing.split(/[、,;／|\n]+/).map(function(part) { return String(part).trim(); }).filter(Boolean) : [];
+  if (values.indexOf(incoming) < 0) values.push(incoming);
+  range.setValue(values.join('、'));
 }
 
 function mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, versionKey, reference) {
