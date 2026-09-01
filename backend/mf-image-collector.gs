@@ -664,8 +664,10 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
     var reference = String(review['Tリファレンス番号'] || '').trim().toUpperCase();
     var versionKey = String(targetVersionKey || mfImageCollectorNextVersionKey_(values, headers, reference)).trim().toUpperCase();
     mfImageCollectorAssertAppendVersionKey_(values, headers, reference, versionKey);
+    var versionLabel = mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey);
     var newRow = headers.map(function(header) {
       if (header === 'VersionKey') return versionKey;
+      if (header === 'バージョン') return versionLabel;
       if (header === 'Tリファレンス番号') return reference;
       if (header === '現在の公式名') return review['公式名'] || '';
       if (header === '現在の公式説明') return review['公式説明抜粋'] || '';
@@ -684,6 +686,16 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
     if (review['公式名']) sheet.getRange(row, nameCol + 1).setValue(review['公式名']);
     if (urlCol >= 0 && review['公式URL']) sheet.getRange(row, urlCol + 1).setValue(review['公式URL']);
   }
+}
+
+function mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey) {
+  var ref = String(reference || '').trim().toUpperCase();
+  var key = String(versionKey || '').trim().toUpperCase();
+  var match = key.match(new RegExp('^' + ref + '-(B\\d{2})$'));
+  if (!match) {
+    throw new Error('VersionKey and バージョン are inconsistent: ' + key);
+  }
+  return match[1];
 }
 
 function mfImageCollectorReviewOfficialCategory_(review) {
