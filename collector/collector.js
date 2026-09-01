@@ -25,6 +25,7 @@ const MASTER_COLUMNS = {
   officialDescriptionSourceUrl: '現在の公式説明根拠URL',
   officialDescriptionOriginal: '現在の公式説明原文',
   officialCategory: '現在のカテゴリ',
+  teaTypeTag: '茶種タグ',
   teaImageUrl: '茶葉画像URL',
   teaThumbnailUrl: '茶葉サムネイルURL',
   liqueurImageUrl: '水色画像URL',
@@ -787,7 +788,32 @@ function normalizeOfficialCategoryForMaster(category) {
   if (/rooibos/.test(normalized)) return 'ルイボス';
   if (/infusion|herbal/.test(normalized)) return 'インフュージョン';
   if (/mat[ée]/.test(normalized)) return 'マテ';
-  return normalizeText(category).replace(/\bBlack tea\b/gi, '黒茶').replace(/\bBlue tea\b/gi, '青茶').replace(/\bGreen tea\b/gi, '緑茶').replace(/\bWhite tea\b/gi, '白茶').replace(/\bThé noir\b/gi, '黒茶').replace(/\bThé bleu\b/gi, '青茶').replace(/\bThé vert\b/gi, '緑茶').replace(/\bThé blanc\b/gi, '白茶');
+  return normalizeText(category)
+    .replace(/紅茶/g, '黒茶')
+    .replace(/\bBlack tea\b/gi, '黒茶')
+    .replace(/\bBlue tea\b/gi, '青茶')
+    .replace(/\bGreen tea\b/gi, '緑茶')
+    .replace(/\bWhite tea\b/gi, '白茶')
+    .replace(/\bThé noir\b/gi, '黒茶')
+    .replace(/\bThé bleu\b/gi, '青茶')
+    .replace(/\bThé vert\b/gi, '緑茶')
+    .replace(/\bThé blanc\b/gi, '白茶');
+}
+
+function normalizeTeaTypeTagTokenForMaster(token) {
+  const raw = normalizeText(token);
+  const normalized = raw.replace(/™/g, '').toLowerCase();
+  if (raw === '紅茶') return '黒茶';
+  if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir') return '黒茶';
+  return raw;
+}
+
+function normalizeTeaTypeTagsForMaster(value) {
+  const tags = String(value || '')
+    .split(/[、,;／|\n]+/)
+    .map((token) => normalizeTeaTypeTagTokenForMaster(token))
+    .filter(Boolean);
+  return [...new Set(tags)].join('、');
 }
 
 function officialDescriptionJapaneseOverrides(config) {

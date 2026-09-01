@@ -89,6 +89,9 @@ function mfImageCollectorDoPost(e) {
     if (payload.action === 'updateMasterOfficialInfo') {
       return mfImageCollectorJson_(mfImageCollectorUpdateMasterOfficialInfo_(payload));
     }
+    if (payload.action === 'normalizeTeaTypeTags') {
+      return mfImageCollectorJson_(mfImageCollectorNormalizeTeaTypeTags_(payload));
+    }
     if (payload.action === 'recordReviewCandidate') {
       return mfImageCollectorJson_(mfImageCollectorRecordReviewCandidate_(payload));
     }
@@ -671,7 +674,7 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
       if (header === 'Tリファレンス番号') return reference;
       if (header === '現在の公式名') return review['公式名'] || '';
       if (header === '現在の公式説明') return review['公式説明抜粋'] || '';
-      if (header === '現在のカテゴリ') return mfImageCollectorReviewOfficialCategory_(review);
+      if (header === '現在のカテゴリ') return mfImageCollectorNormalizeClassificationValueForMaster_(mfImageCollectorReviewOfficialCategory_(review));
       if (header === '公式商品ページURL') return review['公式URL'] || '';
       if (header === '公式商品ページURL状態') return review['公式URL'] ? 'available' : 'pending';
       return '';
@@ -911,7 +914,7 @@ function mfImageCollectorUpdateMasterOfficialInfo_(payload) {
   var officialDescriptionOriginal = String(payload.official_description_original || '').trim();
   var officialDescriptionSourceLanguage = String(payload.official_description_source_language || payload.source_language || '').trim();
   var officialDescriptionSourceUrl = String(payload.official_description_source_url || payload.source_url || '').trim();
-  var officialCategory = String(payload.official_category || '').trim();
+  var officialCategory = mfImageCollectorNormalizeClassificationValueForMaster_(payload.official_category);
   if (!officialDescription && !officialCategory) throw new Error('official_description or official_category is required.');
   if (productPageUrl && !mfImageCollectorUrlHasExactReference_(productPageUrl, reference)) {
     throw new Error('product_page_url does not contain the exact reference.');
@@ -979,6 +982,98 @@ function mfImageCollectorUpdateMasterOfficialInfo_(payload) {
     updated_description: updatedDescription,
     updated_category: updatedCategory
   };
+}
+
+function mfImageCollectorNormalizeTeaTypeTags_(payload) {
+  mfImageCollectorAssertSecret_(payload);
+  var dryRun = payload.dry_run !== false;
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) return { ok: true, dry_run: dryRun, changed_count: 0, changes: [] };
+
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var refCol = headers.indexOf('Tリファレンス番号');
+  var versionCol = headers.indexOf('VersionKey');
+  var tagCol = headers.indexOf('茶種タグ');
+  var categoryCol = headers.indexOf('現在のカテゴリ');
+  if (tagCol < 0 && categoryCol < 0) throw new Error('茶種タグ or 現在のカテゴリ column is required.');
+
+  var changes = [];
+  for (var i = 1; i < values.length; i += 1) {
+    var reference = refCol >= 0 ? String(values[i][refCol] || '').trim() : '';
+    var versionKey = versionCol >= 0 ? String(values[i][versionCol] || '').trim() : '';
+    if (tagCol >= 0) {
+      var tagBefore = String(values[i][tagCol] || '').trim();
+      var tagAfter = mfImageCollectorNormalizeTeaTypeTagsForMaster_(tagBefore);
+      if (tagBefore !== tagAfter) {
+        changes.push({
+          row_number: i + 1,
+          reference: reference,
+          version_key: versionKey,
+          column: '茶種タグ',
+          before: tagBefore,
+          after: tagAfter
+        });
+        if (!dryRun) {
+          sheet.getRange(i + 1, tagCol + 1).setValue(tagAfter);
+        }
+      }
+    }
+    if (categoryCol >= 0) {
+      var categoryBefore = String(values[i][categoryCol] || '').trim();
+      var categoryAfter = mfImageCollectorNormalizeClassificationValueForMaster_(categoryBefore);
+      if (categoryBefore !== categoryAfter) {
+        changes.push({
+          row_number: i + 1,
+          reference: reference,
+          version_key: versionKey,
+          column: '現在のカテゴリ',
+          before: categoryBefore,
+          after: categoryAfter
+        });
+        if (!dryRun) {
+          sheet.getRange(i + 1, categoryCol + 1).setValue(categoryAfter);
+        }
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    dry_run: dryRun,
+    changed_count: changes.length,
+    changes: changes
+  };
+}
+
+function mfImageCollectorNormalizeTeaTypeTagsForMaster_(value) {
+  var parts = String(value || '').split(/[、,;／|\n]+/);
+  var out = [];
+  for (var i = 0; i < parts.length; i += 1) {
+    var normalized = mfImageCollectorNormalizeTeaTypeTagTokenForMaster_(parts[i]);
+    if (normalized && out.indexOf(normalized) < 0) out.push(normalized);
+  }
+  return out.join('、');
+}
+
+function mfImageCollectorNormalizeTeaTypeTagTokenForMaster_(token) {
+  var raw = String(token || '').trim();
+  if (!raw) return '';
+  var normalized = raw.replace(/™/g, '').toLowerCase();
+  if (raw === '紅茶') return '黒茶';
+  if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir') return '黒茶';
+  return raw;
+}
+
+function mfImageCollectorNormalizeClassificationValueForMaster_(value) {
+  return String(value || '').trim()
+    .replace(/紅茶/g, '黒茶')
+    .replace(/\bBlack tea\b/gi, '黒茶')
+    .replace(/\bThé noir\b/gi, '黒茶')
+    .replace(/\bthe noir\b/gi, '黒茶');
 }
 
 function mfImageCollectorUrlHasExactReference_(url, reference) {
