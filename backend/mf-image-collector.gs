@@ -92,6 +92,9 @@ function mfImageCollectorDoPost(e) {
     if (payload.action === 'normalizeTeaTypeTags') {
       return mfImageCollectorJson_(mfImageCollectorNormalizeTeaTypeTags_(payload));
     }
+    if (payload.action === 'updateMasterNewTeaDefaults') {
+      return mfImageCollectorJson_(mfImageCollectorUpdateMasterNewTeaDefaults_(payload));
+    }
     if (payload.action === 'recordReviewCandidate') {
       return mfImageCollectorJson_(mfImageCollectorRecordReviewCandidate_(payload));
     }
@@ -668,17 +671,7 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
     var versionKey = String(targetVersionKey || mfImageCollectorNextVersionKey_(values, headers, reference)).trim().toUpperCase();
     mfImageCollectorAssertAppendVersionKey_(values, headers, reference, versionKey);
     var versionLabel = mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey);
-    var newRow = headers.map(function(header) {
-      if (header === 'VersionKey') return versionKey;
-      if (header === 'バージョン') return versionLabel;
-      if (header === 'Tリファレンス番号') return reference;
-      if (header === '現在の公式名') return review['公式名'] || '';
-      if (header === '現在の公式説明') return review['公式説明抜粋'] || '';
-      if (header === '現在のカテゴリ') return mfImageCollectorNormalizeClassificationValueForMaster_(mfImageCollectorReviewOfficialCategory_(review));
-      if (header === '公式商品ページURL') return review['公式URL'] || '';
-      if (header === '公式商品ページURL状態') return review['公式URL'] ? 'available' : 'pending';
-      return '';
-    });
+    var newRow = mfImageCollectorBuildApprovedNewTeaRow_(headers, review, reference, versionKey, versionLabel);
     sheet.appendRow(newRow);
     return;
   }
@@ -701,6 +694,27 @@ function mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey) {
   return match[1];
 }
 
+function mfImageCollectorBuildApprovedNewTeaRow_(headers, review, reference, versionKey, versionLabel) {
+  var officialCategory = mfImageCollectorNormalizeClassificationValueForMaster_(mfImageCollectorReviewOfficialCategory_(review));
+  var teaTypeTag = mfImageCollectorTeaTypeTagFromCategory_(officialCategory);
+  var officialDescription = mfImageCollectorReviewOfficialDescriptionForMaster_(review);
+  var officialUrl = String(review['公式URL'] || '').trim();
+  return headers.map(function(header) {
+    if (header === 'VersionKey') return versionKey;
+    if (header === 'バージョン') return versionLabel;
+    if (header === 'Tリファレンス番号') return reference;
+    if (header === '現在の公式名') return review['公式名'] || '';
+    if (header === '現在の公式説明') return officialDescription;
+    if (header === '現在のカテゴリ') return officialCategory;
+    if (header === '茶種タグ') return teaTypeTag;
+    if (header === '公式商品ページURL') return officialUrl;
+    if (header === '公式商品ページURL状態') return officialUrl ? 'available' : 'pending';
+    if (header === '黒い本掲載') return 'いいえ';
+    if (header === '茶葉画像状態' || header === '茶葉サムネイル状態' || header === '水色画像状態') return 'pending';
+    return '';
+  });
+}
+
 function mfImageCollectorReviewOfficialCategory_(review) {
   try {
     var info = JSON.parse(String(review['公式情報JSON'] || '{}'));
@@ -708,6 +722,34 @@ function mfImageCollectorReviewOfficialCategory_(review) {
   } catch (error) {
     return '';
   }
+}
+
+function mfImageCollectorReviewOfficialDescriptionForMaster_(review) {
+  try {
+    var info = JSON.parse(String(review['公式情報JSON'] || '{}'));
+    var approved = String(info.approved_japanese_description || info.planned_japanese_description || '').trim();
+    if (approved) return approved;
+    var snippets = info.description_snippets_by_language || {};
+    var jp = String(snippets.JP || snippets.jp || '').trim();
+    if (jp) return jp;
+  } catch (error) {
+    // Fall through to the flat review fields below.
+  }
+  var language = String(review['言語'] || review['確認言語'] || '').trim().toUpperCase();
+  if (language === 'JP') return String(review['公式説明抜粋'] || '').trim();
+  return '';
+}
+
+function mfImageCollectorTeaTypeTagFromCategory_(category) {
+  var normalized = mfImageCollectorNormalizeClassificationValueForMaster_(category);
+  if (!normalized) return '';
+  var direct = ['黒茶', '青茶', '緑茶', '白茶', '黄茶', '後発酵茶', 'ルイボス', 'マテ', 'インフュージョン'];
+  for (var i = 0; i < direct.length; i += 1) {
+    if (normalized.indexOf(direct[i]) === 0 || normalized.indexOf(direct[i] + '／') === 0 || normalized.indexOf(direct[i] + ',') === 0) {
+      return direct[i];
+    }
+  }
+  return mfImageCollectorNormalizeTeaTypeTagsForMaster_(normalized);
 }
 
 function mfImageCollectorApplySalesSku_(review, targetVersionKey) {
@@ -984,6 +1026,92 @@ function mfImageCollectorUpdateMasterOfficialInfo_(payload) {
   };
 }
 
+function mfImageCollectorUpdateMasterNewTeaDefaults_(payload) {
+  mfImageCollectorAssertSecret_(payload);
+
+  var dryRun = payload.dry_run !== false;
+  var reference = String(payload.reference || '').trim().toUpperCase();
+  if (!reference) throw new Error('reference is required.');
+  var versionKey = String(payload.version_key || '').trim().toUpperCase();
+  var productPageUrl = String(payload.product_page_url || '').trim();
+  var officialName = String(payload.official_name || '').trim();
+  var officialCategory = mfImageCollectorNormalizeClassificationValueForMaster_(payload.official_category);
+  var teaTypeTag = mfImageCollectorTeaTypeTagFromCategory_(officialCategory);
+  var masterAbsenceConfirmed = payload.master_absence_confirmed === true;
+  var officialDescription = mfImageCollectorReviewOfficialDescriptionForMaster_({
+    '言語': payload.source_language || '',
+    '確認言語': payload.source_language || '',
+    '公式説明抜粋': payload.description_excerpt || '',
+    '公式情報JSON': mfImageCollectorStableJson_({
+      description_snippets_by_language: payload.description_snippets_by_language || {},
+      approved_japanese_description: payload.approved_japanese_description || '',
+      planned_japanese_description: payload.planned_japanese_description || ''
+    })
+  });
+
+  if (productPageUrl && !mfImageCollectorUrlHasExactReference_(productPageUrl, reference)) {
+    throw new Error('product_page_url does not contain the exact reference.');
+  }
+
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('Sheet has no data rows.');
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var refCol = headers.indexOf('Tリファレンス番号');
+  var versionCol = headers.indexOf('VersionKey');
+  if (refCol < 0) throw new Error('Tリファレンス番号 column is required.');
+
+  var rowIndex = -1;
+  for (var i = 1; i < values.length; i += 1) {
+    if (String(values[i][refCol]).trim().toUpperCase() !== reference) continue;
+    if (versionKey && versionCol >= 0 && String(values[i][versionCol]).trim().toUpperCase() !== versionKey) continue;
+    rowIndex = i;
+    break;
+  }
+  if (rowIndex < 0) throw new Error('Reference not found: ' + reference);
+
+  if (!versionKey && versionCol >= 0) versionKey = String(values[rowIndex][versionCol] || '').trim().toUpperCase();
+  var changes = [];
+  mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, 'バージョン', versionKey ? mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey) : '', changes, dryRun);
+  mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '現在の公式名', officialName, changes, dryRun);
+  mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '公式商品ページURL', productPageUrl, changes, dryRun);
+  mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '公式商品ページURL状態', productPageUrl ? 'available' : '', changes, dryRun);
+  mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '黒い本掲載', masterAbsenceConfirmed ? 'いいえ' : '', changes, dryRun);
+  mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '現在のカテゴリ', officialCategory, changes, dryRun);
+  mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '茶種タグ', teaTypeTag, changes, dryRun);
+  mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '現在の公式説明', officialDescription, changes, dryRun);
+  mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '茶葉画像状態', 'pending', changes, dryRun);
+  mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '茶葉サムネイル状態', 'pending', changes, dryRun);
+  mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '水色画像状態', 'pending', changes, dryRun);
+
+  return {
+    ok: true,
+    dry_run: dryRun,
+    reference: reference,
+    version_key: versionKey,
+    sheet_row: rowIndex + 1,
+    changed_count: changes.length,
+    changes: changes
+  };
+}
+
+function mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, header, value, changes, dryRun) {
+  var col = headers.indexOf(header);
+  if (col < 0 || value === null || value === undefined || String(value).trim() === '') return;
+  var before = String(values[rowIndex][col] || '').trim();
+  if (before) return;
+  var after = String(value).trim();
+  changes.push({
+    row_number: rowIndex + 1,
+    column: header,
+    before: before,
+    after: after
+  });
+  if (!dryRun) sheet.getRange(rowIndex + 1, col + 1).setValue(after);
+}
+
 function mfImageCollectorNormalizeTeaTypeTags_(payload) {
   mfImageCollectorAssertSecret_(payload);
   var dryRun = payload.dry_run !== false;
@@ -1069,11 +1197,31 @@ function mfImageCollectorNormalizeTeaTypeTagTokenForMaster_(token) {
 }
 
 function mfImageCollectorNormalizeClassificationValueForMaster_(value) {
-  return String(value || '').trim()
+  var raw = String(value || '').trim();
+  var normalized = raw.replace(/™/g, '').toLowerCase();
+  if (!normalized) return '';
+  if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir') return '黒茶';
+  if (normalized === 'blue tea' || normalized === 'thé bleu' || normalized === 'the bleu') return '青茶';
+  if (normalized === 'green tea' || normalized === 'thé vert') return '緑茶';
+  if (normalized === 'white tea' || normalized === 'thé blanc') return '白茶';
+  if (normalized === 'yellow tea' || normalized === 'thé jaune') return '黄茶';
+  if (normalized === 'rooibos') return 'ルイボス';
+  if (normalized === 'maté' || normalized === 'mate') return 'マテ';
+  if (normalized === 'infusion' || normalized === 'herbal tea') return 'インフュージョン';
+  return raw
     .replace(/紅茶/g, '黒茶')
     .replace(/\bBlack tea\b/gi, '黒茶')
+    .replace(/\bBlue tea\b/gi, '青茶')
+    .replace(/\bGreen tea\b/gi, '緑茶')
+    .replace(/\bWhite tea\b/gi, '白茶')
+    .replace(/\bYellow tea\b/gi, '黄茶')
     .replace(/\bThé noir\b/gi, '黒茶')
-    .replace(/\bthe noir\b/gi, '黒茶');
+    .replace(/\bthe noir\b/gi, '黒茶')
+    .replace(/\bThé bleu\b/gi, '青茶')
+    .replace(/\bthe bleu\b/gi, '青茶')
+    .replace(/\bThé vert\b/gi, '緑茶')
+    .replace(/\bThé blanc\b/gi, '白茶')
+    .replace(/\bThé jaune\b/gi, '黄茶');
 }
 
 function mfImageCollectorUrlHasExactReference_(url, reference) {
