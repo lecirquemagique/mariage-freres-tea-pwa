@@ -20,6 +20,11 @@ const MASTER_COLUMNS = {
   reference: 'Tリファレンス番号',
   name: '現在の公式名',
   fallbackName: '銘柄名（黒い本）',
+  officialDescription: '現在の公式説明',
+  officialDescriptionSourceLanguage: '現在の公式説明根拠言語',
+  officialDescriptionSourceUrl: '現在の公式説明根拠URL',
+  officialDescriptionOriginal: '現在の公式説明原文',
+  officialCategory: '現在のカテゴリ',
   teaImageUrl: '茶葉画像URL',
   teaThumbnailUrl: '茶葉サムネイルURL',
   liqueurImageUrl: '水色画像URL',
@@ -55,6 +60,7 @@ function parseArgs(argv) {
     useConfigProducts: false,
     discoverUrlsOnly: false,
     discoverNewReferences: false,
+    backfillOfficialDescriptions: false,
     statusJson: false,
     refs: null,
   };
@@ -76,6 +82,7 @@ function parseArgs(argv) {
     else if (arg === '--use-config-products') args.useConfigProducts = true;
     else if (arg === '--discover-urls-only') args.discoverUrlsOnly = true;
     else if (arg === '--discover-new-references') args.discoverNewReferences = true;
+    else if (arg === '--backfill-official-descriptions') args.backfillOfficialDescriptions = true;
     else if (arg === '--status-json') args.statusJson = true;
     else if (arg === '--config') args.config = argv[++i];
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
@@ -401,6 +408,46 @@ async function writeBackReviewCandidate({ config, baseDir, candidate, debug }) {
   return data;
 }
 
+async function writeBackMasterOfficialInfo({ config, baseDir, product, officialInfo, debug }) {
+  const settings = getWriteBackSettings(config, baseDir);
+  if (!settings) return null;
+
+  const payload = {
+    action: 'updateMasterOfficialInfo',
+    secret: settings.secret,
+    reference: product.reference,
+    version_key: product.master?.versionKey || '',
+    product_page_url: product.productUrl,
+    official_description: officialInfo.description || '',
+    official_description_original: officialInfo.originalDescription || '',
+    official_description_source_language: officialInfo.language || '',
+    official_description_source_url: officialInfo.sourceUrl || product.productUrl || '',
+    official_category: officialInfo.category || '',
+    source_language: officialInfo.language || '',
+    source_url: officialInfo.sourceUrl || product.productUrl || '',
+  };
+  if (debug) {
+    console.log(`[official-info-writeback] ${product.reference} description=${payload.official_description ? 'yes' : 'no'} category=${payload.official_category || ''}`);
+  }
+
+  const response = await fetch(settings.gasApiUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+    body: JSON.stringify(payload),
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(formatWriteBackResponseError('Official info writeback did not return JSON', settings, response, text));
+  }
+  if (!response.ok || data.ok === false) {
+    throw new Error(formatWriteBackResponseError(`Official info writeback failed: ${data.error || responsePreview(text)}`, settings, response, text));
+  }
+  return data;
+}
+
 function parseJsonp(text, callbackName = '__mfCollectorCb') {
   const trimmed = text.trim();
   const prefix = `${callbackName}(`;
@@ -453,6 +500,11 @@ async function fetchMasterProducts(config, baseDir, debug) {
         productUrl,
         master: {
           productUrl,
+          officialDescription: normalizeText(row[MASTER_COLUMNS.officialDescription]),
+          officialDescriptionSourceLanguage: normalizeText(row[MASTER_COLUMNS.officialDescriptionSourceLanguage]),
+          officialDescriptionSourceUrl: normalizeText(row[MASTER_COLUMNS.officialDescriptionSourceUrl]),
+          officialDescriptionOriginal: normalizeText(row[MASTER_COLUMNS.officialDescriptionOriginal]),
+          officialCategory: normalizeText(row[MASTER_COLUMNS.officialCategory]),
           productUrlStatus: normalizeProductUrlStatus(row[MASTER_COLUMNS.productUrlStatus]),
           teaImageUrl: normalizeText(row[MASTER_COLUMNS.teaImageUrl]),
           teaThumbnailUrl: normalizeText(row[MASTER_COLUMNS.teaThumbnailUrl]),
@@ -698,6 +750,89 @@ function compactSnippet(value, maxLength = 500) {
   return normalizeText(value).replace(/\s+/g, ' ').slice(0, maxLength);
 }
 
+function preferredDescriptionByLanguage(descriptionsByLanguage) {
+  const descriptions = descriptionsByLanguage && typeof descriptionsByLanguage === 'object' ? descriptionsByLanguage : {};
+  for (const language of ['JP', 'EN', 'FR']) {
+    const description = compactSnippet(descriptions[language] || '', 1200);
+    if (description) return description;
+  }
+  return '';
+}
+
+function normalizeOfficialCategoryForMaster(category) {
+  const normalized = normalizeText(category).replace(/™/g, '').toLowerCase();
+  if (!normalized) return '';
+  const direct = new Map([
+    ['thé noir', '黒茶'],
+    ['the noir', '黒茶'],
+    ['black tea', '黒茶'],
+    ['thé bleu', '青茶'],
+    ['the bleu', '青茶'],
+    ['blue tea', '青茶'],
+    ['thé vert', '緑茶'],
+    ['green tea', '緑茶'],
+    ['thé blanc', '白茶'],
+    ['white tea', '白茶'],
+    ['rooibos', 'ルイボス'],
+    ['infusion', 'インフュージョン'],
+    ['herbal tea', 'インフュージョン'],
+    ['maté', 'マテ'],
+    ['mate', 'マテ'],
+  ]);
+  if (direct.has(normalized)) return direct.get(normalized);
+  if (/thé noir|black tea/.test(normalized)) return '黒茶';
+  if (/thé bleu|blue tea|oolong/.test(normalized)) return '青茶';
+  if (/thé vert|green tea/.test(normalized)) return '緑茶';
+  if (/thé blanc|white tea/.test(normalized)) return '白茶';
+  if (/rooibos/.test(normalized)) return 'ルイボス';
+  if (/infusion|herbal/.test(normalized)) return 'インフュージョン';
+  if (/mat[ée]/.test(normalized)) return 'マテ';
+  return normalizeText(category).replace(/\bBlack tea\b/gi, '黒茶').replace(/\bBlue tea\b/gi, '青茶').replace(/\bGreen tea\b/gi, '緑茶').replace(/\bWhite tea\b/gi, '白茶').replace(/\bThé noir\b/gi, '黒茶').replace(/\bThé bleu\b/gi, '青茶').replace(/\bThé vert\b/gi, '緑茶').replace(/\bThé blanc\b/gi, '白茶');
+}
+
+function officialDescriptionJapaneseOverrides(config) {
+  return config.officialDescriptionJapaneseOverrides && typeof config.officialDescriptionJapaneseOverrides === 'object'
+    ? config.officialDescriptionJapaneseOverrides
+    : {};
+}
+
+function curatedOfficialDescriptionJa(reference, sourceLanguage, originalDescription, config = {}) {
+  const normalizedReference = normalizeText(reference).toUpperCase();
+  const overrides = officialDescriptionJapaneseOverrides(config);
+  if (hasValue(overrides[normalizedReference])) return normalizeText(overrides[normalizedReference]);
+  const original = normalizeText(originalDescription);
+  if (!original) return '';
+  if (sourceLanguage === 'JP') return original;
+  return '';
+}
+
+function buildOfficialDescriptionBackfillValue({ product, facts, language, config }) {
+  const originalDescription = compactSnippet(facts?.productDescription || '', 1200);
+  const japaneseDescription = curatedOfficialDescriptionJa(product.reference, language, originalDescription, config);
+  return {
+    original_description: originalDescription,
+    source_language: language || '',
+    source_url: facts?.url || product.productUrl || '',
+    japanese_description: japaneseDescription,
+    needs_translation: Boolean(originalDescription && !japaneseDescription),
+  };
+}
+
+function buildOfficialDescriptionTranslationReviewCandidate({ product, facts, descriptionValue, category }) {
+  return {
+    reference: product.reference,
+    version_key: product.master?.versionKey || '',
+    official_name: facts?.h1 || product.name || '',
+    source_language: descriptionValue.source_language,
+    source_url: descriptionValue.source_url,
+    original_description: descriptionValue.original_description,
+    normalized_category: category || '',
+    current_master_description: product.master?.officialDescription || '',
+    current_master_category: product.master?.officialCategory || '',
+    reason: 'Official product description was found only outside JP and needs human-approved Japanese text before master writeback.',
+  };
+}
+
 function mergeUniqueTextLines(...values) {
   const out = [];
   for (const value of values) {
@@ -821,6 +956,7 @@ function cacheReviewCandidate(cache, candidate) {
     const beforeFingerprint = reviewCandidateWriteBackFingerprint(existing);
     const languages = new Set(String(existing.source_language || '').split(/[,+\s]+/).filter(Boolean));
     for (const lang of String(item.source_language || '').split(/[,+\s]+/).filter(Boolean)) languages.add(lang);
+    const mergedDescriptionSnippets = mergeObjectValues(existing.description_snippets_by_language, item.description_snippets_by_language);
     const merged = {
       ...existing,
       official_name: existing.official_name || item.official_name,
@@ -837,11 +973,13 @@ function cacheReviewCandidate(cache, candidate) {
       jp_official_url: existing.jp_official_url || item.jp_official_url || '',
       official_urls_by_language: mergeObjectValues(existing.official_urls_by_language, item.official_urls_by_language),
       official_names_by_language: mergeObjectValues(existing.official_names_by_language, item.official_names_by_language),
-      description_snippets_by_language: mergeObjectValues(existing.description_snippets_by_language, item.description_snippets_by_language),
+      description_snippets_by_language: mergedDescriptionSnippets,
+      categories_by_language: mergeObjectValues(existing.categories_by_language, item.categories_by_language),
+      official_category: existing.official_category || item.official_category || '',
       discovery_sources: mergeArrayValues(existing.discovery_sources, item.discovery_sources, (entry) => `${entry.source || ''}|${entry.url || ''}`),
       similar_master_candidates: mergeArrayValues(existing.similar_master_candidates, item.similar_master_candidates, (entry) => entry.reference || entry.version_key || JSON.stringify(entry)).slice(0, 5),
       official_name_differences: mergeUniqueTextLines(existing.official_name_differences, item.official_name_differences),
-      description_excerpt: mergeUniqueTextLines(existing.description_excerpt, item.description_excerpt),
+      description_excerpt: preferredDescriptionByLanguage(mergedDescriptionSnippets) || mergeUniqueTextLines(existing.description_excerpt, item.description_excerpt),
       evidence: mergeUniqueTextLines(existing.evidence, item.evidence),
     };
     if (existing.write_back_success && reviewCandidateWriteBackFingerprint(merged) !== beforeFingerprint) {
@@ -2171,10 +2309,37 @@ function prependDiscoveryUrl(sourceState, url, limit) {
 async function collectDiscoveryPageFacts(page, pageUrl) {
   return page.evaluate(() => {
     const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const isCommonDescription = (value) => /Maison de Thé Restaurant|La plus large carte de thé au monde|Receive Mariage Frères' newsletter|PROLONGEZ L'EXPÉRIENCE|CONTINUE THE EXPERIENCE/i.test(clean(value));
+    const productDescriptionSelectors = [
+      '.product.attribute.overview .value',
+      '.product.attribute.overview',
+      '[itemprop="description"]',
+      '.product-info-main [data-role="content"]',
+    ];
+    const productDescription = (() => {
+      for (const selector of productDescriptionSelectors) {
+        const text = clean(document.querySelector(selector)?.innerText || document.querySelector(selector)?.textContent || '');
+        if (text && !isCommonDescription(text)) return text;
+      }
+      const mainText = clean(document.querySelector('main')?.innerText || '');
+      const match = mainText.match(/\bDESCRIPTION\b\s+(.+?)(?:\s+\bLIQUEUR\b|\s+\bBREWING TIPS\b|\s+\bCONSEILS D'INFUSION\b|\s+\bJARDIN PREMIER\b|\s+\bDELIVERY DETAILS\b|\s+\bDÉTAILS DE LIVRAISON\b|$)/i);
+      return match && !isCommonDescription(match[1]) ? clean(match[1]) : '';
+    })();
+    const category = (() => {
+      const crumbs = [...document.querySelectorAll('.breadcrumbs a, .items.breadcrumbs a, .breadcrumbs li, .items.breadcrumbs li')]
+        .map((node) => clean(node.innerText || node.textContent || ''))
+        .filter(Boolean);
+      const uniqueCrumbs = crumbs.filter((crumb, index) => crumbs.indexOf(crumb) === index);
+      const familyIndex = uniqueCrumbs.findIndex((crumb) => /^(Tea family|Famille de thé|Famille du thé|Les Grandes Familles)$/i.test(crumb));
+      const categoryText = familyIndex >= 0 ? uniqueCrumbs[familyIndex + 1] : '';
+      if (!categoryText || /^(Home|TEA|THÉ|Tea family|Famille de thé|Famille du thé|Les Grandes Familles)$/i.test(categoryText)) return '';
+      return categoryText;
+    })();
     const title = clean(document.title);
     const h1 = clean(document.querySelector('h1')?.textContent);
     const bodyText = clean(document.body?.innerText || document.body?.textContent || '');
-    const description = clean(document.querySelector('meta[name="description"]')?.content || '');
+    const metaDescription = clean(document.querySelector('meta[name="description"]')?.content || '');
+    const description = isCommonDescription(metaDescription) ? '' : metaDescription;
     const canonical = document.querySelector('link[rel="canonical"]')?.href || '';
     const links = [...document.querySelectorAll('a[href]')].map((anchor) => ({
       href: anchor.href,
@@ -2186,9 +2351,12 @@ async function collectDiscoveryPageFacts(page, pageUrl) {
       h1,
       bodyText: bodyText.slice(0, 50000),
       description,
+      metaDescription,
+      productDescription,
+      category,
       canonical,
       links,
-      snippet: (description || bodyText).slice(0, 800),
+      snippet: (productDescription || description || '').slice(0, 800),
       url: location.href,
     };
   }, pageUrl);
@@ -2196,11 +2364,13 @@ async function collectDiscoveryPageFacts(page, pageUrl) {
 
 function buildUnregisteredReferenceReview({ reference, facts, url, source, sourceLanguage, discoverySource, snippet, masterProducts }) {
   const officialName = facts?.h1 || facts?.title || '';
-  const language = sourceLanguage || sourceLanguageFromUrl(url);
-  const descriptionExcerpt = compactSnippet(snippet || facts?.snippet || facts?.description || facts?.bodyText || '', 700);
+  const language = sourceLanguageFromUrl(url) || sourceLanguage || sourceLanguageFromUrl(facts?.url);
+  const productDescription = compactSnippet(facts?.productDescription || '', 1200);
+  const descriptionExcerpt = preferredDescriptionByLanguage(language && productDescription ? { [language]: productDescription } : {});
   const officialUrlsByLanguage = language ? { [language]: url } : {};
   const officialNamesByLanguage = language && officialName ? { [language]: officialName } : {};
   const descriptionSnippetsByLanguage = language && descriptionExcerpt ? { [language]: descriptionExcerpt } : {};
+  const categoriesByLanguage = language && facts?.category ? { [language]: facts.category } : {};
   const similarMasterCandidates = findSimilarMasterCandidates(reference, officialName, masterProducts);
   const candidate = {
     detected_at: nowIso(),
@@ -2220,6 +2390,8 @@ function buildUnregisteredReferenceReview({ reference, facts, url, source, sourc
     official_urls_by_language: officialUrlsByLanguage,
     official_names_by_language: officialNamesByLanguage,
     description_snippets_by_language: descriptionSnippetsByLanguage,
+    categories_by_language: categoriesByLanguage,
+    official_category: facts?.category || '',
     discovery_sources: [{ source: source.id, source_type: source.source, discovery_source: discoverySource, language, url }],
     official_name_differences: Object.entries(officialNamesByLanguage).map(([lang, name]) => `${lang}: ${name}`).join('\n'),
     description_excerpt: descriptionExcerpt,
@@ -2254,6 +2426,107 @@ function buildSalesSkuReview({ sku, facts, url, source, sourceLanguage, discover
   };
   candidate.detection_id = reviewCandidateKey(candidate);
   return candidate;
+}
+
+function selectOfficialDescriptionBackfillProducts(masterProducts, refs = null) {
+  const refFilter = refs?.length ? new Set(refs.map((ref) => String(ref || '').toUpperCase())) : null;
+  return (masterProducts || []).filter((product) => {
+    if (refFilter && !refFilter.has(String(product.reference || '').toUpperCase())) return false;
+    if (!hasValue(product.productUrl)) return false;
+    return !hasValue(product.master?.officialDescription);
+  });
+}
+
+async function runOfficialDescriptionBackfill({ context, config, master, baseDir, args }) {
+  const products = selectOfficialDescriptionBackfillProducts(master?.products || [], args.refs);
+  const translationReviewCandidates = [];
+  console.log(JSON.stringify({
+    official_description_backfill: 'selected',
+    master_rows: master?.rowCount || 0,
+    selected: products.length,
+    dry_run: args.dryRun,
+  }));
+
+  for (const product of products) {
+    const page = await context.newPage();
+    let result;
+    try {
+      await page.goto(product.productUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 45000 });
+      await page.waitForTimeout(config.afterNavigationWaitMs || 1200);
+      const facts = await collectDiscoveryPageFacts(page, product.productUrl);
+      const combinedText = `${facts.title}\n${facts.h1}\n${facts.bodyText}`;
+      const pageRefs = new Set(extractVerifiedProductTeaReferences(combinedText, facts));
+      const exactReferenceVerified = pageRefs.has(product.reference);
+      const language = sourceLanguageFromUrl(facts.url) || sourceLanguageFromUrl(product.productUrl);
+      const descriptionValue = buildOfficialDescriptionBackfillValue({ product, facts, language, config });
+      const category = !hasValue(product.master?.officialCategory) ? normalizeOfficialCategoryForMaster(facts.category || '') : '';
+
+      result = {
+        reference: product.reference,
+        version_key: product.master?.versionKey || '',
+        official_name: facts.h1 || product.name || '',
+        source_url: facts.url || product.productUrl,
+        source_language: descriptionValue.source_language,
+        exact_reference_verified: exactReferenceVerified,
+        original_description: descriptionValue.original_description,
+        planned_japanese_description: descriptionValue.japanese_description,
+        needs_translation: descriptionValue.needs_translation,
+        category,
+        would_update_description: exactReferenceVerified && !hasValue(product.master?.officialDescription) && hasValue(descriptionValue.japanese_description),
+        would_update_category: exactReferenceVerified && !hasValue(product.master?.officialCategory) && hasValue(category),
+        dry_run: args.dryRun,
+      };
+
+      if (!exactReferenceVerified) {
+        result.status = 'skipped';
+        result.error = 'Product page did not verify the exact master reference.';
+      } else if (!descriptionValue.original_description) {
+        result.status = 'skipped';
+        result.error = 'Product-specific DOM description was not found.';
+      } else if (!descriptionValue.japanese_description) {
+        result.status = 'translation_review_required';
+        result.error = 'Japanese official description is not available yet. Add an officialDescriptionJapaneseOverrides entry or use a JP official page description.';
+        result.translation_review_candidate = buildOfficialDescriptionTranslationReviewCandidate({ product, facts, descriptionValue, category });
+        translationReviewCandidates.push(result.translation_review_candidate);
+      } else if (!args.dryRun && writeBackRequired(config)) {
+        const writeBack = await writeBackMasterOfficialInfo({
+          config,
+          baseDir,
+          product,
+          officialInfo: {
+            description: descriptionValue.japanese_description,
+            originalDescription: descriptionValue.original_description,
+            category,
+            language: descriptionValue.source_language,
+            sourceUrl: descriptionValue.source_url,
+          },
+          debug: args.debug,
+        });
+        result.status = 'updated';
+        result.write_back = writeBack;
+      } else {
+        result.status = args.dryRun ? 'dry_run' : 'write_back_disabled';
+      }
+    } catch (error) {
+      result = {
+        reference: product.reference,
+        version_key: product.master?.versionKey || '',
+        source_url: product.productUrl,
+        status: 'error',
+        error: error.message,
+        dry_run: args.dryRun,
+      };
+    } finally {
+      await page.close().catch(() => {});
+    }
+    console.log(JSON.stringify({ official_description_backfill: result }));
+  }
+  console.log(JSON.stringify({
+    official_description_backfill: 'translation_review_candidates',
+    count: translationReviewCandidates.length,
+    candidates: translationReviewCandidates,
+    dry_run: args.dryRun,
+  }));
 }
 
 async function runNewReferenceDiscovery({ context, config, paths, master, discoveryCache, baseDir, args }) {
@@ -2333,6 +2606,20 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
             for (const ref of pageRefs) {
               if (masterReferences.has(ref)) {
                 existingReferences += 1;
+                const staleReviewId = reviewCandidateKey({ detection_type: 'unregistered_reference', reference: ref });
+                if (discoveryCache.review_candidates?.[staleReviewId] && (facts.productDescription || facts.snippet)) {
+                  const review = buildUnregisteredReferenceReview({
+                    reference: ref,
+                    facts,
+                    url: facts.canonical || facts.url,
+                    source,
+                    sourceLanguage: source.language,
+                    discoverySource: pageIsProduct ? 'product_page' : source.source,
+                    snippet: facts.snippet,
+                    masterProducts,
+                  });
+                  cacheReviewCandidate(discoveryCache, review);
+                }
                 continue;
               }
               const review = buildUnregisteredReferenceReview({
@@ -2479,16 +2766,16 @@ async function main() {
     return;
   }
 
-  if (!args.discoverNewReferences && products.length === 0) {
+  if (!args.discoverNewReferences && !args.backfillOfficialDescriptions && products.length === 0) {
     console.log('No pending products selected.');
     return;
   }
 
-  if (!args.discoverNewReferences) {
+  if (!args.discoverNewReferences && !args.backfillOfficialDescriptions) {
     console.log(`Selected ${products.length} product(s)${master ? ` from master rows=${master.rowCount}` : ' from config'}.`);
   }
 
-  if (args.dryRun && !args.discoverNewReferences) {
+  if (args.dryRun && !args.discoverNewReferences && !args.backfillOfficialDescriptions) {
     for (const product of products) {
       console.log(JSON.stringify({
         reference: product.reference,
@@ -2548,6 +2835,11 @@ async function main() {
 
     if (args.authSetup) {
       await runAuthSetup({ context, products, config, debug: args.debug });
+      return;
+    }
+
+    if (args.backfillOfficialDescriptions) {
+      await runOfficialDescriptionBackfill({ context, config, master, baseDir, args });
       return;
     }
 

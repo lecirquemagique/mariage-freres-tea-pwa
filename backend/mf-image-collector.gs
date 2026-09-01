@@ -86,6 +86,9 @@ function mfImageCollectorDoPost(e) {
     if (payload.action === 'updateProductPageUrl') {
       return mfImageCollectorJson_(mfImageCollectorUpdateProductPageUrl_(payload));
     }
+    if (payload.action === 'updateMasterOfficialInfo') {
+      return mfImageCollectorJson_(mfImageCollectorUpdateMasterOfficialInfo_(payload));
+    }
     if (payload.action === 'recordReviewCandidate') {
       return mfImageCollectorJson_(mfImageCollectorRecordReviewCandidate_(payload));
     }
@@ -505,6 +508,8 @@ function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
     urls_by_language: candidate.official_urls_by_language || {},
     names_by_language: candidate.official_names_by_language || {},
     description_snippets_by_language: candidate.description_snippets_by_language || {},
+    categories_by_language: candidate.categories_by_language || {},
+    official_category: candidate.official_category || '',
     master_absence_confirmed: candidate.master_absence_confirmed === true,
     similar_master_candidates: candidate.similar_master_candidates || []
   };
@@ -663,6 +668,8 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
       if (header === 'VersionKey') return versionKey;
       if (header === 'Tリファレンス番号') return reference;
       if (header === '現在の公式名') return review['公式名'] || '';
+      if (header === '現在の公式説明') return review['公式説明抜粋'] || '';
+      if (header === '現在のカテゴリ') return mfImageCollectorReviewOfficialCategory_(review);
       if (header === '公式商品ページURL') return review['公式URL'] || '';
       if (header === '公式商品ページURL状態') return review['公式URL'] ? 'available' : 'pending';
       return '';
@@ -676,6 +683,15 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
     if (row < 2) throw new Error('Target master row was not found.');
     if (review['公式名']) sheet.getRange(row, nameCol + 1).setValue(review['公式名']);
     if (urlCol >= 0 && review['公式URL']) sheet.getRange(row, urlCol + 1).setValue(review['公式URL']);
+  }
+}
+
+function mfImageCollectorReviewOfficialCategory_(review) {
+  try {
+    var info = JSON.parse(String(review['公式情報JSON'] || '{}'));
+    return String(info.official_category || '').trim();
+  } catch (error) {
+    return '';
   }
 }
 
@@ -869,6 +885,87 @@ function mfImageCollectorUpdateProductPageUrl_(payload) {
     sheet_row: rowIndex + 1,
     product_page_url: status === 'available' ? productPageUrl : '',
     status: status
+  };
+}
+
+function mfImageCollectorUpdateMasterOfficialInfo_(payload) {
+  mfImageCollectorAssertSecret_(payload);
+
+  var reference = String(payload.reference || '').trim();
+  if (!reference) throw new Error('reference is required.');
+  var versionKey = String(payload.version_key || '').trim();
+  var productPageUrl = String(payload.product_page_url || '').trim();
+  var officialDescription = String(payload.official_description || '').trim();
+  var officialDescriptionOriginal = String(payload.official_description_original || '').trim();
+  var officialDescriptionSourceLanguage = String(payload.official_description_source_language || payload.source_language || '').trim();
+  var officialDescriptionSourceUrl = String(payload.official_description_source_url || payload.source_url || '').trim();
+  var officialCategory = String(payload.official_category || '').trim();
+  if (!officialDescription && !officialCategory) throw new Error('official_description or official_category is required.');
+  if (productPageUrl && !mfImageCollectorUrlHasExactReference_(productPageUrl, reference)) {
+    throw new Error('product_page_url does not contain the exact reference.');
+  }
+
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('Sheet has no data rows.');
+
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var refCol = headers.indexOf('Tリファレンス番号');
+  var versionCol = headers.indexOf('VersionKey');
+  var productUrlCol = headers.indexOf('公式商品ページURL');
+  var descriptionCol = headers.indexOf('現在の公式説明');
+  var categoryCol = headers.indexOf('現在のカテゴリ');
+  var descriptionSourceLanguageCol = mfImageCollectorEnsureHeader_(sheet, headers, '現在の公式説明根拠言語');
+  var descriptionSourceUrlCol = mfImageCollectorEnsureHeader_(sheet, headers, '現在の公式説明根拠URL');
+  var descriptionOriginalCol = mfImageCollectorEnsureHeader_(sheet, headers, '現在の公式説明原文');
+  if (refCol < 0 || productUrlCol < 0 || descriptionCol < 0) {
+    throw new Error('Required official info columns are missing.');
+  }
+
+  var rowIndex = -1;
+  for (var i = 1; i < values.length; i += 1) {
+    if (String(values[i][refCol]).trim().toUpperCase() !== reference.toUpperCase()) continue;
+    if (versionKey && versionCol >= 0 && String(values[i][versionCol]).trim().toUpperCase() !== versionKey.toUpperCase()) continue;
+    rowIndex = i;
+    break;
+  }
+  if (rowIndex < 0) throw new Error('Reference not found: ' + reference);
+
+  var existingUrl = String(values[rowIndex][productUrlCol] || '').trim();
+  if (productPageUrl && existingUrl && existingUrl !== productPageUrl) {
+    throw new Error('product_page_url does not match the master row URL.');
+  }
+
+  var updatedDescription = false;
+  var updatedCategory = false;
+  if (officialDescription && !String(values[rowIndex][descriptionCol] || '').trim()) {
+    sheet.getRange(rowIndex + 1, descriptionCol + 1).setValue(officialDescription);
+    if (officialDescriptionSourceLanguage && !String(values[rowIndex][descriptionSourceLanguageCol] || '').trim()) {
+      sheet.getRange(rowIndex + 1, descriptionSourceLanguageCol + 1).setValue(officialDescriptionSourceLanguage);
+    }
+    if (officialDescriptionSourceUrl && !String(values[rowIndex][descriptionSourceUrlCol] || '').trim()) {
+      sheet.getRange(rowIndex + 1, descriptionSourceUrlCol + 1).setValue(officialDescriptionSourceUrl);
+    }
+    if (officialDescriptionOriginal && !String(values[rowIndex][descriptionOriginalCol] || '').trim()) {
+      sheet.getRange(rowIndex + 1, descriptionOriginalCol + 1).setValue(officialDescriptionOriginal);
+    }
+    updatedDescription = true;
+  }
+  if (officialCategory && categoryCol >= 0 && !String(values[rowIndex][categoryCol] || '').trim()) {
+    sheet.getRange(rowIndex + 1, categoryCol + 1).setValue(officialCategory);
+    updatedCategory = true;
+  }
+
+  return {
+    ok: true,
+    reference: reference,
+    version_key: versionKey,
+    sheet_row: rowIndex + 1,
+    updated_description: updatedDescription,
+    updated_category: updatedCategory
   };
 }
 
