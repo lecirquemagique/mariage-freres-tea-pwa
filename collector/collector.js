@@ -35,6 +35,15 @@ const MASTER_COLUMNS = {
   productUrl: '公式商品ページURL',
   productUrlStatus: '公式商品ページURL状態',
   versionKey: 'VersionKey',
+  originCountry: '産地・国',
+  originRegion: '産地・地域／茶園',
+  smokedTea: '燻製茶',
+  milkTeaRecommended: 'ミルクティー推奨',
+  flavorCategory: '香味大分類',
+  flavorTags: '香味詳細タグ',
+  timeTags: '時間帯タグ',
+  icedTeaRecommended: 'アイスティー推奨',
+  caffeineFree: 'テインフリー',
 };
 const MIME_EXT = {
   'image/jpeg': '.jpg',
@@ -500,6 +509,7 @@ async function fetchMasterProducts(config, baseDir, debug) {
         name: normalizeText(row[MASTER_COLUMNS.name]) || normalizeText(row[MASTER_COLUMNS.fallbackName]),
         productUrl,
         master: {
+          ...row,
           productUrl,
           officialDescription: normalizeText(row[MASTER_COLUMNS.officialDescription]),
           officialDescriptionSourceLanguage: normalizeText(row[MASTER_COLUMNS.officialDescriptionSourceLanguage]),
@@ -719,6 +729,9 @@ function reviewCandidateIdentity(candidate) {
   if (type === 'unregistered_reference') return `${type}|${reference}`;
   if (type === 'unregistered_reference_image') return `${type}|${reference}`;
   if (type === 'sales_sku_detected') return `${type}|${reference}`;
+  if (type === 'structured_fact') {
+    return `${type}|${reference}|${normalizeText(candidate?.existing_version_key || candidate?.target_version_key || '')}|${normalizeText(candidate?.target_column || '')}|${normalizeText(candidate?.suggested_value || '')}`;
+  }
   if (type === 'official_name_changed') {
     return `${type}|${reference}|${normalizeText(candidate?.existing_version_key || candidate?.target_version_key || '')}`;
   }
@@ -857,6 +870,320 @@ function buildOfficialDescriptionTranslationReviewCandidate({ product, facts, de
     current_master_category: product.master?.officialCategory || '',
     reason: 'Official product description was found only outside JP and needs human-approved Japanese text before master writeback.',
   };
+}
+
+function structuredFactVocabulary(masterProducts = []) {
+  const columns = [
+    MASTER_COLUMNS.flavorCategory,
+    MASTER_COLUMNS.flavorTags,
+    MASTER_COLUMNS.originCountry,
+    MASTER_COLUMNS.timeTags,
+  ];
+  const vocabulary = {};
+  for (const column of columns) vocabulary[column] = new Set();
+  for (const product of masterProducts || []) {
+    const master = product.master || {};
+    for (const column of columns) {
+      for (const token of splitMasterListValue(master[column] || '')) {
+        vocabulary[column].add(token);
+      }
+    }
+  }
+  return vocabulary;
+}
+
+function splitMasterListValue(value) {
+  return normalizeText(value)
+    .split(/[、,;／|\n]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function masterHasSuggestedValue(product, column, suggestedValue) {
+  const current = product?.master?.[column] || '';
+  if (!current || !suggestedValue) return false;
+  return splitMasterListValue(current).includes(suggestedValue);
+}
+
+function addStructuredSuggestion(suggestions, product, suggestion) {
+  if (!suggestion?.column || !suggestion?.suggested_value) return;
+  if (masterHasSuggestedValue(product, suggestion.column, suggestion.suggested_value)) return;
+  const key = `${suggestion.column}|${suggestion.suggested_value}`;
+  if (suggestions.some((item) => `${item.column}|${item.suggested_value}` === key)) return;
+  suggestions.push({
+    confidence: 'medium',
+    requires_human_review: true,
+    ...suggestion,
+  });
+}
+
+function evidenceSnippet(text, pattern, maxLength = 360) {
+  const hay = normalizeText(text).replace(/\s+/g, ' ');
+  if (!hay) return '';
+  const match = hay.match(pattern);
+  if (!match) return '';
+  const index = typeof match.index === 'number' ? match.index : hay.search(pattern);
+  return hay.slice(Math.max(0, index - 120), index + maxLength).trim();
+}
+
+function conciseFlavorEvidence(text, pattern, maxLength = 260) {
+  const hay = normalizeText(text).replace(/\s+/g, ' ');
+  if (!hay) return '';
+  const match = hay.match(pattern);
+  if (!match) return '';
+  const sentences = hay
+    .split(/(?<=[.!?。！？])\s+|\s+[•●]\s+|\n+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const sentence = sentences.find((part) => pattern.test(part));
+  const candidate = sentence || evidenceSnippet(hay, pattern, maxLength);
+  return candidate
+    .replace(/\s+R[ÉE]F\s+T[A-Z0-9-]+.*$/i, '')
+    .replace(/\s+(Choisir le poids|Ajouter au panier|Add to cart|Quantit[ée]|Prix|Price|Livraison|Delivery|Exp[ée]dition|Shipping)\b.*$/i, '')
+    .slice(0, maxLength)
+    .trim();
+}
+
+function includesVocabulary(vocabulary, column, value) {
+  const set = vocabulary?.[column];
+  return !set || set.size === 0 || set.has(value);
+}
+
+function flavorRules() {
+  return [
+    { value: 'ベルガモット', category: '柑橘系', pattern: /\bbergamot(?:te)?\b|ベルガモット/i },
+    { value: 'ヴァニラ', category: '甘香・菓子系', pattern: /\bvanilla\b|\bvanille\b|ヴァニラ|バニラ/i },
+    { value: 'ジャスミン', category: '花系', pattern: /\bjasmine\b|\bjasmin\b|ジャスミン/i },
+    { value: 'ローズ', category: '花系', pattern: /\brose\b|\broses\b|ローズ|薔薇|バラ/i },
+    { value: 'ジンジャー', category: 'スパイス', pattern: /\bginger\b|\bgingembre\b|ジンジャー|生姜/i },
+    { value: 'ミント', category: 'ハーブ系', pattern: /\bmint\b|\bmenthe\b|ミント/i },
+    { value: 'カカオ', category: 'カカオ系', pattern: /\bcacao\b|\bcocoa\b|カカオ/i },
+    { value: 'キャラメル', category: '甘香・菓子系', pattern: /\bcaramel\b|キャラメル/i },
+    { value: '柑橘', category: '柑橘系', pattern: /\bcitrus\b|\bagrumes?\b|柑橘/i },
+    { value: '果実', category: '果実系', pattern: /\bfruits?\b|\bfruité(?:e|es|s)?\b|果実|フルーツ/i, rejectPattern: /\bfruits?\s+à\s+coque\b|\btraces?\s+de\s+fruits?\s+à\s+coque\b/i },
+    { value: '花', category: '花系', pattern: /\bflowers?\b|\bfleurs?\b|\bfloral(?:e|es|s)?\b|花/i },
+  ];
+}
+
+function flavorContextTexts(facts) {
+  return [
+    { source_type: 'ingredients', source_dom: facts?.ingredientsSelector || 'ingredients section', text: facts?.ingredientsText || '' },
+    { source_type: 'product_summary', source_dom: facts?.productFlavorSummarySelector || 'product summary', text: facts?.productFlavorSummary || '' },
+    { source_type: 'description', source_dom: facts?.productDescriptionSelector || 'product description', text: facts?.productDescription || '' },
+  ].filter((entry) => hasValue(entry.text));
+}
+
+function isFlavorContext(text) {
+  return /ingredient|ingrédient|ingredients|ar[oô]me|aroma|flavou?r|parfum|notes?|go[uû]t|taste|blend|composition|素材|香り|香味|フレーバー/i.test(text || '');
+}
+
+function buildStructuredFactSuggestions({ product, facts, vocabulary }) {
+  const suggestions = [];
+  const language = sourceLanguageFromUrl(facts?.url) || '';
+  const url = facts?.url || product.productUrl || '';
+
+  const countryRules = [
+    { value: '日本', pattern: /\b(?:origin|provenance|origine|cultivated in|grown in|récolté à|cultivé à)\s+(?:Japan|Japon)\b|原産地[:：]?\s*日本|産地[:：]?\s*日本/i },
+    { value: '中国', pattern: /\b(?:origin|provenance|origine|cultivated in|grown in|récolté à|cultivé à)\s+(?:China|Chine)\b|原産地[:：]?\s*中国|産地[:：]?\s*中国/i },
+    { value: 'インド', pattern: /\b(?:origin|provenance|origine|cultivated in|grown in|récolté à|cultivé à)\s+(?:India|Inde)\b|原産地[:：]?\s*インド|産地[:：]?\s*インド/i },
+    { value: 'スリランカ（セイロン）', pattern: /\b(?:origin|provenance|origine|cultivated in|grown in|récolté à|cultivé à)\s+(?:Sri Lanka|Ceylon|Ceylan)\b|原産地[:：]?\s*(?:スリランカ|セイロン)|産地[:：]?\s*(?:スリランカ|セイロン)/i },
+    { value: '台湾', pattern: /\b(?:origin|provenance|origine|cultivated in|grown in|récolté à|cultivé à)\s+(?:Taiwan|Taïwan)\b|原産地[:：]?\s*台湾|産地[:：]?\s*台湾/i },
+    { value: '南アフリカ', pattern: /\b(?:origin|provenance|origine|cultivated in|grown in|récolté à|cultivé à)\s+(?:South Africa|Afrique du Sud)\b|原産地[:：]?\s*南アフリカ|産地[:：]?\s*南アフリカ/i },
+  ];
+  const originText = `${facts?.productDescription || ''}\n${facts?.ingredientsText || ''}\n${facts?.productDetailsText || ''}`;
+  for (const rule of countryRules) {
+    const evidence = evidenceSnippet(originText, rule.pattern);
+    if (evidence && includesVocabulary(vocabulary, MASTER_COLUMNS.originCountry, rule.value)) {
+      addStructuredSuggestion(suggestions, product, {
+        column: MASTER_COLUMNS.originCountry,
+        suggested_value: rule.value,
+        evidence_text: evidence,
+        evidence_language: language,
+        evidence_url: url,
+        source_type: 'description',
+        confidence: 'high',
+      });
+    }
+  }
+
+  const regionRules = [
+    { value: 'ダージリン', pattern: /\b(?:Darjeeling|ダージリン)\b(?=.*\b(?:estate|garden|tea garden|jardin|plantation|origin|origine|provenance|récolté|cultivated|grown|産地|茶園)\b)/i },
+    { value: 'ウバ', pattern: /\b(?:Uva|ウバ)\b(?=.*\b(?:estate|garden|tea garden|jardin|plantation|origin|origine|provenance|récolté|cultivated|grown|産地|茶園)\b)/i },
+    { value: '雲南', pattern: /\b(?:Yunnan|Yun Nan|雲南)\b(?=.*\b(?:origin|origine|provenance|récolté|cultivated|grown|産地|茶園)\b)/i },
+    { value: '藤枝', pattern: /\b(?:Fujieda|藤枝)\b(?=.*\b(?:origin|origine|provenance|récolté|cultivated|grown|産地|茶園)\b)/i },
+  ];
+  for (const rule of regionRules) {
+    const evidence = evidenceSnippet(originText, rule.pattern);
+    if (evidence) {
+      addStructuredSuggestion(suggestions, product, {
+        column: MASTER_COLUMNS.originRegion,
+        suggested_value: rule.value,
+        evidence_text: evidence,
+        evidence_language: language,
+        evidence_url: url,
+        source_type: 'description',
+        confidence: 'high',
+      });
+    }
+  }
+
+  for (const context of flavorContextTexts(facts)) {
+    if (!isFlavorContext(context.text)) continue;
+    for (const rule of flavorRules()) {
+      const evidence = conciseFlavorEvidence(context.text, rule.pattern);
+      if (!evidence) continue;
+      if (rule.rejectPattern && rule.rejectPattern.test(evidence)) continue;
+      if (includesVocabulary(vocabulary, MASTER_COLUMNS.flavorTags, rule.value)) {
+        addStructuredSuggestion(suggestions, product, {
+          column: MASTER_COLUMNS.flavorTags,
+          suggested_value: rule.value,
+          evidence_text: evidence,
+          evidence_language: language,
+          evidence_url: url,
+          source_type: context.source_type,
+          source_dom: context.source_dom,
+          confidence: context.source_type === 'ingredients' || context.source_type === 'product_summary' ? 'high' : 'medium',
+        });
+      }
+      if (rule.category && includesVocabulary(vocabulary, MASTER_COLUMNS.flavorCategory, rule.category)) {
+        addStructuredSuggestion(suggestions, product, {
+          column: MASTER_COLUMNS.flavorCategory,
+          suggested_value: rule.category,
+          evidence_text: evidence,
+          evidence_language: language,
+          evidence_url: url,
+          source_type: context.source_type,
+          source_dom: context.source_dom,
+          confidence: 'medium',
+        });
+      }
+    }
+  }
+
+  const pageText = `${facts?.productDescription || ''}\n${facts?.productSummary || ''}\n${facts?.ingredientsText || ''}\n${facts?.preparationText || ''}`;
+  const flagRules = [
+    { column: MASTER_COLUMNS.smokedTea, value: 'はい', pattern: /\bsmoked tea\b|\bthé fumé\b|\bfumé\b/i, source_type: 'description', confidence: 'high' },
+    { column: MASTER_COLUMNS.milkTeaRecommended, value: 'はい', pattern: /\b(?:enjoy|serve|add|with)\s+(?:it\s+)?(?:with\s+)?milk\b|\bavec du lait\b|\blait\b.{0,30}\b(?:conseillé|recommandé)\b/i, source_type: 'preparation', confidence: 'high' },
+    { column: MASTER_COLUMNS.icedTeaRecommended, value: 'はい', pattern: /\biced tea\b|\bserve iced\b|\benjoy over ice\b|\bthé glacé\b|\binfusion glacée\b/i, source_type: 'preparation', confidence: 'high' },
+    { column: MASTER_COLUMNS.caffeineFree, value: 'はい', pattern: /\bcaffeine[- ]free\b|\btheine[- ]free\b|\bsans théine\b|\bsans theine\b/i, source_type: 'description', confidence: 'high' },
+  ];
+  for (const rule of flagRules) {
+    const evidence = evidenceSnippet(pageText, rule.pattern);
+    if (!evidence) continue;
+    addStructuredSuggestion(suggestions, product, {
+      column: rule.column,
+      suggested_value: rule.value,
+      evidence_text: evidence,
+      evidence_language: language,
+      evidence_url: url,
+      source_type: rule.source_type,
+      confidence: rule.confidence,
+    });
+  }
+
+  const timeRules = [
+    { value: '朝', pattern: /\b(?:recommended|ideal|perfect|best)\s+(?:for|in the)\s+(?:morning|breakfast)\b|\b(?:matin|petit-déjeuner)\b.{0,40}\b(?:idéal|recommandé|parfait)\b/i },
+    { value: '午後', pattern: /\b(?:recommended|ideal|perfect|best)\s+(?:for|in the)\s+afternoon\b|\baprès-midi\b.{0,40}\b(?:idéal|recommandé|parfait)\b/i },
+    { value: '夜', pattern: /\b(?:recommended|ideal|perfect|best)\s+(?:for|in the)\s+(?:evening|night)\b|\b(?:soir|nuit)\b.{0,40}\b(?:idéal|recommandé|parfait)\b/i },
+  ];
+  for (const rule of timeRules) {
+    const evidence = evidenceSnippet(pageText, rule.pattern);
+    if (!evidence || !includesVocabulary(vocabulary, MASTER_COLUMNS.timeTags, rule.value)) continue;
+    addStructuredSuggestion(suggestions, product, {
+      column: MASTER_COLUMNS.timeTags,
+      suggested_value: rule.value,
+      evidence_text: evidence,
+      evidence_language: language,
+      evidence_url: url,
+      source_type: 'description',
+      confidence: 'medium',
+    });
+  }
+
+  return suggestions;
+}
+
+function buildOfficialStructuredFacts({ product, facts, language, vocabulary, translationReviewCandidate }) {
+  const category = normalizeOfficialCategoryForMaster(facts?.category || '');
+  const teaTypeTag = normalizeTeaTypeTagsForMaster(category);
+  const structuredReviewSuggestions = buildStructuredFactSuggestions({ product, facts, vocabulary });
+  return {
+    raw_facts: {
+      reference: product.reference,
+      language,
+      url: facts?.url || product.productUrl || '',
+      h1: facts?.h1 || '',
+      breadcrumb: facts?.breadcrumb || '',
+      product_description: facts?.productDescription || '',
+      product_summary: facts?.productFlavorSummary || '',
+      ingredients_text: facts?.ingredientsText || '',
+      preparation_text: facts?.preparationText || '',
+      page_context: facts?.productSummary || '',
+    },
+    confirmed_facts: {
+      official_category: category,
+      tea_type_tag: teaTypeTag,
+    },
+    translation_review_candidates: translationReviewCandidate ? [translationReviewCandidate] : [],
+    structured_review_suggestions: structuredReviewSuggestions,
+  };
+}
+
+function structuredFactReviewCandidate({ product, facts, suggestion }) {
+  const currentValue = normalizeText(product.master?.[suggestion.column] || '');
+  const candidate = {
+    detected_at: nowIso(),
+    reference: product.reference,
+    official_name: facts?.h1 || product.name || '',
+    detection_type: 'structured_fact',
+    official_url: suggestion.evidence_url || facts?.url || product.productUrl || '',
+    source_language: suggestion.evidence_language || sourceLanguageFromUrl(facts?.url) || '',
+    existing_reference: product.reference,
+    existing_version_key: product.master?.versionKey || '',
+    existing_name: product.name || '',
+    target_version_key: product.master?.versionKey || '',
+    target_column: suggestion.column,
+    current_value: currentValue,
+    suggested_value: suggestion.suggested_value,
+    evidence_text: suggestion.evidence_text,
+    evidence_language: suggestion.evidence_language,
+    evidence_url: suggestion.evidence_url,
+    source_type: suggestion.source_type,
+    source_dom: suggestion.source_dom || '',
+    confidence: suggestion.confidence,
+    requires_human_review: true,
+    diff_summary: `Structured fact candidate for ${suggestion.column}: "${currentValue || '(blank)'}" -> "${suggestion.suggested_value}".`,
+    evidence: `target_column=${suggestion.column}; current_value=${currentValue || '(blank)'}; suggested_value=${suggestion.suggested_value}; source_type=${suggestion.source_type}; confidence=${suggestion.confidence}; evidence_language=${suggestion.evidence_language}; evidence_url=${suggestion.evidence_url}; evidence=${suggestion.evidence_text}`,
+    discovery_sources: [{ source: suggestion.source_type, source_type: 'structured_fact', discovery_source: 'official_product_page', language: suggestion.evidence_language, url: suggestion.evidence_url }],
+    structured_fact: suggestion,
+    status: '要確認',
+    human_decision: '',
+    comment: '',
+  };
+  candidate.detection_id = reviewCandidateKey(candidate);
+  return candidate;
+}
+
+function productForStructuredFacts(reference, masterProducts = [], facts = {}) {
+  const existing = (masterProducts || []).find((product) => product.reference === reference);
+  if (existing) return existing;
+  return {
+    reference,
+    name: facts?.h1 || '',
+    productUrl: facts?.url || '',
+    master: {
+      versionKey: '',
+    },
+  };
+}
+
+function structuredFactReviewCandidatesForProduct({ product, facts, vocabulary }) {
+  const language = sourceLanguageFromUrl(facts?.url) || sourceLanguageFromUrl(product.productUrl);
+  const officialStructuredFacts = buildOfficialStructuredFacts({ product, facts, language, vocabulary });
+  const reviewCandidates = officialStructuredFacts.structured_review_suggestions.map((suggestion) =>
+    structuredFactReviewCandidate({ product, facts, suggestion })
+  );
+  return { officialStructuredFacts, reviewCandidates };
 }
 
 function mergeUniqueTextLines(...values) {
@@ -1002,6 +1329,15 @@ function cacheReviewCandidate(cache, candidate) {
       description_snippets_by_language: mergedDescriptionSnippets,
       categories_by_language: mergeObjectValues(existing.categories_by_language, item.categories_by_language),
       official_category: existing.official_category || item.official_category || '',
+      target_column: existing.target_column || item.target_column || '',
+      current_value: existing.current_value || item.current_value || '',
+      suggested_value: existing.suggested_value || item.suggested_value || '',
+      evidence_text: existing.evidence_text || item.evidence_text || '',
+      evidence_language: existing.evidence_language || item.evidence_language || '',
+      evidence_url: existing.evidence_url || item.evidence_url || '',
+      source_type: existing.source_type || item.source_type || '',
+      confidence: existing.confidence || item.confidence || '',
+      structured_fact: { ...(existing.structured_fact || {}), ...(item.structured_fact || {}) },
       discovery_sources: mergeArrayValues(existing.discovery_sources, item.discovery_sources, (entry) => `${entry.source || ''}|${entry.url || ''}`),
       similar_master_candidates: mergeArrayValues(existing.similar_master_candidates, item.similar_master_candidates, (entry) => entry.reference || entry.version_key || JSON.stringify(entry)).slice(0, 5),
       official_name_differences: mergeUniqueTextLines(existing.official_name_differences, item.official_name_differences),
@@ -2336,20 +2672,30 @@ async function collectDiscoveryPageFacts(page, pageUrl) {
   return page.evaluate(() => {
     const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
     const isCommonDescription = (value) => /Maison de Thé Restaurant|La plus large carte de thé au monde|Receive Mariage Frères' newsletter|PROLONGEZ L'EXPÉRIENCE|CONTINUE THE EXPERIENCE/i.test(clean(value));
+    const hasFlavorLanguage = (value) => /ar[oô]me|aroma|flavou?r|parfum|notes?|go[uû]t|taste|blend|composition|fruit|fruité|fleur|floral|bergamot|vanille|jasmin|rose|gingembre|menthe|cacao|caramel|agrumes|素材|香り|香味|フレーバー/i.test(clean(value));
+    const hasUiLanguage = (value) => /R[ÉE]F\s+T[A-Z0-9-]+|Choisir le poids|Ajouter au panier|Add to cart|Quantit[ée]|Prix|Price|Livraison|Delivery|Exp[ée]dition|Shipping|Newsletter|Panier/i.test(clean(value));
     const productDescriptionSelectors = [
       '.product.attribute.overview .value',
       '.product.attribute.overview',
       '[itemprop="description"]',
       '.product-info-main [data-role="content"]',
     ];
+    let productDescriptionSelector = '';
     const productDescription = (() => {
       for (const selector of productDescriptionSelectors) {
         const text = clean(document.querySelector(selector)?.innerText || document.querySelector(selector)?.textContent || '');
-        if (text && !isCommonDescription(text)) return text;
+        if (text && !isCommonDescription(text)) {
+          productDescriptionSelector = selector;
+          return text;
+        }
       }
       const mainText = clean(document.querySelector('main')?.innerText || '');
       const match = mainText.match(/\bDESCRIPTION\b\s+(.+?)(?:\s+\bLIQUEUR\b|\s+\bBREWING TIPS\b|\s+\bCONSEILS D'INFUSION\b|\s+\bJARDIN PREMIER\b|\s+\bDELIVERY DETAILS\b|\s+\bDÉTAILS DE LIVRAISON\b|$)/i);
-      return match && !isCommonDescription(match[1]) ? clean(match[1]) : '';
+      if (match && !isCommonDescription(match[1])) {
+        productDescriptionSelector = 'main DESCRIPTION section';
+        return clean(match[1]);
+      }
+      return '';
     })();
     const category = (() => {
       const crumbs = [...document.querySelectorAll('.breadcrumbs a, .items.breadcrumbs a, .breadcrumbs li, .items.breadcrumbs li')]
@@ -2361,6 +2707,49 @@ async function collectDiscoveryPageFacts(page, pageUrl) {
       if (!categoryText || /^(Home|TEA|THÉ|Tea family|Famille de thé|Famille du thé|Les Grandes Familles)$/i.test(categoryText)) return '';
       return categoryText;
     })();
+    const breadcrumb = [...document.querySelectorAll('.breadcrumbs a, .items.breadcrumbs a, .breadcrumbs li, .items.breadcrumbs li')]
+      .map((node) => clean(node.innerText || node.textContent || ''))
+      .filter(Boolean)
+      .filter((crumb, index, list) => list.indexOf(crumb) === index)
+      .join(' > ');
+    const productSummary = clean(document.querySelector('.product-info-main')?.innerText || '').slice(0, 4000);
+    const productFlavorSummary = (() => {
+      const selectorCandidates = [
+        '.product-info-main .product.attribute.short-description',
+        '.product-info-main [class*="subtitle"]',
+        '.product-info-main [class*="baseline"]',
+        '.product-info-main [class*="tagline"]',
+        '.product-info-main [class*="short"]',
+      ];
+      for (const selector of selectorCandidates) {
+        const text = clean(document.querySelector(selector)?.innerText || document.querySelector(selector)?.textContent || '');
+        if (text && text.length <= 320 && hasFlavorLanguage(text) && !isCommonDescription(text) && !hasUiLanguage(text)) {
+          return { text, selector };
+        }
+      }
+      const nodes = [...document.querySelectorAll('.product-info-main *')];
+      for (const node of nodes) {
+        const text = clean(node.innerText || node.textContent || '');
+        const childText = clean([...node.children].map((child) => child.innerText || child.textContent || '').join(' '));
+        if (!text || text === childText) continue;
+        if (text.length < 12 || text.length > 220) continue;
+        if (!hasFlavorLanguage(text) || isCommonDescription(text) || hasUiLanguage(text)) continue;
+        if (/^(Accueil|Home|TH[ÉE]|Les Grandes Familles|Tea family)$/i.test(text)) continue;
+        const selector = node.className ? `${node.tagName.toLowerCase()}.${String(node.className).trim().replace(/\s+/g, '.')}` : node.tagName.toLowerCase();
+        return { text, selector };
+      }
+      return { text: '', selector: '' };
+    })();
+    const sectionText = (labels) => {
+      const mainText = clean(document.querySelector('main')?.innerText || document.body?.innerText || '');
+      const labelPattern = labels.join('|');
+      const stopPattern = "DESCRIPTION|LIQUEUR|BREWING TIPS|CONSEILS D'INFUSION|JARDIN PREMIER|DELIVERY DETAILS|DÉTAILS DE LIVRAISON";
+      const match = mainText.match(new RegExp('(?:' + labelPattern + ')\\s+(.+?)(?:\\s+(?:' + stopPattern + ')|$)', 'i'));
+      return match ? clean(match[1]).slice(0, 1200) : '';
+    };
+    const ingredientsSelector = document.querySelector('.product-info-main [data-role="content"]') ? '.product-info-main [data-role="content"]' : 'section Ingredients/Ingrédients';
+    const ingredientsText = clean(document.querySelector('.product-info-main [data-role="content"]')?.innerText || '') || sectionText(['Ingredients', 'Ingrédients', '原材料']);
+    const preparationText = sectionText(['BREWING TIPS', "CONSEILS D'INFUSION", '淹れ方', '抽出']);
     const title = clean(document.title);
     const h1 = clean(document.querySelector('h1')?.textContent);
     const bodyText = clean(document.body?.innerText || document.body?.textContent || '');
@@ -2379,7 +2768,15 @@ async function collectDiscoveryPageFacts(page, pageUrl) {
       description,
       metaDescription,
       productDescription,
+      productDescriptionSelector,
+      productSummary,
+      productFlavorSummary: productFlavorSummary.text,
+      productFlavorSummarySelector: productFlavorSummary.selector,
       category,
+      breadcrumb,
+      ingredientsText,
+      ingredientsSelector,
+      preparationText,
       canonical,
       links,
       snippet: (productDescription || description || '').slice(0, 800),
@@ -2466,6 +2863,8 @@ function selectOfficialDescriptionBackfillProducts(masterProducts, refs = null) 
 async function runOfficialDescriptionBackfill({ context, config, master, baseDir, args }) {
   const products = selectOfficialDescriptionBackfillProducts(master?.products || [], args.refs);
   const translationReviewCandidates = [];
+  const structuredReviewCandidates = [];
+  const vocabulary = structuredFactVocabulary(master?.products || []);
   console.log(JSON.stringify({
     official_description_backfill: 'selected',
     master_rows: master?.rowCount || 0,
@@ -2486,6 +2885,8 @@ async function runOfficialDescriptionBackfill({ context, config, master, baseDir
       const language = sourceLanguageFromUrl(facts.url) || sourceLanguageFromUrl(product.productUrl);
       const descriptionValue = buildOfficialDescriptionBackfillValue({ product, facts, language, config });
       const category = !hasValue(product.master?.officialCategory) ? normalizeOfficialCategoryForMaster(facts.category || '') : '';
+      const structuredFacts = structuredFactReviewCandidatesForProduct({ product, facts, vocabulary });
+      structuredReviewCandidates.push(...structuredFacts.reviewCandidates);
 
       result = {
         reference: product.reference,
@@ -2500,6 +2901,8 @@ async function runOfficialDescriptionBackfill({ context, config, master, baseDir
         category,
         would_update_description: exactReferenceVerified && !hasValue(product.master?.officialDescription) && hasValue(descriptionValue.japanese_description),
         would_update_category: exactReferenceVerified && !hasValue(product.master?.officialCategory) && hasValue(category),
+        official_structured_facts: structuredFacts.officialStructuredFacts,
+        structured_review_candidates: structuredFacts.reviewCandidates,
         dry_run: args.dryRun,
       };
 
@@ -2553,6 +2956,12 @@ async function runOfficialDescriptionBackfill({ context, config, master, baseDir
     candidates: translationReviewCandidates,
     dry_run: args.dryRun,
   }));
+  console.log(JSON.stringify({
+    official_structured_facts: 'review_candidates',
+    count: structuredReviewCandidates.length,
+    candidates: structuredReviewCandidates,
+    dry_run: args.dryRun,
+  }));
 }
 
 async function runNewReferenceDiscovery({ context, config, paths, master, discoveryCache, baseDir, args }) {
@@ -2560,6 +2969,7 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
   const state = normalizeNewReferenceDiscoveryState(readJson(paths.newReferenceDiscoveryStateFile, {}), sources);
   const masterProducts = master?.products || [];
   const masterReferences = new Set(masterProducts.map((product) => product.reference).filter(Boolean));
+  const vocabulary = structuredFactVocabulary(masterProducts);
   const maxPages = Number.isFinite(config.newReferenceDiscovery?.maxPagesPerRun) ? config.newReferenceDiscovery.maxPagesPerRun : 8;
   const maxPagesPerSource = Number.isFinite(config.newReferenceDiscovery?.maxPagesPerSourcePerRun)
     ? config.newReferenceDiscovery.maxPagesPerSourcePerRun
@@ -2630,6 +3040,11 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
 
           if (pageIsProduct) {
             for (const ref of pageRefs) {
+              const structuredProduct = productForStructuredFacts(ref, masterProducts, facts);
+              const structuredFacts = structuredFactReviewCandidatesForProduct({ product: structuredProduct, facts, vocabulary });
+              for (const candidate of structuredFacts.reviewCandidates) {
+                if (cacheReviewCandidate(discoveryCache, candidate)) createdOrQueuedReviews += 1;
+              }
               if (masterReferences.has(ref)) {
                 existingReferences += 1;
                 const staleReviewId = reviewCandidateKey({ detection_type: 'unregistered_reference', reference: ref });
