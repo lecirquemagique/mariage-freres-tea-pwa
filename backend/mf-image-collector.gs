@@ -920,7 +920,60 @@ function mfImageCollectorAssertAppendVersionKey_(values, headers, reference, ver
 }
 
 function mfImageCollectorReviewHtml_() {
-  return '<!doctype html><html><head><base target="_top"><style>body{font-family:Arial,sans-serif;margin:20px;color:#222}button,select,input,textarea{font:inherit;margin:4px 0}textarea{display:block;width:100%;min-height:56px}.item{border:1px solid #ddd;padding:12px;margin:12px 0}.head{font-size:18px;font-weight:700}.section{border-top:1px solid #eee;margin-top:10px;padding-top:10px}.section h3{font-size:13px;margin:0 0 6px;color:#555}.muted{color:#666}.url{word-break:break-all}.kv{margin:3px 0}.error{background:#fff2f2;border:1px solid #f2b8b8;color:#8a1f1f;padding:10px;margin:10px 0}</style></head><body><h2>変更候補レビュー</h2><div id="summary">読み込み中...</div><div id="items">読み込み中...</div><script>function esc(s){return String(s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c]));}function dbStatus(it){return it["DB存在確認"]||(it["DB既存T"]||it["DB既存VersionKey"]||it["DB既存名"]?"DB既存データあり":"DB既存データなし");}function fail(where,e){document.getElementById(where).innerHTML=`<div class="error">${esc((e&&e.message)||e||"読み込みエラー")}</div>`;}function link(label,url){return url?`<div class="url"><b>${esc(label)}</b>: <a href="${esc(url)}" target="_blank">${esc(url)}</a></div>`:"";}function structured(it){return it["対象列"]?`<div class="kv">対象列: ${esc(it["対象列"])} / 現在値: ${esc(it["現在値"]||"なし")} / 候補値: ${esc(it["候補値"])}</div><div class="kv">根拠原文: ${esc(it["根拠原文"]||"")}</div><div class="kv">根拠言語: ${esc(it["根拠言語"]||"")} / source: ${esc(it["source_type"]||"")} / confidence: ${esc(it["confidence"]||"")}</div>${link("根拠URL",it["根拠URL"])}`:"";}function load(){google.script.run.withSuccessHandler(render).withFailureHandler(e=>fail("items",e)).mfImageCollectorGetReviewItems("要確認");google.script.run.withSuccessHandler(s=>document.getElementById("summary").textContent="要確認 "+s.pending_count+"件 / 最古 "+(s.oldest_pending_at||"なし")).withFailureHandler(e=>fail("summary",e)).mfImageCollectorGetReviewSummary();}function render(items){document.getElementById("items").innerHTML=(items||[]).map((it,idx)=>`<div class="item"><div class="head">${esc(it["Tリファレンス番号"])} ${esc(it["公式名"])}</div><div class="muted">${esc(it["検出種別"])} / ${esc(it["確認言語"]||it["言語"])} / ${esc(it["検出日時"])} / ${esc(it["ステータス"])}</div><div class="section"><h3>現在の公式情報</h3><div class="kv">公式名: ${esc(it["公式名"])}</div><div class="kv">確認言語: ${esc(it["確認言語"]||it["言語"])}</div>${link("FR",it["FR公式URL"])}${link("EN",it["EN公式URL"])}${link("JP",it["JP公式URL"])}${link("代表URL",it["公式URL"])}<div class="kv">名称差: ${esc(it["公式名称差"]||"")}</div><div class="kv">説明: ${esc(it["公式説明抜粋"]||"")}</div></div><div class="section"><h3>DBの現在情報</h3><div class="kv">${esc(dbStatus(it))}</div><div class="kv">DB既存T: ${esc(it["DB既存T"]||"なし")}</div><div class="kv">DB VersionKey: ${esc(it["DB既存VersionKey"]||"なし")}</div><div class="kv">DB Name: ${esc(it["DB既存名"]||"なし")}</div><div class="kv">類似候補: ${esc(it["DB類似候補"]||"[]")}</div></div><div class="section"><h3>差分・根拠</h3>${structured(it)}<div class="kv">${esc(it["差分概要"])}</div><div class="kv"><b>根拠</b><br>${esc(it["Collectorが取得した根拠"])}</div><div class="kv">Discovery source: ${esc(it["Discovery source"]||"")}</div></div><div class="section"><h3>判定</h3><select id="d${idx}"><option>保留</option><option>新規銘柄として追加</option><option>既存銘柄を更新</option><option>既存銘柄の新バージョンとして追加</option><option>販売SKUとして追加</option><option>既存銘柄と同一</option><option>終売情報として更新</option><option>誤検出</option></select><input id="v${idx}" placeholder="対象VersionKey"><textarea id="c${idx}" placeholder="コメント"></textarea><button onclick="apply(${idx},${it.row_number})">反映</button></div></div>`).join("")||"要確認はありません";}function apply(idx,row){google.script.run.withSuccessHandler(load).withFailureHandler(e=>alert((e&&e.message)||e)).mfImageCollectorApplyReviewDecision(row,document.getElementById("d"+idx).value,document.getElementById("v"+idx).value,document.getElementById("c"+idx).value);}load();</script></body></html>';
+  return `<!doctype html><html><head><base target="_top"><style>
+body{font-family:Arial,sans-serif;margin:20px;color:#222}
+button,select,input,textarea{font:inherit;margin:4px 0}
+textarea{display:block;width:100%;min-height:56px}
+.item{border:1px solid #ddd;padding:12px;margin:12px 0}
+.item.structured{padding:10px 12px}
+.head{font-size:18px;font-weight:700}
+.structured .head{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+.section{border-top:1px solid #eee;margin-top:10px;padding-top:10px}
+.structured .section{margin-top:8px;padding-top:8px}
+.section h3{font-size:13px;margin:0 0 6px;color:#555}
+.muted{color:#666}
+.url{word-break:break-all}
+.kv{margin:3px 0}
+.change{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0}
+.pill{border:1px solid #ddd;background:#fafafa;border-radius:4px;padding:4px 8px}
+.candidate{font-weight:700}
+.evidence{margin:8px 0;line-height:1.45}
+.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.error{background:#fff2f2;border:1px solid #f2b8b8;color:#8a1f1f;padding:10px;margin:10px 0}
+</style></head><body><h2>変更候補レビュー</h2><div id="summary">読み込み中...</div><div id="items">読み込み中...</div><script>
+function esc(s){return String(s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function dbStatus(it){return it['DB存在確認']||(it['DB既存T']||it['DB既存VersionKey']||it['DB既存名']?'DB既存データあり':'DB既存データなし');}
+function fail(where,e){document.getElementById(where).innerHTML='<div class="error">'+esc((e&&e.message)||e||'読み込みエラー')+'</div>';}
+function link(label,url){return url?'<div class="url"><b>'+esc(label)+'</b>: <a href="'+esc(url)+'" target="_blank">'+esc(url)+'</a></div>':'';}
+function actionControls(it,idx){
+  return '<div class="section"><h3>判定</h3><div class="actions"><select id="d'+idx+'"><option>保留</option><option>新規銘柄として追加</option><option>既存銘柄を更新</option><option>既存銘柄の新バージョンとして追加</option><option>販売SKUとして追加</option><option>既存銘柄と同一</option><option>終売情報として更新</option><option>誤検出</option></select><input id="v'+idx+'" placeholder="対象VersionKey"><textarea id="c'+idx+'" placeholder="コメント"></textarea><button onclick="apply('+idx+','+it.row_number+')">反映</button></div></div>';
+}
+function structuredActionControls(it,idx){
+  return '<div class="section"><h3>判定</h3><div class="actions"><select id="d'+idx+'"><option value="保留">保留</option><option value="既存銘柄を更新">承認</option><option value="誤検出">却下</option></select><input id="v'+idx+'" placeholder="対象VersionKey"><textarea id="c'+idx+'" placeholder="コメント"></textarea><button onclick="apply('+idx+','+it.row_number+')">反映</button></div></div>';
+}
+function renderStructured(it,idx){
+  var lang=it['根拠言語']||it['確認言語']||it['言語']||'';
+  var source=it['source_type']||'';
+  var confidence=it['confidence']||'';
+  return '<div class="item structured"><div class="head"><span>'+esc(it['公式名'])+'</span><span class="muted">'+esc(it['Tリファレンス番号'])+'</span></div><div class="muted">'+esc(it['検出種別'])+' / '+esc(it['ステータス'])+'</div><div class="section"><h3>'+esc(it['対象列'])+'</h3><div class="change"><span class="pill">現在: '+esc(it['現在値']||'なし')+'</span><span>→</span><span class="pill candidate">候補: '+esc(it['候補値'])+'</span></div></div><div class="section"><h3>根拠</h3><div class="evidence">'+esc(it['根拠原文']||'')+'</div><div class="muted">'+esc(lang)+'公式 / '+esc(source)+' / confidence: '+esc(confidence)+'</div>'+link('公式ページ',it['根拠URL']||it['公式URL'])+'</div>'+structuredActionControls(it,idx)+'</div>';
+}
+function renderGeneric(it,idx){
+  return '<div class="item"><div class="head">'+esc(it['Tリファレンス番号'])+' '+esc(it['公式名'])+'</div><div class="muted">'+esc(it['検出種別'])+' / '+esc(it['確認言語']||it['言語'])+' / '+esc(it['検出日時'])+' / '+esc(it['ステータス'])+'</div><div class="section"><h3>現在の公式情報</h3><div class="kv">公式名: '+esc(it['公式名'])+'</div><div class="kv">確認言語: '+esc(it['確認言語']||it['言語'])+'</div>'+link('FR',it['FR公式URL'])+link('EN',it['EN公式URL'])+link('JP',it['JP公式URL'])+link('代表URL',it['公式URL'])+'<div class="kv">名称差: '+esc(it['公式名称差']||'')+'</div><div class="kv">説明: '+esc(it['公式説明抜粋']||'')+'</div></div><div class="section"><h3>DBの現在情報</h3><div class="kv">'+esc(dbStatus(it))+'</div><div class="kv">DB既存T: '+esc(it['DB既存T']||'なし')+'</div><div class="kv">DB VersionKey: '+esc(it['DB既存VersionKey']||'なし')+'</div><div class="kv">DB Name: '+esc(it['DB既存名']||'なし')+'</div><div class="kv">類似候補: '+esc(it['DB類似候補']||'[]')+'</div></div><div class="section"><h3>差分・根拠</h3><div class="kv">'+esc(it['差分概要'])+'</div><div class="kv"><b>根拠</b><br>'+esc(it['Collectorが取得した根拠'])+'</div><div class="kv">Discovery source: '+esc(it['Discovery source']||'')+'</div></div>'+actionControls(it,idx)+'</div>';
+}
+function load(){
+  google.script.run.withSuccessHandler(render).withFailureHandler(function(e){fail('items',e);}).mfImageCollectorGetReviewItems('要確認');
+  google.script.run.withSuccessHandler(function(s){document.getElementById('summary').textContent='要確認 '+s.pending_count+'件 / 最古 '+(s.oldest_pending_at||'なし');}).withFailureHandler(function(e){fail('summary',e);}).mfImageCollectorGetReviewSummary();
+}
+function render(items){
+  document.getElementById('items').innerHTML=(items||[]).map(function(it,idx){
+    return it['検出種別']==='structured_fact'?renderStructured(it,idx):renderGeneric(it,idx);
+  }).join('')||'要確認はありません';
+}
+function apply(idx,row){
+  google.script.run.withSuccessHandler(load).withFailureHandler(function(e){alert((e&&e.message)||e);}).mfImageCollectorApplyReviewDecision(row,document.getElementById('d'+idx).value,document.getElementById('v'+idx).value,document.getElementById('c'+idx).value);
+}
+load();
+</script></body></html>`;
 }
 
 function mfImageCollectorUpdateProductPageUrl_(payload) {
