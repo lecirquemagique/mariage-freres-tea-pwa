@@ -71,6 +71,7 @@ function parseArgs(argv) {
     discoverUrlsOnly: false,
     discoverNewReferences: false,
     backfillOfficialDescriptions: false,
+    writeStructuredReviewCandidates: false,
     statusJson: false,
     refs: null,
   };
@@ -93,6 +94,7 @@ function parseArgs(argv) {
     else if (arg === '--discover-urls-only') args.discoverUrlsOnly = true;
     else if (arg === '--discover-new-references') args.discoverNewReferences = true;
     else if (arg === '--backfill-official-descriptions') args.backfillOfficialDescriptions = true;
+    else if (arg === '--write-structured-review-candidates') args.writeStructuredReviewCandidates = true;
     else if (arg === '--status-json') args.statusJson = true;
     else if (arg === '--config') args.config = argv[++i];
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
@@ -2962,6 +2964,22 @@ async function runOfficialDescriptionBackfill({ context, config, master, baseDir
     candidates: structuredReviewCandidates,
     dry_run: args.dryRun,
   }));
+  if (args.writeStructuredReviewCandidates) {
+    if (args.dryRun) {
+      console.log(JSON.stringify({
+        official_structured_facts: 'review_writeback_skipped',
+        reason: 'dry_run',
+        count: structuredReviewCandidates.length,
+      }));
+    } else {
+      const reviewWriteBacks = await writeBackReviewCandidates({ config, baseDir, candidates: structuredReviewCandidates, debug: args.debug });
+      console.log(JSON.stringify({
+        official_structured_facts: 'review_writeback',
+        count: reviewWriteBacks.length,
+        results: reviewWriteBacks,
+      }));
+    }
+  }
 }
 
 async function runNewReferenceDiscovery({ context, config, paths, master, discoveryCache, baseDir, args }) {
