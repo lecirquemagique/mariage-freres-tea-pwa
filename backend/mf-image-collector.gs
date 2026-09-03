@@ -685,6 +685,10 @@ function mfImageCollectorGetReviewSummary() {
 
 function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey) {
   if (decision === '誤検出' || decision === '保留') return;
+  if (String(review['検出種別'] || '').trim() === 'structured_fact') {
+    mfImageCollectorApplyStructuredFact_(review);
+    return;
+  }
   if (decision === '販売SKUとして追加') {
     mfImageCollectorApplySalesSku_(review, targetVersionKey);
     return;
@@ -718,6 +722,88 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
     if (review['公式名']) sheet.getRange(row, nameCol + 1).setValue(review['公式名']);
     if (urlCol >= 0 && review['公式URL']) sheet.getRange(row, urlCol + 1).setValue(review['公式URL']);
   }
+}
+
+function mfImageCollectorApplyStructuredFact_(review) {
+  var targetVersionKey = String(review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim();
+  var targetColumn = String(review['対象列'] || '').trim();
+  var candidateCurrentValue = String(review['現在値'] || '').trim();
+  var suggestedValue = String(review['候補値'] || '').trim();
+  if (!targetVersionKey) throw new Error('structured_fact target_version_key is required.');
+  if (!targetColumn) throw new Error('structured_fact target_column is required.');
+  if (!suggestedValue) throw new Error('structured_fact suggested_value is required.');
+  if (!mfImageCollectorStructuredFactAllowedColumns_()[targetColumn]) {
+    throw new Error('structured_fact cannot update this column: ' + targetColumn);
+  }
+
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var targetRow = mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, targetVersionKey, '');
+  if (targetRow < 2) throw new Error('Target master row was not found for structured_fact: ' + targetVersionKey);
+  var targetCol = headers.indexOf(targetColumn);
+  if (targetCol < 0) throw new Error('Target master column was not found for structured_fact: ' + targetColumn);
+
+  var range = sheet.getRange(targetRow, targetCol + 1);
+  var actualCurrentValue = String(range.getValue() || '').trim();
+  var nextValue = mfImageCollectorStructuredFactNextValue_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue);
+  if (nextValue === actualCurrentValue) return;
+  range.setValue(nextValue);
+}
+
+function mfImageCollectorStructuredFactAllowedColumns_() {
+  return {
+    '産地・国': true,
+    '産地・地域／茶園': true,
+    '香味大分類': true,
+    '香味詳細タグ': true,
+    '燻製茶': true,
+    'ミルクティー推奨': true,
+    'アイスティー推奨': true,
+    'テインフリー': true,
+    '時間帯タグ': true
+  };
+}
+
+function mfImageCollectorStructuredFactMultiValueColumns_() {
+  return {
+    '産地・国': true,
+    '産地・地域／茶園': true,
+    '香味大分類': true,
+    '香味詳細タグ': true,
+    '時間帯タグ': true
+  };
+}
+
+function mfImageCollectorStructuredFactNextValue_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue) {
+  var actual = String(actualCurrentValue || '').trim();
+  var expected = String(candidateCurrentValue || '').trim();
+  var incoming = String(suggestedValue || '').trim();
+  if (mfImageCollectorStructuredFactMultiValueColumns_()[targetColumn]) {
+    var values = mfImageCollectorDelimitedValues_(actual);
+    var expectedValues = mfImageCollectorDelimitedValues_(expected);
+    for (var i = 0; i < expectedValues.length; i += 1) {
+      if (values.indexOf(expectedValues[i]) < 0) {
+        throw new Error('Master value changed after structured_fact candidate was created: ' + targetColumn + ' expected token "' + expectedValues[i] + '" but found "' + actual + '".');
+      }
+    }
+    if (values.indexOf(incoming) >= 0) return actual;
+    values.push(incoming);
+    return values.join('、');
+  }
+  if (actual === incoming) return actual;
+  if (actual !== expected) {
+    throw new Error('Master value changed after structured_fact candidate was created: ' + targetColumn + ' expected "' + expected + '" but found "' + actual + '".');
+  }
+  return incoming;
+}
+
+function mfImageCollectorDelimitedValues_(value) {
+  return String(value || '').split(/[、,;／|\n]+/).map(function(part) {
+    return String(part).trim();
+  }).filter(Boolean);
 }
 
 function mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey) {
@@ -949,7 +1035,7 @@ function actionControls(it,idx){
   return '<div class="section"><h3>判定</h3><div class="actions"><select id="d'+idx+'"><option>保留</option><option>新規銘柄として追加</option><option>既存銘柄を更新</option><option>既存銘柄の新バージョンとして追加</option><option>販売SKUとして追加</option><option>既存銘柄と同一</option><option>終売情報として更新</option><option>誤検出</option></select><input id="v'+idx+'" placeholder="対象VersionKey"><textarea id="c'+idx+'" placeholder="コメント"></textarea><button onclick="apply('+idx+','+it.row_number+')">反映</button></div></div>';
 }
 function structuredActionControls(it,idx){
-  return '<div class="section"><h3>判定</h3><div class="actions"><select id="d'+idx+'"><option value="保留">保留</option><option value="既存銘柄を更新">承認</option><option value="誤検出">却下</option></select><input id="v'+idx+'" placeholder="対象VersionKey"><textarea id="c'+idx+'" placeholder="コメント"></textarea><button onclick="apply('+idx+','+it.row_number+')">反映</button></div></div>';
+  return '<div class="section"><h3>判定</h3><div class="muted">対象VersionKey: '+esc(it['対象VersionKey']||it['DB既存VersionKey']||'')+'</div><div class="actions"><select id="d'+idx+'"><option value="保留">保留</option><option value="既存銘柄を更新">承認</option><option value="誤検出">却下</option></select><textarea id="c'+idx+'" placeholder="コメント"></textarea><button onclick="apply('+idx+','+it.row_number+')">反映</button></div></div>';
 }
 function renderStructured(it,idx){
   var lang=it['根拠言語']||it['確認言語']||it['言語']||'';
@@ -970,7 +1056,8 @@ function render(items){
   }).join('')||'要確認はありません';
 }
 function apply(idx,row){
-  google.script.run.withSuccessHandler(load).withFailureHandler(function(e){alert((e&&e.message)||e);}).mfImageCollectorApplyReviewDecision(row,document.getElementById('d'+idx).value,document.getElementById('v'+idx).value,document.getElementById('c'+idx).value);
+  var versionInput=document.getElementById('v'+idx);
+  google.script.run.withSuccessHandler(load).withFailureHandler(function(e){alert((e&&e.message)||e);}).mfImageCollectorApplyReviewDecision(row,document.getElementById('d'+idx).value,versionInput?versionInput.value:'',document.getElementById('c'+idx).value);
 }
 load();
 </script></body></html>`;
