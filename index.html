@@ -849,6 +849,10 @@ function normalizeTeaType(value){
   const raw=String(value||'').trim();
   const v=n(raw);
 
+  if(raw==='紅茶'){
+    return '黒茶';
+  }
+
   if(
     v.includes('チザン') ||
     v.includes('tisane') ||

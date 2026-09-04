@@ -4,7 +4,6 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { chromium } = require('playwright');
 
 const DEFAULT_CONFIG = 'config.json';
 const IMAGE_TYPES = ['tea', 'teaThumbnail', 'liqueur'];
@@ -20,6 +19,7 @@ const MASTER_COLUMNS = {
   reference: 'Tリファレンス番号',
   name: '現在の公式名',
   fallbackName: '銘柄名（黒い本）',
+  blackBookDescription: '黒い本説明',
   officialDescription: '現在の公式説明',
   officialDescriptionSourceLanguage: '現在の公式説明根拠言語',
   officialDescriptionSourceUrl: '現在の公式説明根拠URL',
@@ -72,6 +72,7 @@ function parseArgs(argv) {
     discoverNewReferences: false,
     backfillOfficialDescriptions: false,
     writeStructuredReviewCandidates: false,
+    taxonomyDryRun: false,
     statusJson: false,
     refs: null,
   };
@@ -95,6 +96,7 @@ function parseArgs(argv) {
     else if (arg === '--discover-new-references') args.discoverNewReferences = true;
     else if (arg === '--backfill-official-descriptions') args.backfillOfficialDescriptions = true;
     else if (arg === '--write-structured-review-candidates') args.writeStructuredReviewCandidates = true;
+    else if (arg === '--taxonomy-dry-run') args.taxonomyDryRun = true;
     else if (arg === '--status-json') args.statusJson = true;
     else if (arg === '--config') args.config = argv[++i];
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
@@ -130,6 +132,10 @@ function nowIso() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function playwrightChromium() {
+  return require('playwright').chromium;
 }
 
 function randomDelay({ min = 4000, max = 14000 } = {}) {
@@ -831,6 +837,121 @@ function normalizeTeaTypeTagsForMaster(value) {
   return [...new Set(tags)].join('、');
 }
 
+const AROMA_CATEGORY_ORDER = [
+  '花',
+  '果実',
+  'ベリー',
+  '柑橘',
+  'スパイス',
+  'ハーブ',
+  'ミント',
+  '甘香・菓子',
+  'カカオ',
+  'キャラメル',
+  'ナッツ',
+  'モルト',
+  '植物・青葉',
+  'ウッディ',
+];
+
+function aromaCategoryOrderIndex(value) {
+  const index = AROMA_CATEGORY_ORDER.indexOf(value);
+  return index >= 0 ? index : AROMA_CATEGORY_ORDER.length + 100;
+}
+
+function orderedUniqueAromaCategories(values) {
+  return [...new Set((values || []).filter(Boolean))]
+    .sort((a, b) => aromaCategoryOrderIndex(a) - aromaCategoryOrderIndex(b) || a.localeCompare(b, 'ja'));
+}
+
+function normalizeAromaCategoryToken(token) {
+  const raw = normalizeText(token);
+  if (!raw) return [];
+  const normalized = raw.replace(/™/g, '').trim();
+  const map = new Map([
+    ['花系', ['花']],
+    ['花', ['花']],
+    ['果実系', ['果実']],
+    ['果実', ['果実']],
+    ['ベリー系', ['果実', 'ベリー']],
+    ['ベリー', ['果実', 'ベリー']],
+    ['柑橘系', ['柑橘']],
+    ['柑橘', ['柑橘']],
+    ['スパイス', ['スパイス']],
+    ['ハーブ系', ['ハーブ']],
+    ['ハーブ・清涼系', ['ハーブ']],
+    ['ハーブ', ['ハーブ']],
+    ['ミント', ['ハーブ', 'ミント']],
+    ['甘香・菓子系', ['甘香・菓子']],
+    ['甘香・菓子', ['甘香・菓子']],
+    ['カカオ系', ['カカオ']],
+    ['カカオ', ['カカオ']],
+    ['キャラメル系', ['甘香・菓子', 'キャラメル']],
+    ['キャラメル', ['甘香・菓子', 'キャラメル']],
+    ['ナッツ系', ['ナッツ']],
+    ['ナッツ', ['ナッツ']],
+    ['モルト', ['モルト']],
+    ['グリーン', ['植物・青葉']],
+    ['植物・青葉', ['植物・青葉']],
+    ['ウッディ', ['ウッディ']],
+    ['樹脂・木質系', ['ウッディ']],
+    ['アーシー', ['ウッディ']],
+  ]);
+  return map.get(normalized) || [];
+}
+
+function aromaCategoriesFromDetailTag(token) {
+  const raw = normalizeText(token);
+  if (!raw) return [];
+  if (/ベリー|ストロベリー|苺|いちご|イチゴ|ラズベリー|フランボワーズ|ブルーベリー|ブラックベリー|クランベリー|カシス/.test(raw)) return ['果実', 'ベリー'];
+  if (/ミント|ペパーミント|スペアミント/.test(raw)) return ['ハーブ', 'ミント'];
+  if (/キャラメル|カラメル|ブロンドキャラメル/.test(raw)) return ['甘香・菓子', 'キャラメル'];
+  if (/モルト|麦芽/.test(raw)) return ['モルト'];
+  if (/チョコレート|ショコラ|カカオ/.test(raw)) return ['カカオ'];
+  if (/木質|樹脂|杉|杉樹脂|森林|下草|土香|土|ウッディ/.test(raw)) return ['ウッディ'];
+  if (/植物香|青葉|若葉|竹|樹液|グリーン/.test(raw)) return ['植物・青葉'];
+  if (/ベルガモット|柑橘|シトラス|レモン|オレンジ|グレープフルーツ|マンダリン|ゆず|柚子/.test(raw)) return ['柑橘'];
+  if (/ジャスミン|ローズ|薔薇|バラ|花|フローラル|すみれ|スミレ|ラベンダー/.test(raw)) return ['花'];
+  return [];
+}
+
+function aromaCategoriesFromTrustedEvidenceText(text) {
+  const raw = normalizeText(text);
+  if (!raw) return [];
+  if (/モルト|麦芽|\bmalt(?:y|ed)?\b|malt[ée](?:e|es|s)?/i.test(raw)) return ['モルト'];
+  return [];
+}
+
+function normalizeAromaCategoriesForMaster(currentValue, detailTags = '', evidenceTexts = []) {
+  const categories = [];
+  const unknown = [];
+  const evidenceDerived = [];
+  for (const token of splitMasterListValue(currentValue)) {
+    const normalized = normalizeAromaCategoryToken(token);
+    if (normalized.length) categories.push(...normalized);
+    else unknown.push(token);
+  }
+  for (const token of splitMasterListValue(detailTags)) {
+    categories.push(...aromaCategoriesFromDetailTag(token));
+  }
+  for (const text of evidenceTexts || []) {
+    const derived = aromaCategoriesFromTrustedEvidenceText(text);
+    if (derived.length) {
+      categories.push(...derived);
+      for (const category of derived) {
+        evidenceDerived.push({ category, evidence_text: compactSnippet(text, 180) });
+      }
+    }
+  }
+  const normalizedCategories = orderedUniqueAromaCategories(categories);
+  return {
+    value: normalizedCategories.join('、'),
+    categories: normalizedCategories,
+    unknown: [...new Set(unknown)],
+    evidence_derived: evidenceDerived,
+  };
+}
+
 function officialDescriptionJapaneseOverrides(config) {
   return config.officialDescriptionJapaneseOverrides && typeof config.officialDescriptionJapaneseOverrides === 'object'
     ? config.officialDescriptionJapaneseOverrides
@@ -953,17 +1074,17 @@ function includesVocabulary(vocabulary, column, value) {
 
 function flavorRules() {
   return [
-    { value: 'ベルガモット', category: '柑橘系', pattern: /\bbergamot(?:te)?\b|ベルガモット/i },
-    { value: 'ヴァニラ', category: '甘香・菓子系', pattern: /\bvanilla\b|\bvanille\b|ヴァニラ|バニラ/i },
-    { value: 'ジャスミン', category: '花系', pattern: /\bjasmine\b|\bjasmin\b|ジャスミン/i },
-    { value: 'ローズ', category: '花系', pattern: /\brose\b|\broses\b|ローズ|薔薇|バラ/i },
+    { value: 'ベルガモット', category: '柑橘', pattern: /\bbergamot(?:te)?\b|ベルガモット/i },
+    { value: 'ヴァニラ', category: '甘香・菓子', pattern: /\bvanilla\b|\bvanille\b|ヴァニラ|バニラ/i },
+    { value: 'ジャスミン', category: '花', pattern: /\bjasmine\b|\bjasmin\b|ジャスミン/i },
+    { value: 'ローズ', category: '花', pattern: /\brose\b|\broses\b|ローズ|薔薇|バラ/i },
     { value: 'ジンジャー', category: 'スパイス', pattern: /\bginger\b|\bgingembre\b|ジンジャー|生姜/i },
-    { value: 'ミント', category: 'ハーブ系', pattern: /\bmint\b|\bmenthe\b|ミント/i },
-    { value: 'カカオ', category: 'カカオ系', pattern: /\bcacao\b|\bcocoa\b|カカオ/i },
-    { value: 'キャラメル', category: '甘香・菓子系', pattern: /\bcaramel\b|キャラメル/i },
-    { value: '柑橘', category: '柑橘系', pattern: /\bcitrus\b|\bagrumes?\b|柑橘/i },
-    { value: '果実', category: '果実系', pattern: /\bfruits?\b|\bfruité(?:e|es|s)?\b|果実|フルーツ/i, rejectPattern: /\bfruits?\s+à\s+coque\b|\btraces?\s+de\s+fruits?\s+à\s+coque\b/i },
-    { value: '花', category: '花系', pattern: /\bflowers?\b|\bfleurs?\b|\bfloral(?:e|es|s)?\b|花/i },
+    { value: 'ミント', categories: ['ハーブ', 'ミント'], pattern: /\bmint\b|\bmenthe\b|ミント/i },
+    { value: 'カカオ', category: 'カカオ', pattern: /\bcacao\b|\bcocoa\b|カカオ/i },
+    { value: 'キャラメル', categories: ['甘香・菓子', 'キャラメル'], pattern: /\bcaramel\b|キャラメル/i },
+    { value: '柑橘', category: '柑橘', pattern: /\bcitrus\b|\bagrumes?\b|柑橘/i },
+    { value: '果実', category: '果実', pattern: /\bfruits?\b|\bfruité(?:e|es|s)?\b|果実|フルーツ/i, rejectPattern: /\bfruits?\s+à\s+coque\b|\btraces?\s+de\s+fruits?\s+à\s+coque\b/i },
+    { value: '花', category: '花', pattern: /\bflowers?\b|\bfleurs?\b|\bfloral(?:e|es|s)?\b|花/i },
   ];
 }
 
@@ -1047,17 +1168,19 @@ function buildStructuredFactSuggestions({ product, facts, vocabulary }) {
           confidence: context.source_type === 'ingredients' || context.source_type === 'product_summary' ? 'high' : 'medium',
         });
       }
-      if (rule.category && includesVocabulary(vocabulary, MASTER_COLUMNS.flavorCategory, rule.category)) {
-        addStructuredSuggestion(suggestions, product, {
-          column: MASTER_COLUMNS.flavorCategory,
-          suggested_value: rule.category,
-          evidence_text: evidence,
-          evidence_language: language,
-          evidence_url: url,
-          source_type: context.source_type,
-          source_dom: context.source_dom,
-          confidence: 'medium',
-        });
+      for (const category of rule.categories || (rule.category ? [rule.category] : [])) {
+        if (includesVocabulary(vocabulary, MASTER_COLUMNS.flavorCategory, category)) {
+          addStructuredSuggestion(suggestions, product, {
+            column: MASTER_COLUMNS.flavorCategory,
+            suggested_value: category,
+            evidence_text: evidence,
+            evidence_language: language,
+            evidence_url: url,
+            source_type: context.source_type,
+            source_dom: context.source_dom,
+            confidence: 'medium',
+          });
+        }
       }
     }
   }
@@ -2251,6 +2374,111 @@ function newReferenceDiscoveryStats(state) {
   };
 }
 
+function taxonomyDryRun(masterProducts = [], focusReferences = []) {
+  const rows = [];
+  const focusRows = [];
+  const focusSet = new Set((focusReferences || []).map((ref) => normalizeText(ref).toUpperCase()).filter(Boolean));
+  const summary = {
+    master_rows: masterProducts.length,
+    tea_type_changed_cells: 0,
+    aroma_changed_rows: 0,
+    changed_rows: 0,
+    changed_cells: 0,
+    new_category_counts: Object.fromEntries(AROMA_CATEGORY_ORDER.map((category) => [category, 0])),
+    old_category_conversion_counts: {},
+    unknown_old_categories: {},
+    detail_derived_counts: {},
+    evidence_derived_counts: {},
+  };
+
+  for (const product of masterProducts) {
+    const master = product.master || {};
+    const currentTeaType = normalizeText(master[MASTER_COLUMNS.teaTypeTag]);
+    const currentOfficialCategory = normalizeText(master[MASTER_COLUMNS.officialCategory]);
+    const currentAroma = normalizeText(master[MASTER_COLUMNS.flavorCategory]);
+    const currentDetails = normalizeText(master[MASTER_COLUMNS.flavorTags]);
+    const trustedEvidenceTexts = [
+      master[MASTER_COLUMNS.blackBookDescription],
+      master[MASTER_COLUMNS.officialDescription],
+      master[MASTER_COLUMNS.officialDescriptionOriginal],
+    ].map((value) => normalizeText(value)).filter(Boolean);
+    const newTeaType = normalizeTeaTypeTagsForMaster(currentTeaType);
+    const newOfficialCategory = normalizeOfficialCategoryForMaster(currentOfficialCategory);
+    const aroma = normalizeAromaCategoriesForMaster(currentAroma, currentDetails, trustedEvidenceTexts);
+    const oldAromaTokens = splitMasterListValue(currentAroma);
+    const detailTokens = splitMasterListValue(currentDetails);
+    const reasons = [];
+
+    for (const token of oldAromaTokens) {
+      const normalized = normalizeAromaCategoryToken(token);
+      if (normalized.length) {
+        const key = `${token} -> ${normalized.join('、')}`;
+        summary.old_category_conversion_counts[key] = (summary.old_category_conversion_counts[key] || 0) + 1;
+      } else {
+        summary.unknown_old_categories[token] = (summary.unknown_old_categories[token] || 0) + 1;
+      }
+    }
+    for (const token of detailTokens) {
+      for (const category of aromaCategoriesFromDetailTag(token)) {
+        const key = `${token} -> ${category}`;
+        summary.detail_derived_counts[key] = (summary.detail_derived_counts[key] || 0) + 1;
+      }
+    }
+    for (const derived of aroma.evidence_derived) {
+      const key = `trusted evidence -> ${derived.category}`;
+      summary.evidence_derived_counts[key] = (summary.evidence_derived_counts[key] || 0) + 1;
+    }
+    for (const category of aroma.categories) {
+      summary.new_category_counts[category] = (summary.new_category_counts[category] || 0) + 1;
+    }
+
+    const rowResult = {
+      version_key: master[MASTER_COLUMNS.versionKey] || '',
+      reference: product.reference,
+      name: product.name || '',
+      current_tea_type_tags: currentTeaType,
+      new_tea_type_tags: newTeaType,
+      current_official_category: currentOfficialCategory,
+      new_official_category: newOfficialCategory,
+      current_aroma_categories: currentAroma,
+      new_aroma_categories: aroma.value,
+      flavor_detail_tags: currentDetails,
+      evidence_derived_aroma_categories: aroma.evidence_derived,
+      reasons,
+    };
+    if (focusSet.has(normalizeText(product.reference).toUpperCase())) {
+      focusRows.push(rowResult);
+    }
+
+    const teaChanged = currentTeaType !== newTeaType || currentOfficialCategory !== newOfficialCategory;
+    const aromaChanged = currentAroma !== aroma.value;
+    if (!teaChanged && !aromaChanged) continue;
+
+    if (currentTeaType !== newTeaType) reasons.push('茶種タグ normalized');
+    if (currentOfficialCategory !== newOfficialCategory) reasons.push('現在のカテゴリ normalized');
+    if (currentAroma !== aroma.value) reasons.push('香味大分類 normalized/derived from 香味詳細タグ');
+    if (aroma.evidence_derived.length) reasons.push('香味大分類 derived from trusted evidence text');
+    if (aroma.unknown.length) reasons.push(`unknown aroma category kept out: ${aroma.unknown.join('、')}`);
+
+    summary.changed_rows += 1;
+    if (currentTeaType !== newTeaType) {
+      summary.tea_type_changed_cells += 1;
+      summary.changed_cells += 1;
+    }
+    if (currentOfficialCategory !== newOfficialCategory) {
+      summary.tea_type_changed_cells += 1;
+      summary.changed_cells += 1;
+    }
+    if (aromaChanged) {
+      summary.aroma_changed_rows += 1;
+      summary.changed_cells += 1;
+    }
+
+    rows.push(rowResult);
+  }
+  return { ok: true, dry_run: true, summary, rows, focus_rows: focusRows };
+}
+
 async function writeBackReviewCandidates({ config, baseDir, candidates, debug }) {
   if (!writeBackRequired(config) || !candidates?.length) return [];
   const results = [];
@@ -3174,7 +3402,7 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
 }
 
 async function connectBrowser(args) {
-  const browser = await chromium.connectOverCDP(args.connectCdp);
+  const browser = await playwrightChromium().connectOverCDP(args.connectCdp);
   const context = browser.contexts()[0] || await browser.newContext();
   return { browser, context };
 }
@@ -3184,7 +3412,7 @@ async function main() {
   const baseDir = process.cwd();
   const configPath = resolveProjectPath(baseDir, args.config);
   const fallbackConfigPath = path.join(baseDir, 'collector', 'config.example.json');
-  const config = readJson(configPath, readJson(fallbackConfigPath));
+  const config = readJson(configPath, readJson(fallbackConfigPath, args.taxonomyDryRun ? {} : null));
   if (!config) throw new Error(`Config not found: ${configPath}`);
   if (args.writeBack !== null) {
     config.writeBack = { ...(config.writeBack || {}), enabled: args.writeBack };
@@ -3214,6 +3442,10 @@ async function main() {
   if (!master && !useConfigProducts) {
     throw new Error('Master products are required for normal collector runs. Use --use-config-products only for explicit local tests.');
   }
+    if (args.taxonomyDryRun) {
+      console.log(JSON.stringify(taxonomyDryRun(master?.products || config.products || [], args.refs), null, 2));
+      return;
+    }
   if (!args.statusJson && !args.dryRun) {
     await normalizeNotFoundProductUrlWriteBacks({ config, baseDir, state, master, debug: args.debug });
   }
@@ -3283,7 +3515,7 @@ async function main() {
   const externalBrowser = args.connectCdp ? await connectBrowser(args) : null;
   const context = externalBrowser
     ? externalBrowser.context
-    : await chromium.launchPersistentContext(paths.profileDir, launchOptions);
+    : await playwrightChromium().launchPersistentContext(paths.profileDir, launchOptions);
 
   try {
     if (externalBrowser && args.authSetup) {
