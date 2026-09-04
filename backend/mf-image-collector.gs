@@ -100,6 +100,10 @@ function mfImageCollectorDoPost(e) {
     if (payload.action === 'normalizeTeaTypeTags') {
       return mfImageCollectorJson_(mfImageCollectorNormalizeTeaTypeTags_(payload));
     }
+    if (payload.action === 'taxonomyDryRun') {
+      mfImageCollectorAssertSecret_(payload);
+      return mfImageCollectorJson_(mfImageCollectorTaxonomyDryRun_());
+    }
     if (payload.action === 'updateMasterNewTeaDefaults') {
       return mfImageCollectorJson_(mfImageCollectorUpdateMasterNewTeaDefaults_(payload));
     }
@@ -275,6 +279,7 @@ function mfImageCollectorOnOpen(e) {
     .addItem('変更レビュー', 'mfImageCollectorShowReviewDialog')
     .addItem('要確認件数を表示', 'mfImageCollectorShowReviewSummary')
     .addItem('レビュー更新', 'mfImageCollectorRefreshReviewSheet')
+    .addItem('分類整理 dry-run', 'mfImageCollectorShowTaxonomyDryRun')
     .addToUi();
 }
 
@@ -292,6 +297,19 @@ function mfImageCollectorShowReviewDialog() {
     .setWidth(820)
     .setHeight(720);
   SpreadsheetApp.getUi().showModalDialog(html, 'MARIAGE FRÈRES 変更レビュー');
+}
+
+function mfImageCollectorShowTaxonomyDryRun() {
+  var result = mfImageCollectorTaxonomyDryRun_();
+  SpreadsheetApp.getUi().alert(
+    '分類整理 dry-run',
+    '変更対象行: ' + result.summary.changed_rows +
+      '\n変更対象セル: ' + result.summary.changed_cells +
+      '\n茶種/カテゴリ変更セル: ' + result.summary.tea_type_changed_cells +
+      '\n香味大分類変更行: ' + result.summary.aroma_changed_rows +
+      '\n未知分類: ' + Object.keys(result.summary.unknown_old_categories).join(', '),
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
 }
 
 function mfImageCollectorRefreshReviewSheet() {
@@ -780,7 +798,7 @@ function mfImageCollectorStructuredFactMultiValueColumns_() {
 function mfImageCollectorStructuredFactNextValue_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue) {
   var actual = String(actualCurrentValue || '').trim();
   var expected = String(candidateCurrentValue || '').trim();
-  var incoming = String(suggestedValue || '').trim();
+  var incoming = mfImageCollectorNormalizeStructuredFactValue_(targetColumn, suggestedValue);
   if (mfImageCollectorStructuredFactMultiValueColumns_()[targetColumn]) {
     var values = mfImageCollectorDelimitedValues_(actual);
     var expectedValues = mfImageCollectorDelimitedValues_(expected);
@@ -798,6 +816,19 @@ function mfImageCollectorStructuredFactNextValue_(targetColumn, actualCurrentVal
     throw new Error('Master value changed after structured_fact candidate was created: ' + targetColumn + ' expected "' + expected + '" but found "' + actual + '".');
   }
   return incoming;
+}
+
+function mfImageCollectorNormalizeStructuredFactValue_(targetColumn, value) {
+  if (targetColumn === '香味大分類') {
+    return mfImageCollectorNormalizeAromaCategoriesForMaster_(value, '').value;
+  }
+  if (targetColumn === '現在のカテゴリ') {
+    return mfImageCollectorNormalizeClassificationValueForMaster_(value);
+  }
+  if (targetColumn === '茶種タグ') {
+    return mfImageCollectorNormalizeTeaTypeTagsForMaster_(value);
+  }
+  return String(value || '').trim();
 }
 
 function mfImageCollectorDelimitedValues_(value) {
@@ -1353,6 +1384,135 @@ function mfImageCollectorNormalizeTeaTypeTags_(payload) {
   };
 }
 
+function mfImageCollectorTaxonomyDryRun_() {
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) return {
+    ok: true,
+    dry_run: true,
+    summary: mfImageCollectorEmptyTaxonomySummary_(0),
+    rows: []
+  };
+
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var refCol = headers.indexOf('Tリファレンス番号');
+  var versionCol = headers.indexOf('VersionKey');
+  var nameCol = headers.indexOf('現在の公式名');
+  var fallbackNameCol = headers.indexOf('銘柄名（黒い本）');
+  var tagCol = headers.indexOf('茶種タグ');
+  var categoryCol = headers.indexOf('現在のカテゴリ');
+  var aromaCol = headers.indexOf('香味大分類');
+  var detailCol = headers.indexOf('香味詳細タグ');
+  var blackBookDescriptionCol = headers.indexOf('黒い本説明');
+  var officialDescriptionCol = headers.indexOf('現在の公式説明');
+  var officialDescriptionOriginalCol = headers.indexOf('現在の公式説明原文');
+  var summary = mfImageCollectorEmptyTaxonomySummary_(values.length - 1);
+  var rows = [];
+
+  for (var i = 1; i < values.length; i += 1) {
+    var currentTeaType = tagCol >= 0 ? String(values[i][tagCol] || '').trim() : '';
+    var currentOfficialCategory = categoryCol >= 0 ? String(values[i][categoryCol] || '').trim() : '';
+    var currentAroma = aromaCol >= 0 ? String(values[i][aromaCol] || '').trim() : '';
+    var currentDetails = detailCol >= 0 ? String(values[i][detailCol] || '').trim() : '';
+    var trustedEvidenceTexts = [
+      blackBookDescriptionCol >= 0 ? values[i][blackBookDescriptionCol] : '',
+      officialDescriptionCol >= 0 ? values[i][officialDescriptionCol] : '',
+      officialDescriptionOriginalCol >= 0 ? values[i][officialDescriptionOriginalCol] : ''
+    ];
+    var newTeaType = mfImageCollectorNormalizeTeaTypeTagsForMaster_(currentTeaType);
+    var newOfficialCategory = mfImageCollectorNormalizeClassificationValueForMaster_(currentOfficialCategory);
+    var aroma = mfImageCollectorNormalizeAromaCategoriesForMaster_(currentAroma, currentDetails, trustedEvidenceTexts);
+    var reasons = [];
+
+    mfImageCollectorAccumulateTaxonomyStats_(summary, currentAroma, currentDetails, aroma.categories, aroma.unknown);
+    for (var derivedIndex = 0; derivedIndex < aroma.evidence_derived.length; derivedIndex += 1) {
+      var evidenceKey = 'trusted evidence -> ' + aroma.evidence_derived[derivedIndex].category;
+      summary.evidence_derived_counts[evidenceKey] = (summary.evidence_derived_counts[evidenceKey] || 0) + 1;
+    }
+    if (currentTeaType !== newTeaType) reasons.push('茶種タグ normalized');
+    if (currentOfficialCategory !== newOfficialCategory) reasons.push('現在のカテゴリ normalized');
+    if (currentAroma !== aroma.value) reasons.push('香味大分類 normalized/derived from 香味詳細タグ');
+    if (aroma.evidence_derived.length) reasons.push('香味大分類 derived from trusted evidence text');
+    if (aroma.unknown.length) reasons.push('unknown aroma category kept out: ' + aroma.unknown.join('、'));
+    if (!reasons.length) continue;
+
+    summary.changed_rows += 1;
+    if (currentTeaType !== newTeaType) {
+      summary.tea_type_changed_cells += 1;
+      summary.changed_cells += 1;
+    }
+    if (currentOfficialCategory !== newOfficialCategory) {
+      summary.tea_type_changed_cells += 1;
+      summary.changed_cells += 1;
+    }
+    if (currentAroma !== aroma.value) {
+      summary.aroma_changed_rows += 1;
+      summary.changed_cells += 1;
+    }
+    rows.push({
+      row_number: i + 1,
+      version_key: versionCol >= 0 ? String(values[i][versionCol] || '').trim() : '',
+      reference: refCol >= 0 ? String(values[i][refCol] || '').trim() : '',
+      name: nameCol >= 0 ? String(values[i][nameCol] || '').trim() : (fallbackNameCol >= 0 ? String(values[i][fallbackNameCol] || '').trim() : ''),
+      current_tea_type_tags: currentTeaType,
+      new_tea_type_tags: newTeaType,
+      current_official_category: currentOfficialCategory,
+      new_official_category: newOfficialCategory,
+      current_aroma_categories: currentAroma,
+      new_aroma_categories: aroma.value,
+      flavor_detail_tags: currentDetails,
+      evidence_derived_aroma_categories: aroma.evidence_derived,
+      reasons: reasons
+    });
+  }
+  return { ok: true, dry_run: true, summary: summary, rows: rows };
+}
+
+function mfImageCollectorEmptyTaxonomySummary_(masterRows) {
+  var counts = {};
+  var order = mfImageCollectorAromaCategoryOrder_();
+  for (var i = 0; i < order.length; i += 1) counts[order[i]] = 0;
+  return {
+    master_rows: masterRows,
+    changed_rows: 0,
+    changed_cells: 0,
+    tea_type_changed_cells: 0,
+    aroma_changed_rows: 0,
+    new_category_counts: counts,
+    old_category_conversion_counts: {},
+    unknown_old_categories: {},
+    detail_derived_counts: {},
+    evidence_derived_counts: {}
+  };
+}
+
+function mfImageCollectorAccumulateTaxonomyStats_(summary, currentAroma, detailTags, categories, unknown) {
+  var oldTokens = mfImageCollectorDelimitedValues_(currentAroma);
+  for (var i = 0; i < oldTokens.length; i += 1) {
+    var normalized = mfImageCollectorNormalizeAromaCategoryToken_(oldTokens[i]);
+    if (normalized.length) {
+      var key = oldTokens[i] + ' -> ' + normalized.join('、');
+      summary.old_category_conversion_counts[key] = (summary.old_category_conversion_counts[key] || 0) + 1;
+    }
+  }
+  for (var u = 0; u < unknown.length; u += 1) {
+    summary.unknown_old_categories[unknown[u]] = (summary.unknown_old_categories[unknown[u]] || 0) + 1;
+  }
+  var detailTokens = mfImageCollectorDelimitedValues_(detailTags);
+  for (var d = 0; d < detailTokens.length; d += 1) {
+    var derived = mfImageCollectorAromaCategoriesFromDetailTag_(detailTokens[d]);
+    for (var j = 0; j < derived.length; j += 1) {
+      var detailKey = detailTokens[d] + ' -> ' + derived[j];
+      summary.detail_derived_counts[detailKey] = (summary.detail_derived_counts[detailKey] || 0) + 1;
+    }
+  }
+  for (var c = 0; c < categories.length; c += 1) {
+    summary.new_category_counts[categories[c]] = (summary.new_category_counts[categories[c]] || 0) + 1;
+  }
+}
+
 function mfImageCollectorNormalizeTeaTypeTagsForMaster_(value) {
   var parts = String(value || '').split(/[、,;／|\n]+/);
   var out = [];
@@ -1398,6 +1558,134 @@ function mfImageCollectorNormalizeClassificationValueForMaster_(value) {
     .replace(/\bThé vert\b/gi, '緑茶')
     .replace(/\bThé blanc\b/gi, '白茶')
     .replace(/\bThé jaune\b/gi, '黄茶');
+}
+
+function mfImageCollectorAromaCategoryOrder_() {
+  return ['花', '果実', 'ベリー', '柑橘', 'スパイス', 'ハーブ', 'ミント', '甘香・菓子', 'カカオ', 'キャラメル', 'ナッツ', 'モルト', '植物・青葉', 'ウッディ'];
+}
+
+function mfImageCollectorNormalizeAromaCategoriesForMaster_(currentValue, detailTags, evidenceTexts) {
+  var categories = [];
+  var unknown = [];
+  var evidenceDerived = [];
+  var currentTokens = mfImageCollectorDelimitedValues_(currentValue);
+  for (var i = 0; i < currentTokens.length; i += 1) {
+    var normalized = mfImageCollectorNormalizeAromaCategoryToken_(currentTokens[i]);
+    if (normalized.length) {
+      categories = categories.concat(normalized);
+    } else {
+      unknown.push(currentTokens[i]);
+    }
+  }
+  var detailTokens = mfImageCollectorDelimitedValues_(detailTags);
+  for (var d = 0; d < detailTokens.length; d += 1) {
+    categories = categories.concat(mfImageCollectorAromaCategoriesFromDetailTag_(detailTokens[d]));
+  }
+  evidenceTexts = evidenceTexts || [];
+  for (var e = 0; e < evidenceTexts.length; e += 1) {
+    var derived = mfImageCollectorAromaCategoriesFromTrustedEvidenceText_(evidenceTexts[e]);
+    if (derived.length) {
+      categories = categories.concat(derived);
+      for (var c = 0; c < derived.length; c += 1) {
+        evidenceDerived.push({
+          category: derived[c],
+          evidence_text: mfImageCollectorCompactText_(evidenceTexts[e], 180)
+        });
+      }
+    }
+  }
+  categories = mfImageCollectorOrderedUniqueAromaCategories_(categories);
+  return {
+    value: categories.join('、'),
+    categories: categories,
+    unknown: mfImageCollectorUnique_(unknown),
+    evidence_derived: evidenceDerived
+  };
+}
+
+function mfImageCollectorNormalizeAromaCategoryToken_(token) {
+  var raw = String(token || '').trim();
+  var map = {
+    '花系': ['花'],
+    '花': ['花'],
+    '果実系': ['果実'],
+    '果実': ['果実'],
+    'ベリー系': ['果実', 'ベリー'],
+    'ベリー': ['果実', 'ベリー'],
+    '柑橘系': ['柑橘'],
+    '柑橘': ['柑橘'],
+    'スパイス': ['スパイス'],
+    'ハーブ系': ['ハーブ'],
+    'ハーブ・清涼系': ['ハーブ'],
+    'ハーブ': ['ハーブ'],
+    'ミント': ['ハーブ', 'ミント'],
+    '甘香・菓子系': ['甘香・菓子'],
+    '甘香・菓子': ['甘香・菓子'],
+    'カカオ系': ['カカオ'],
+    'カカオ': ['カカオ'],
+    'キャラメル系': ['甘香・菓子', 'キャラメル'],
+    'キャラメル': ['甘香・菓子', 'キャラメル'],
+    'ナッツ系': ['ナッツ'],
+    'ナッツ': ['ナッツ'],
+    'モルト': ['モルト'],
+    'グリーン': ['植物・青葉'],
+    '植物・青葉': ['植物・青葉'],
+    'ウッディ': ['ウッディ'],
+    '樹脂・木質系': ['ウッディ'],
+    'アーシー': ['ウッディ']
+  };
+  return map[raw] || [];
+}
+
+function mfImageCollectorAromaCategoriesFromDetailTag_(token) {
+  var raw = String(token || '').trim();
+  if (!raw) return [];
+  if (/ベリー|ストロベリー|苺|いちご|イチゴ|ラズベリー|フランボワーズ|ブルーベリー|ブラックベリー|クランベリー|カシス/.test(raw)) return ['果実', 'ベリー'];
+  if (/ミント|ペパーミント|スペアミント/.test(raw)) return ['ハーブ', 'ミント'];
+  if (/キャラメル|カラメル|ブロンドキャラメル/.test(raw)) return ['甘香・菓子', 'キャラメル'];
+  if (/モルト|麦芽/.test(raw)) return ['モルト'];
+  if (/チョコレート|ショコラ|カカオ/.test(raw)) return ['カカオ'];
+  if (/木質|樹脂|杉|杉樹脂|森林|下草|土香|土|ウッディ/.test(raw)) return ['ウッディ'];
+  if (/植物香|青葉|若葉|竹|樹液|グリーン/.test(raw)) return ['植物・青葉'];
+  if (/ベルガモット|柑橘|シトラス|レモン|オレンジ|グレープフルーツ|マンダリン|ゆず|柚子/.test(raw)) return ['柑橘'];
+  if (/ジャスミン|ローズ|薔薇|バラ|花|フローラル|すみれ|スミレ|ラベンダー/.test(raw)) return ['花'];
+  return [];
+}
+
+function mfImageCollectorAromaCategoriesFromTrustedEvidenceText_(text) {
+  var raw = String(text || '').trim();
+  if (!raw) return [];
+  if (/モルト|麦芽|\bmalt(?:y|ed)?\b|malt[ée](?:e|es|s)?/i.test(raw)) return ['モルト'];
+  return [];
+}
+
+function mfImageCollectorCompactText_(text, maxLength) {
+  var compacted = String(text || '').replace(/\s+/g, ' ').trim();
+  var limit = maxLength || 180;
+  return compacted.length > limit ? compacted.slice(0, limit) : compacted;
+}
+
+function mfImageCollectorOrderedUniqueAromaCategories_(values) {
+  var order = mfImageCollectorAromaCategoryOrder_();
+  var unique = mfImageCollectorUnique_(values);
+  unique.sort(function(a, b) {
+    var ai = order.indexOf(a);
+    var bi = order.indexOf(b);
+    if (ai < 0) ai = order.length + 100;
+    if (bi < 0) bi = order.length + 100;
+    if (ai !== bi) return ai - bi;
+    return String(a).localeCompare(String(b), 'ja');
+  });
+  return unique;
+}
+
+function mfImageCollectorUnique_(values) {
+  var out = [];
+  for (var i = 0; i < values.length; i += 1) {
+    var value = String(values[i] || '').trim();
+    if (value && out.indexOf(value) < 0) out.push(value);
+  }
+  return out;
 }
 
 function mfImageCollectorUrlHasExactReference_(url, reference) {
