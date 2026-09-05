@@ -74,6 +74,9 @@ function parseArgs(argv) {
     writeStructuredReviewCandidates: false,
     taxonomyDryRun: false,
     statusJson: false,
+    targetName: '',
+    targetRef: '',
+    targetUrl: '',
     refs: null,
   };
   for (let i = 2; i < argv.length; i += 1) {
@@ -98,6 +101,12 @@ function parseArgs(argv) {
     else if (arg === '--write-structured-review-candidates') args.writeStructuredReviewCandidates = true;
     else if (arg === '--taxonomy-dry-run') args.taxonomyDryRun = true;
     else if (arg === '--status-json') args.statusJson = true;
+    else if (arg === '--target-name') args.targetName = argv[++i] || '';
+    else if (arg.startsWith('--target-name=')) args.targetName = arg.slice('--target-name='.length);
+    else if (arg === '--target-ref') args.targetRef = argv[++i] || '';
+    else if (arg.startsWith('--target-ref=')) args.targetRef = arg.slice('--target-ref='.length);
+    else if (arg === '--target-url') args.targetUrl = argv[++i] || '';
+    else if (arg.startsWith('--target-url=')) args.targetUrl = arg.slice('--target-url='.length);
     else if (arg === '--config') args.config = argv[++i];
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
     else if (arg === '--refs') args.refs = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
@@ -1606,6 +1615,13 @@ function productSearchQueries(product) {
   return [...new Set(queries.filter(Boolean))].slice(0, 4);
 }
 
+function targetedSearchQueries(input) {
+  return [...new Set([
+    normalizeText(input.reference),
+    normalizeSearchTerm(input.name),
+  ].filter(Boolean))].slice(0, 4);
+}
+
 function productSearchUrls(query) {
   const fr = new URL('https://www.mariagefreres.com/fr/catalogsearch/result/');
   fr.searchParams.set('q', query);
@@ -1645,6 +1661,351 @@ async function collectProductSearchCandidates(page) {
       }))
       .filter((entry) => entry.href);
   });
+}
+
+function normalizeTargetReference(value) {
+  const ref = normalizeText(value).toUpperCase();
+  return ref ? ref.match(/^T\d{2,6}$/)?.[0] || '' : '';
+}
+
+function targetedNameMatches(targetName, officialName) {
+  const target = normalizeNameForCompare(targetName);
+  const official = normalizeNameForCompare(officialName);
+  if (!target || !official) return false;
+  return official === target || official.includes(target) || target.includes(official);
+}
+
+function targetedExactNameMatches(targetName, officialName) {
+  const target = normalizeNameForCompare(targetName);
+  const official = normalizeNameForCompare(officialName);
+  return Boolean(target && official && target === official);
+}
+
+function targetedOfficialUrlByLanguage(pages) {
+  const urls = {};
+  for (const page of pages || []) {
+    if (!page.language || urls[page.language]) continue;
+    urls[page.language] = page.url;
+  }
+  return urls;
+}
+
+function targetedOfficialNamesByLanguage(pages) {
+  const names = {};
+  for (const page of pages || []) {
+    if (!page.language || !page.official_name || names[page.language]) continue;
+    names[page.language] = page.official_name;
+  }
+  return names;
+}
+
+function targetedDescriptionsByLanguage(pages) {
+  const descriptions = {};
+  for (const page of pages || []) {
+    const description = compactSnippet(page.facts?.productDescription || '', 1200);
+    if (!page.language || !description || descriptions[page.language]) continue;
+    descriptions[page.language] = description;
+  }
+  return descriptions;
+}
+
+function targetedCategoriesByLanguage(pages) {
+  const categories = {};
+  for (const page of pages || []) {
+    if (!page.language || !page.facts?.category || categories[page.language]) continue;
+    categories[page.language] = page.facts.category;
+  }
+  return categories;
+}
+
+function preferredTargetedPage(pages) {
+  const priority = { JP: 0, EN: 1, FR: 2 };
+  return [...(pages || [])].sort((a, b) => {
+    const left = priority[a.language] ?? 9;
+    const right = priority[b.language] ?? 9;
+    return left - right || a.url.localeCompare(b.url);
+  })[0] || null;
+}
+
+function targetedMasterMatches(reference, officialName, masterProducts) {
+  const exact = (masterProducts || [])
+    .filter((product) => String(product.reference || '').toUpperCase() === reference)
+    .map((product) => ({
+      reference: product.reference,
+      version_key: product.master?.versionKey || '',
+      name: product.name || '',
+      official_url: product.productUrl || '',
+      status: product.master?.['現行ステータス'] || '',
+    }));
+  return {
+    exact,
+    similar: findSimilarMasterCandidates(reference, officialName, masterProducts),
+  };
+}
+
+function mergeTargetedUnregisteredReview({ reference, pages, primaryPage, source, masterProducts }) {
+  const urlsByLanguage = targetedOfficialUrlByLanguage(pages);
+  const namesByLanguage = targetedOfficialNamesByLanguage(pages);
+  const descriptionsByLanguage = targetedDescriptionsByLanguage(pages);
+  const categoriesByLanguage = targetedCategoriesByLanguage(pages);
+  const candidate = buildUnregisteredReferenceReview({
+    reference,
+    facts: primaryPage.facts,
+    url: primaryPage.url,
+    source,
+    sourceLanguage: primaryPage.language,
+    discoverySource: 'targeted_search',
+    snippet: primaryPage.facts?.snippet || '',
+    masterProducts,
+  });
+  candidate.source_language = Object.keys(urlsByLanguage).join('+') || primaryPage.language;
+  candidate.fr_official_url = urlsByLanguage.FR || '';
+  candidate.en_official_url = urlsByLanguage.EN || '';
+  candidate.jp_official_url = urlsByLanguage.JP || '';
+  candidate.official_urls_by_language = urlsByLanguage;
+  candidate.official_names_by_language = namesByLanguage;
+  candidate.description_snippets_by_language = descriptionsByLanguage;
+  candidate.categories_by_language = categoriesByLanguage;
+  candidate.official_name_differences = Object.entries(namesByLanguage).map(([lang, name]) => `${lang}: ${name}`).join('\n');
+  candidate.description_excerpt = preferredDescriptionByLanguage(descriptionsByLanguage);
+  candidate.official_category = primaryPage.facts?.category || Object.values(categoriesByLanguage)[0] || '';
+  candidate.discovery_sources = pages.map((page) => ({
+    source: source.id,
+    source_type: source.source,
+    discovery_source: 'targeted_search',
+    language: page.language,
+    url: page.url,
+  }));
+  candidate.evidence = [
+    `discovery_source=targeted_search`,
+    `target_name=${source.target_name || ''}`,
+    `target_ref=${source.target_ref || ''}`,
+    `matched_urls=${pages.map((page) => page.url).join(',')}`,
+  ].join('; ');
+  candidate.detection_id = reviewCandidateKey(candidate);
+  return candidate;
+}
+
+async function inspectTargetedProductPage(page, url, input, config, debug, sourceUrl) {
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
+  await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
+  await sleep(config.settleDelayMs || 2500);
+
+  const facts = await collectDiscoveryPageFacts(page, url);
+  const finalUrl = facts.canonical || facts.url || page.url();
+  const combinedText = `${facts.url}\n${facts.canonical}\n${facts.title}\n${facts.h1}\n${facts.bodyText}`;
+  if (/cloudflare|verify you are human|vérifiez que vous êtes humain|just a moment/i.test(combinedText)) {
+    return { ok: false, url: finalUrl, reject_reason: 'browser_verification', source_url: sourceUrl };
+  }
+  if (!looksLikeProductUrl(finalUrl) && !looksLikeProductUrl(facts.url || '')) {
+    return { ok: false, url: finalUrl, reject_reason: 'not_product_page', source_url: sourceUrl };
+  }
+
+  const refs = [...new Set(extractVerifiedProductTeaReferences(combinedText, facts))];
+  if (input.reference && !refs.includes(input.reference)) {
+    return { ok: false, url: finalUrl, facts, refs, reject_reason: `target_ref_mismatch:${input.reference}`, source_url: sourceUrl };
+  }
+  if (!refs.length) {
+    return { ok: false, url: finalUrl, facts, refs, reject_reason: 'no_verified_reference', source_url: sourceUrl };
+  }
+  const officialName = facts.h1 || facts.title || '';
+  if (!targetedNameMatches(input.name, officialName)) {
+    return { ok: false, url: finalUrl, facts, refs, official_name: officialName, reject_reason: 'name_mismatch', source_url: sourceUrl };
+  }
+
+  const result = {
+    ok: true,
+    url: finalUrl,
+    source_url: sourceUrl,
+    language: sourceLanguageFromUrl(finalUrl) || sourceLanguageFromUrl(facts.url),
+    official_name: officialName,
+    refs,
+    exact_name_match: targetedExactNameMatches(input.name, officialName),
+    facts,
+  };
+  if (debug) console.log(`[target-verified] ${refs.join(',')} ${officialName} ${finalUrl}`);
+  return result;
+}
+
+function summarizeTargetedPage(page) {
+  return {
+    url: page.url,
+    source_url: page.source_url || '',
+    language: page.language,
+    official_name: page.official_name,
+    references: page.refs,
+    exact_name_match: page.exact_name_match,
+    h1: page.facts?.h1 || '',
+    category: page.facts?.category || '',
+    product_description: compactSnippet(page.facts?.productDescription || '', 500),
+  };
+}
+
+async function runTargetedTeaDiscovery({ context, config, master, baseDir, args }) {
+  const input = {
+    name: normalizeText(args.targetName),
+    reference: normalizeTargetReference(args.targetRef),
+    url: normalizeText(args.targetUrl),
+  };
+  if (!input.name) throw new Error('--target-name is required for targeted tea discovery.');
+  if (args.targetRef && !input.reference) throw new Error(`Invalid --target-ref: ${args.targetRef}`);
+  if (!args.connectCdp) throw new Error('--connect-cdp is required for targeted tea discovery.');
+
+  const page = await context.newPage();
+  const seenUrls = new Set();
+  const candidateUrls = [];
+  const rejected = [];
+  const source = {
+    id: 'targeted-tea-discovery',
+    source: 'targeted',
+    target_name: input.name,
+    target_ref: input.reference,
+  };
+
+  try {
+    if (input.url) {
+      candidateUrls.push({ url: input.url, source_url: 'target-url', priority: 0 });
+      seenUrls.add(input.url);
+    }
+
+    for (const query of targetedSearchQueries(input)) {
+      for (const searchUrl of productSearchUrls(query)) {
+        if (args.debug) console.log(`[target-search] query=${query} ${searchUrl}`);
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
+        await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
+        await sleep(config.settleDelayMs || 2500);
+        const title = await page.title().catch(() => '');
+        const bodyText = await page.locator('body').innerText({ timeout: 5000 });
+        if (/cloudflare|verify you are human|vérifiez que vous êtes humain|just a moment/i.test(`${title}\n${bodyText}`)) {
+          throw new Error('Targeted search is blocked by browser verification.');
+        }
+        for (const candidate of await collectProductSearchCandidates(page)) {
+          if (!looksLikeProductUrl(candidate.href)) continue;
+          if (seenUrls.has(candidate.href)) continue;
+          const text = `${candidate.text}\n${candidate.closestText}\n${candidate.href}`;
+          if (input.reference && !referenceRegex(input.reference).test(text)) continue;
+          if (!input.reference && !targetedNameMatches(input.name, text)) continue;
+          seenUrls.add(candidate.href);
+          candidateUrls.push({ url: candidate.href, source_url: searchUrl, priority: 1 });
+        }
+      }
+    }
+
+    const verifiedPages = [];
+    for (const item of candidateUrls.slice(0, 20)) {
+      const inspected = await inspectTargetedProductPage(page, item.url, input, config, args.debug, item.source_url);
+      if (inspected.ok) verifiedPages.push(inspected);
+      else rejected.push({
+        url: inspected.url || item.url,
+        source_url: item.source_url,
+        references: inspected.refs || [],
+        official_name: inspected.official_name || inspected.facts?.h1 || '',
+        reject_reason: inspected.reject_reason,
+      });
+    }
+
+    const pagesByReference = new Map();
+    for (const verified of verifiedPages) {
+      const refs = input.reference ? [input.reference] : verified.refs;
+      for (const ref of refs) {
+        if (!pagesByReference.has(ref)) pagesByReference.set(ref, []);
+        pagesByReference.get(ref).push(verified);
+      }
+    }
+
+    const referenceGroups = [...pagesByReference.entries()].map(([reference, pages]) => ({
+      reference,
+      pages,
+      exact_name_pages: pages.filter((item) => item.exact_name_match).length,
+    }));
+    const preferredGroups = input.reference
+      ? referenceGroups.filter((group) => group.reference === input.reference)
+      : referenceGroups.filter((group) => group.exact_name_pages > 0);
+    const resolvableGroups = preferredGroups.length ? preferredGroups : referenceGroups;
+
+    if (resolvableGroups.length !== 1) {
+      const result = {
+        ok: true,
+        mode: 'targeted_tea_discovery',
+        resolved: false,
+        reason: resolvableGroups.length ? 'ambiguous_candidates' : 'no_verified_product',
+        target_input: input,
+        candidate_urls: candidateUrls.map((item) => item.url),
+        matched_product_pages: verifiedPages.map(summarizeTargetedPage),
+        rejected_candidates: rejected,
+        write_back: { attempted: false, reason: 'target was not uniquely resolved' },
+      };
+      console.log(JSON.stringify(result, null, 2));
+      return result;
+    }
+
+    const resolved = resolvableGroups[0];
+    const primaryPage = preferredTargetedPage(resolved.pages);
+    const masterMatches = targetedMasterMatches(resolved.reference, primaryPage.official_name, master?.products || []);
+    const existingMaster = masterMatches.exact.length > 0;
+    const vocabulary = structuredFactVocabulary(master?.products || []);
+    const structuredProduct = productForStructuredFacts(resolved.reference, master?.products || [], primaryPage.facts);
+    const structured = structuredFactReviewCandidatesForProduct({ product: structuredProduct, facts: primaryPage.facts, vocabulary });
+    const structuredCandidates = existingMaster
+      ? structured.reviewCandidates.filter((candidate) => hasValue(candidate.target_version_key))
+      : [];
+    const reviewCandidates = [];
+    let unregisteredReview = null;
+    if (!existingMaster) {
+      unregisteredReview = mergeTargetedUnregisteredReview({
+        reference: resolved.reference,
+        pages: resolved.pages,
+        primaryPage,
+        source,
+        masterProducts: master?.products || [],
+      });
+      reviewCandidates.push(unregisteredReview);
+    } else {
+      reviewCandidates.push(...structuredCandidates);
+    }
+
+    let writeBackResults = [];
+    if (args.writeBack === true && reviewCandidates.length) {
+      writeBackResults = await writeBackReviewCandidates({ config, baseDir, candidates: reviewCandidates, debug: args.debug });
+    }
+
+    const result = {
+      ok: true,
+      mode: 'targeted_tea_discovery',
+      resolved: true,
+      target_input: input,
+      resolved_reference: resolved.reference,
+      official_name: primaryPage.official_name,
+      source_language: primaryPage.language,
+      fr_official_url: targetedOfficialUrlByLanguage(resolved.pages).FR || '',
+      en_official_url: targetedOfficialUrlByLanguage(resolved.pages).EN || '',
+      jp_official_url: targetedOfficialUrlByLanguage(resolved.pages).JP || '',
+      matched_product_pages: resolved.pages.map(summarizeTargetedPage),
+      master_existing_match: masterMatches.exact,
+      similar_candidates: masterMatches.similar,
+      unregistered: !existingMaster,
+      structured_suggestions: structured.officialStructuredFacts?.structured_review_suggestions || [],
+      review_candidates_would_create: reviewCandidates.map((candidate) => ({
+        detection_id: candidate.detection_id,
+        detection_type: candidate.detection_type,
+        reference: candidate.reference,
+        official_name: candidate.official_name,
+        target_version_key: candidate.target_version_key || '',
+        target_column: candidate.target_column || '',
+        suggested_value: candidate.suggested_value || '',
+      })),
+      write_back: {
+        attempted: args.writeBack === true,
+        results: writeBackResults,
+      },
+      rejected_candidates: rejected,
+      dry_run: args.writeBack !== true,
+    };
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  } finally {
+    await page.close().catch(() => {});
+  }
 }
 
 async function discoverProductPageUrl(context, product, config, debug, discoveryCache = null, masterReferences = new Set()) {
@@ -3412,10 +3773,18 @@ async function main() {
   const baseDir = process.cwd();
   const configPath = resolveProjectPath(baseDir, args.config);
   const fallbackConfigPath = path.join(baseDir, 'collector', 'config.example.json');
-  const config = readJson(configPath, readJson(fallbackConfigPath, args.taxonomyDryRun ? {} : null));
+  const configlessMode = args.taxonomyDryRun || hasValue(args.targetName) || hasValue(args.targetRef) || hasValue(args.targetUrl);
+  const config = readJson(configPath, readJson(fallbackConfigPath, configlessMode ? {} : null));
   if (!config) throw new Error(`Config not found: ${configPath}`);
   if (args.writeBack !== null) {
     config.writeBack = { ...(config.writeBack || {}), enabled: args.writeBack };
+  }
+  const targetedDiscoveryRequested = hasValue(args.targetName) || hasValue(args.targetRef) || hasValue(args.targetUrl);
+  if ((hasValue(args.targetRef) || hasValue(args.targetUrl)) && !hasValue(args.targetName)) {
+    throw new Error('--target-name is required when using --target-ref or --target-url.');
+  }
+  if (targetedDiscoveryRequested && !args.connectCdp) {
+    throw new Error('--connect-cdp is required for targeted tea discovery.');
   }
 
   const paths = {
@@ -3446,7 +3815,7 @@ async function main() {
       console.log(JSON.stringify(taxonomyDryRun(master?.products || config.products || [], args.refs), null, 2));
       return;
     }
-  if (!args.statusJson && !args.dryRun) {
+  if (!targetedDiscoveryRequested && !args.statusJson && !args.dryRun) {
     await normalizeNotFoundProductUrlWriteBacks({ config, baseDir, state, master, debug: args.debug });
   }
   const products = selectProducts(config, state, args.refs, master?.products || null);
@@ -3457,16 +3826,16 @@ async function main() {
     return;
   }
 
-  if (!args.discoverNewReferences && !args.backfillOfficialDescriptions && products.length === 0) {
+  if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && products.length === 0) {
     console.log('No pending products selected.');
     return;
   }
 
-  if (!args.discoverNewReferences && !args.backfillOfficialDescriptions) {
+  if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions) {
     console.log(`Selected ${products.length} product(s)${master ? ` from master rows=${master.rowCount}` : ' from config'}.`);
   }
 
-  if (args.dryRun && !args.discoverNewReferences && !args.backfillOfficialDescriptions) {
+  if (args.dryRun && !targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions) {
     for (const product of products) {
       console.log(JSON.stringify({
         reference: product.reference,
@@ -3526,6 +3895,11 @@ async function main() {
 
     if (args.authSetup) {
       await runAuthSetup({ context, products, config, debug: args.debug });
+      return;
+    }
+
+    if (targetedDiscoveryRequested) {
+      await runTargetedTeaDiscovery({ context, config, master, baseDir, args });
       return;
     }
 
