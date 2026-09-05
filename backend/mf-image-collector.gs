@@ -354,49 +354,51 @@ function mfImageCollectorShowReviewDialog() {
 }
 
 function mfImageCollectorTargetRequestHtml_() {
-  return `<!doctype html><html><head><base target="_top"><style>
-body{font-family:Arial,"Noto Sans JP",sans-serif;margin:0;padding:18px;color:#202124}
-.note{background:#f8f5ef;border:1px solid #e5dccd;border-radius:6px;padding:10px 12px;margin-bottom:14px;line-height:1.55}
-label{display:block;font-weight:700;margin:12px 0 6px}
-input{box-sizing:border-box;width:100%;padding:9px 10px;border:1px solid #c9c2b8;border-radius:4px;font-size:14px}
-.actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
-button{border:1px solid #8b7358;background:#fff;padding:8px 12px;border-radius:4px;cursor:pointer}
-button.primary{background:#4b3a2a;color:#fff;border-color:#4b3a2a}
-#message{margin-top:12px;white-space:pre-wrap}
-</style></head><body>
-<div class="note">この操作では銘柄マスターへ直接追加しません。次回collector実行時に公式サイトを調査し、確認できた場合は変更候補レビューへ送ります。</div>
-<label for="target_name">銘柄名 <span style="color:#b3261e">*</span></label>
-<input id="target_name" autocomplete="off" placeholder="例: KUKICHA">
-<label for="target_ref">REF</label>
-<input id="target_ref" autocomplete="off" placeholder="例: T662 / TFG9965 / TJ9JA">
-<label for="target_url">公式商品URL</label>
-<input id="target_url" autocomplete="off" placeholder="https://www.mariagefreres.com/en/...">
-<div class="actions">
-  <button onclick="google.script.host.close()">キャンセル</button>
-  <button class="primary" id="submit" onclick="submitRequest()">調査キューに追加</button>
-</div>
-<div id="message"></div>
-<script>
-function value(id){return document.getElementById(id).value.trim();}
-function submitRequest(){
-  var button=document.getElementById('submit');
-  var message=document.getElementById('message');
-  var payload={target_name:value('target_name'),target_ref:value('target_ref'),target_url:value('target_url')};
-  if(!payload.target_name){message.textContent='銘柄名を入力してください。';return;}
-  button.disabled=true;
-  message.textContent='登録中...';
-  google.script.run
-    .withSuccessHandler(function(result){
-      if(!result || result.ok===false){message.textContent=(result && result.error) || '登録に失敗しました。';button.disabled=false;return;}
-      message.textContent=(result.message || '調査キューに追加しました。') + '\\nrequest_id: ' + (result.request_id || '');
-    })
-    .withFailureHandler(function(error){
-      message.textContent='エラー: ' + (error && error.message ? error.message : error);
-      button.disabled=false;
-    })
-    .mfImageCollectorCreateTargetDiscoveryRequest(payload);
-}
-</script></body></html>`;
+  return [
+    '<!doctype html><html><head><base target="_top"><style>',
+    'body{font-family:Arial,"Noto Sans JP",sans-serif;margin:0;padding:18px;color:#202124}',
+    '.note{background:#f8f5ef;border:1px solid #e5dccd;border-radius:6px;padding:10px 12px;margin-bottom:14px;line-height:1.55}',
+    'label{display:block;font-weight:700;margin:12px 0 6px}',
+    'input{box-sizing:border-box;width:100%;padding:9px 10px;border:1px solid #c9c2b8;border-radius:4px;font-size:14px}',
+    '.actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}',
+    'button{border:1px solid #8b7358;background:#fff;padding:8px 12px;border-radius:4px;cursor:pointer}',
+    'button.primary{background:#4b3a2a;color:#fff;border-color:#4b3a2a}',
+    '#message{margin-top:12px;white-space:pre-wrap}',
+    '</style></head><body>',
+    '<div class="note">この操作では銘柄マスターへ直接追加しません。次回collector実行時に公式サイトを調査し、確認できた場合は変更候補レビューへ送ります。</div>',
+    '<label for="target_name">銘柄名 <span style="color:#b3261e">*</span></label>',
+    '<input id="target_name" autocomplete="off" placeholder="例: KUKICHA">',
+    '<label for="target_ref">REF</label>',
+    '<input id="target_ref" autocomplete="off" placeholder="例: T662 / TFG9965 / TJ9JA">',
+    '<label for="target_url">公式商品URL</label>',
+    '<input id="target_url" autocomplete="off" placeholder="https://www.mariagefreres.com/en/...">',
+    '<div class="actions">',
+    '  <button onclick="google.script.host.close()">キャンセル</button>',
+    '  <button class="primary" id="submit" onclick="submitRequest()">調査キューに追加</button>',
+    '</div>',
+    '<div id="message"></div>',
+    '<script>',
+    'function value(id){return document.getElementById(id).value.trim();}',
+    'function submitRequest(){',
+    "  var button=document.getElementById('submit');",
+    "  var message=document.getElementById('message');",
+    "  var payload={target_name:value('target_name'),target_ref:value('target_ref'),target_url:value('target_url')};",
+    "  if(!payload.target_name){message.textContent='銘柄名を入力してください。';return;}",
+    '  button.disabled=true;',
+    "  message.textContent='登録中...';",
+    '  google.script.run',
+    '    .withSuccessHandler(function(result){',
+    "      if(!result || result.ok===false){message.textContent=(result && result.error) || '登録に失敗しました。';button.disabled=false;return;}",
+    "      message.textContent=(result.message || '調査キューに追加しました。') + '\\nrequest_id: ' + (result.request_id || '');",
+    '    })',
+    '    .withFailureHandler(function(error){',
+    "      message.textContent='エラー: ' + (error && error.message ? error.message : error);",
+    '      button.disabled=false;',
+    '    })',
+    '    .mfImageCollectorCreateTargetDiscoveryRequest(payload);',
+    '}',
+    '</script></body></html>'
+  ].join('\n');
 }
 
 function mfImageCollectorShowTargetRequestDialog() {
