@@ -3203,6 +3203,171 @@ async function writeBackReviewCandidates({ config, baseDir, candidates, debug })
   return results;
 }
 
+async function claimTargetDiscoveryRequest({ config, baseDir, debug }) {
+  const settings = getWriteBackSettings(config, baseDir);
+  if (!settings) return null;
+
+  const url = new URL(settings.gasApiUrl);
+  url.searchParams.set('action', 'getTargetDiscoveryRequest');
+  url.searchParams.set('secret', settings.secret);
+  if (debug) {
+    const redacted = new URL(url.href);
+    redacted.searchParams.set('secret', '(redacted)');
+    console.log(`[target-queue] claim ${redacted.href}`);
+  }
+
+  const response = await fetch(url.href);
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(formatWriteBackResponseError('Target queue claim did not return JSON', settings, response, text));
+  }
+  if (!response.ok || data.ok === false) {
+    throw new Error(formatWriteBackResponseError(`Target queue claim failed: ${data.error || responsePreview(text)}`, settings, response, text));
+  }
+  return data.request || null;
+}
+
+async function completeTargetDiscoveryRequest({ config, baseDir, requestId, status, resultReference, resultName, message, debug }) {
+  const settings = getWriteBackSettings(config, baseDir);
+  if (!settings) return null;
+  const payload = {
+    action: 'completeTargetDiscoveryRequest',
+    secret: settings.secret,
+    request_id: requestId,
+    status,
+    result_reference: resultReference || '',
+    result_name: resultName || '',
+    result_status: status,
+    message: responsePreview(message, 1800),
+  };
+  if (debug) console.log(`[target-queue] complete request=${requestId} status=${status}`);
+
+  const response = await fetch(settings.gasApiUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+    body: JSON.stringify(payload),
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(formatWriteBackResponseError('Target queue completion did not return JSON', settings, response, text));
+  }
+  if (!response.ok || data.ok === false) {
+    throw new Error(formatWriteBackResponseError(`Target queue completion failed: ${data.error || responsePreview(text)}`, settings, response, text));
+  }
+  return data;
+}
+
+function targetQueueCompletionFromResult(result, error = null) {
+  if (error) {
+    return {
+      status: 'error',
+      resultReference: '',
+      resultName: '',
+      message: error.message || String(error),
+    };
+  }
+  if (!result || result.ok === false) {
+    return {
+      status: 'error',
+      resultReference: '',
+      resultName: '',
+      message: result?.error || 'targeted discovery failed',
+    };
+  }
+  if (!result.resolved) {
+    const ambiguous = result.reason === 'ambiguous_candidates';
+    return {
+      status: ambiguous ? 'ambiguous' : 'not_found',
+      resultReference: '',
+      resultName: '',
+      message: result.reason || 'target was not resolved',
+    };
+  }
+  const failures = (result.write_back?.results || []).filter((row) => row && row.success === false);
+  if (result.unregistered && result.write_back?.attempted === true && failures.length) {
+    return {
+      status: 'error',
+      resultReference: result.resolved_reference || '',
+      resultName: result.official_name || '',
+      message: failures.map((row) => row.error_message || row.detection_id || 'write-back failed').join(' | '),
+    };
+  }
+  if (result.unregistered && result.write_back?.attempted !== true) {
+    return {
+      status: 'error',
+      resultReference: result.resolved_reference || '',
+      resultName: result.official_name || '',
+      message: 'targeted discovery resolved an unregistered reference, but review write-back was not attempted',
+    };
+  }
+  return {
+    status: 'completed',
+    resultReference: result.resolved_reference || '',
+    resultName: result.official_name || '',
+    message: result.unregistered ? '変更候補レビューへ送信しました。' : '既存Master銘柄です。',
+  };
+}
+
+async function processTargetDiscoveryQueueRequest({ context, config, master, baseDir, args, request }) {
+  if (!request) return null;
+  const queueArgs = {
+    ...args,
+    targetName: request.target_name || '',
+    targetRef: request.target_ref || '',
+    targetUrl: request.target_url || '',
+    writeBack: true,
+  };
+  let result = null;
+  let completion;
+  try {
+    console.log(JSON.stringify({
+      target_queue: 'processing',
+      request_id: request.request_id,
+      target_name: request.target_name || '',
+      target_ref: request.target_ref || '',
+      target_url: request.target_url || '',
+    }));
+    result = await runTargetedTeaDiscovery({ context, config, master, baseDir, args: queueArgs });
+    completion = targetQueueCompletionFromResult(result);
+  } catch (error) {
+    completion = targetQueueCompletionFromResult(null, error);
+  }
+
+  try {
+    await completeTargetDiscoveryRequest({
+      config,
+      baseDir,
+      requestId: request.request_id,
+      status: completion.status,
+      resultReference: completion.resultReference,
+      resultName: completion.resultName,
+      message: completion.message,
+      debug: args.debug,
+    });
+  } catch (error) {
+    console.log(JSON.stringify({
+      target_queue: 'completion_failed',
+      request_id: request.request_id,
+      error: error.message,
+    }));
+  }
+  console.log(JSON.stringify({
+    target_queue: 'completed',
+    request_id: request.request_id,
+    status: completion.status,
+    result_reference: completion.resultReference,
+    result_name: completion.resultName,
+    message: completion.message,
+  }));
+  return { result, completion };
+}
+
 function reviewCandidateReadyForWriteBack(candidate) {
   if (candidate?.detection_type === 'sales_sku_detected') {
     return hasValue(candidate.existing_reference);
@@ -4303,6 +4468,14 @@ async function main() {
     await normalizeNotFoundProductUrlWriteBacks({ config, baseDir, state, master, debug: args.debug });
   }
   const products = selectProducts(config, state, args.refs, master?.products || null);
+  const normalCollectorMode = !targetedDiscoveryRequested &&
+    !args.discoverNewReferences &&
+    !args.backfillOfficialDescriptions &&
+    !args.enrichIncompleteRecords &&
+    !args.statusJson &&
+    !args.dryRun &&
+    !args.authSetup;
+  let targetQueueRequest = null;
   const masterReferences = new Set((master?.products || config.products || []).flatMap((product) => [
     product.reference,
     product.tReference,
@@ -4314,7 +4487,7 @@ async function main() {
     return;
   }
 
-  if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords && products.length === 0) {
+  if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords && products.length === 0 && !(normalCollectorMode && args.connectCdp && writeBackRequired(config))) {
     console.log('No pending products selected.');
     return;
   }
@@ -4386,9 +4559,37 @@ async function main() {
       return;
     }
 
+    if (normalCollectorMode && args.connectCdp && writeBackRequired(config)) {
+      try {
+        targetQueueRequest = await claimTargetDiscoveryRequest({ config, baseDir, debug: args.debug });
+        if (targetQueueRequest) {
+          console.log(JSON.stringify({
+            target_queue: 'claimed',
+            request_id: targetQueueRequest.request_id,
+            target_name: targetQueueRequest.target_name || '',
+            target_ref: targetQueueRequest.target_ref || '',
+          }));
+        }
+      } catch (error) {
+        console.log(JSON.stringify({
+          target_queue: 'claim_failed',
+          error: error.message,
+        }));
+      }
+    }
+
+    if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords && products.length === 0 && !targetQueueRequest) {
+      console.log('No pending products selected.');
+      return;
+    }
+
     if (targetedDiscoveryRequested) {
       await runTargetedTeaDiscovery({ context, config, master, baseDir, args });
       return;
+    }
+
+    if (targetQueueRequest) {
+      await processTargetDiscoveryQueueRequest({ context, config, master, baseDir, args, request: targetQueueRequest });
     }
 
     if (args.backfillOfficialDescriptions) {

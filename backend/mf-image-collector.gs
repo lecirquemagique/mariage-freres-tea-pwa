@@ -10,6 +10,7 @@ var MF_IMAGE_COLLECTOR_FOLDER_ID = '192M8W9aopop-k0H_xHMJBWkEVy3fK4eX';
 var MF_IMAGE_COLLECTOR_SHEET_NAME = '銘柄マスター';
 var MF_IMAGE_COLLECTOR_REVIEW_SHEET_NAME = '変更候補レビュー';
 var MF_IMAGE_COLLECTOR_TAXONOMY_LOG_SHEET_NAME = '分類変更履歴';
+var MF_IMAGE_COLLECTOR_TARGET_QUEUE_SHEET_NAME = '銘柄指定調査キュー';
 var MF_IMAGE_COLLECTOR_SECRET_PROPERTY = 'MF_COLLECTOR_WRITE_SECRET';
 var MF_IMAGE_COLLECTOR_REVIEW_HEADERS = [
   '検出ID',
@@ -75,6 +76,21 @@ var MF_IMAGE_COLLECTOR_TAXONOMY_LOG_HEADERS = [
   'after',
   'reason'
 ];
+var MF_IMAGE_COLLECTOR_TARGET_QUEUE_HEADERS = [
+  'request_id',
+  'created_at',
+  'target_name',
+  'target_ref',
+  'target_url',
+  'status',
+  'started_at',
+  'completed_at',
+  'result_reference',
+  'result_name',
+  'result_status',
+  'message'
+];
+var MF_IMAGE_COLLECTOR_TARGET_QUEUE_STATUSES = ['pending', 'processing', 'completed', 'not_found', 'ambiguous', 'error'];
 
 function doPost(e) {
   return mfImageCollectorDoPost(e);
@@ -94,6 +110,10 @@ function mfImageCollectorDoGet(e) {
     var action = String(params.action || 'teaData');
     if (action === 'teaData') {
       return mfImageCollectorJsonOrJsonp_(mfImageCollectorGetTeaData_(), params.callback);
+    }
+    if (action === 'getTargetDiscoveryRequest') {
+      mfImageCollectorAssertSecret_(params);
+      return mfImageCollectorJsonOrJsonp_(mfImageCollectorGetTargetDiscoveryRequest_(params), params.callback);
     }
     return mfImageCollectorJsonOrJsonp_({ ok: false, error: 'Unsupported action.' }, params.callback);
   } catch (error) {
@@ -148,6 +168,10 @@ function mfImageCollectorDoPost(e) {
         ok: true,
         items: mfImageCollectorGetReviewItems(String(payload.status || '要確認'))
       });
+    }
+    if (payload.action === 'completeTargetDiscoveryRequest') {
+      mfImageCollectorAssertSecret_(payload);
+      return mfImageCollectorJson_(mfImageCollectorCompleteTargetDiscoveryRequest_(payload));
     }
     return mfImageCollectorJson_({ ok: false, error: 'Unsupported action.' });
   } catch (error) {
@@ -304,6 +328,9 @@ function mfImageCollectorOnOpen(e) {
     .addItem('変更レビュー', 'mfImageCollectorShowReviewDialog')
     .addItem('要確認件数を表示', 'mfImageCollectorShowReviewSummary')
     .addItem('レビュー更新', 'mfImageCollectorRefreshReviewSheet')
+    .addSeparator()
+    .addItem('銘柄指定で追加候補を作成', 'mfImageCollectorShowTargetRequestDialog')
+    .addItem('銘柄指定調査キューを開く', 'mfImageCollectorOpenTargetRequestQueue')
     .addItem('分類整理 dry-run', 'mfImageCollectorShowTaxonomyDryRun')
     .addItem('分類整理を反映', 'mfImageCollectorShowTaxonomyApplyConfirm')
     .addItem('分類整理を元に戻す', 'mfImageCollectorShowTaxonomyRollbackConfirm')
@@ -324,6 +351,105 @@ function mfImageCollectorShowReviewDialog() {
     .setWidth(820)
     .setHeight(720);
   SpreadsheetApp.getUi().showModalDialog(html, 'MARIAGE FRÈRES 変更レビュー');
+}
+
+function mfImageCollectorTargetRequestHtml_() {
+  return `<!doctype html><html><head><base target="_top"><style>
+body{font-family:Arial,"Noto Sans JP",sans-serif;margin:0;padding:18px;color:#202124}
+.note{background:#f8f5ef;border:1px solid #e5dccd;border-radius:6px;padding:10px 12px;margin-bottom:14px;line-height:1.55}
+label{display:block;font-weight:700;margin:12px 0 6px}
+input{box-sizing:border-box;width:100%;padding:9px 10px;border:1px solid #c9c2b8;border-radius:4px;font-size:14px}
+.actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
+button{border:1px solid #8b7358;background:#fff;padding:8px 12px;border-radius:4px;cursor:pointer}
+button.primary{background:#4b3a2a;color:#fff;border-color:#4b3a2a}
+#message{margin-top:12px;white-space:pre-wrap}
+</style></head><body>
+<div class="note">この操作では銘柄マスターへ直接追加しません。次回collector実行時に公式サイトを調査し、確認できた場合は変更候補レビューへ送ります。</div>
+<label for="target_name">銘柄名 <span style="color:#b3261e">*</span></label>
+<input id="target_name" autocomplete="off" placeholder="例: KUKICHA">
+<label for="target_ref">REF</label>
+<input id="target_ref" autocomplete="off" placeholder="例: T662 / TFG9965 / TJ9JA">
+<label for="target_url">公式商品URL</label>
+<input id="target_url" autocomplete="off" placeholder="https://www.mariagefreres.com/en/...">
+<div class="actions">
+  <button onclick="google.script.host.close()">キャンセル</button>
+  <button class="primary" id="submit" onclick="submitRequest()">調査キューに追加</button>
+</div>
+<div id="message"></div>
+<script>
+function value(id){return document.getElementById(id).value.trim();}
+function submitRequest(){
+  var button=document.getElementById('submit');
+  var message=document.getElementById('message');
+  var payload={target_name:value('target_name'),target_ref:value('target_ref'),target_url:value('target_url')};
+  if(!payload.target_name){message.textContent='銘柄名を入力してください。';return;}
+  button.disabled=true;
+  message.textContent='登録中...';
+  google.script.run
+    .withSuccessHandler(function(result){
+      if(!result || result.ok===false){message.textContent=(result && result.error) || '登録に失敗しました。';button.disabled=false;return;}
+      message.textContent=(result.message || '調査キューに追加しました。') + '\\nrequest_id: ' + (result.request_id || '');
+    })
+    .withFailureHandler(function(error){
+      message.textContent='エラー: ' + (error && error.message ? error.message : error);
+      button.disabled=false;
+    })
+    .mfImageCollectorCreateTargetDiscoveryRequest(payload);
+}
+</script></body></html>`;
+}
+
+function mfImageCollectorShowTargetRequestDialog() {
+  var html = HtmlService.createHtmlOutput(mfImageCollectorTargetRequestHtml_())
+    .setWidth(520)
+    .setHeight(430);
+  SpreadsheetApp.getUi().showModalDialog(html, '銘柄指定で追加候補を作成');
+}
+
+function mfImageCollectorOpenTargetRequestQueue() {
+  var sheet = mfImageCollectorGetOrCreateTargetQueueSheet_();
+  SpreadsheetApp.setActiveSheet(sheet);
+}
+
+function mfImageCollectorCreateTargetDiscoveryRequest(form) {
+  var input = mfImageCollectorNormalizeTargetRequestInput_(form || {});
+  if (!input.target_name) throw new Error('銘柄名は必須です。');
+
+  var sheet = mfImageCollectorGetOrCreateTargetQueueSheet_();
+  var headers = mfImageCollectorSheetHeaders_(sheet);
+  var duplicate = mfImageCollectorFindOpenTargetQueueRow_(sheet, headers, input);
+  if (duplicate.row_number > 0) {
+    return {
+      ok: true,
+      duplicate: true,
+      request_id: duplicate.request.request_id,
+      message: 'すでに調査待ちです。'
+    };
+  }
+
+  var requestId = mfImageCollectorTargetRequestId_(input);
+  var row = {
+    request_id: requestId,
+    created_at: new Date(),
+    target_name: input.target_name,
+    target_ref: input.target_ref,
+    target_url: input.target_url,
+    status: 'pending',
+    started_at: '',
+    completed_at: '',
+    result_reference: '',
+    result_name: '',
+    result_status: '',
+    message: ''
+  };
+  sheet.appendRow(MF_IMAGE_COLLECTOR_TARGET_QUEUE_HEADERS.map(function(header) { return row[header] || ''; }));
+  mfImageCollectorApplyTargetQueueValidation_(sheet);
+  return {
+    ok: true,
+    duplicate: false,
+    request_id: requestId,
+    message: '調査キューに追加しました。次回collector実行時に調査します。'
+  };
 }
 
 function mfImageCollectorShowTaxonomyDryRun() {
@@ -576,6 +702,13 @@ function mfImageCollectorGetTeaData_() {
   return { ok: true, rows: rows, updatedAt: new Date().toISOString() };
 }
 
+function mfImageCollectorSheetHeaders_(sheet) {
+  if (!sheet || sheet.getLastColumn() < 1) return [];
+  return sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(value) {
+    return String(value).trim();
+  });
+}
+
 function mfImageCollectorGetOrCreateReviewSheet_() {
   var ss = mfImageCollectorOpenSpreadsheet_();
   var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_REVIEW_SHEET_NAME);
@@ -598,6 +731,207 @@ function mfImageCollectorGetOrCreateReviewSheet_() {
   }
   mfImageCollectorApplyReviewValidation_(sheet);
   return sheet;
+}
+
+function mfImageCollectorGetOrCreateTargetQueueSheet_() {
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_TARGET_QUEUE_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(MF_IMAGE_COLLECTOR_TARGET_QUEUE_SHEET_NAME);
+    sheet.getRange(1, 1, 1, MF_IMAGE_COLLECTOR_TARGET_QUEUE_HEADERS.length).setValues([MF_IMAGE_COLLECTOR_TARGET_QUEUE_HEADERS]);
+    sheet.setFrozenRows(1);
+  } else {
+    var headers = mfImageCollectorSheetHeaders_(sheet);
+    for (var i = 0; i < MF_IMAGE_COLLECTOR_TARGET_QUEUE_HEADERS.length; i += 1) {
+      if (headers.indexOf(MF_IMAGE_COLLECTOR_TARGET_QUEUE_HEADERS[i]) < 0) {
+        var lastColumn = Math.max(sheet.getLastColumn(), 1);
+        sheet.insertColumnAfter(lastColumn);
+        sheet.getRange(1, lastColumn + 1).setValue(MF_IMAGE_COLLECTOR_TARGET_QUEUE_HEADERS[i]);
+        headers.push(MF_IMAGE_COLLECTOR_TARGET_QUEUE_HEADERS[i]);
+      }
+    }
+  }
+  mfImageCollectorApplyTargetQueueValidation_(sheet);
+  return sheet;
+}
+
+function mfImageCollectorApplyTargetQueueValidation_(sheet) {
+  var headers = mfImageCollectorSheetHeaders_(sheet);
+  var statusCol = headers.indexOf('status') + 1;
+  if (statusCol < 1) return;
+  var maxRows = Math.max(sheet.getMaxRows() - 1, 1);
+  sheet.getRange(2, statusCol, maxRows, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation()
+      .requireValueInList(MF_IMAGE_COLLECTOR_TARGET_QUEUE_STATUSES, true)
+      .setAllowInvalid(false)
+      .build()
+  );
+}
+
+function mfImageCollectorQueueRowToObject_(headers, rowValues) {
+  var row = {};
+  for (var i = 0; i < headers.length; i += 1) {
+    row[headers[i]] = mfImageCollectorClientValue_(rowValues[i]);
+  }
+  return row;
+}
+
+function mfImageCollectorNormalizeTargetRequestName_(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .replace(/[®™]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+}
+
+function mfImageCollectorNormalizeTargetRequestRef_(value) {
+  var ref = String(value || '').normalize('NFKC').trim().toUpperCase().replace(/\s+/g, '');
+  if (!ref) return '';
+  if (/^T\d+$/.test(ref)) return ref;
+  if (/^(TFG|TJC|TB|TC|TE|TF|TP|TA)\d+$/.test(ref)) return ref;
+  if (/^TJ[A-Z0-9]+$/.test(ref)) return ref;
+  throw new Error('REFの形式が不正です: ' + ref);
+}
+
+function mfImageCollectorNormalizeTargetRequestUrl_(value) {
+  var url = String(value || '').trim();
+  if (!url) return '';
+  var match = url.match(/^https:\/\/([^\/?#]+)(\/[^?#]*)/i);
+  if (!match) throw new Error('公式商品URLの形式が不正です。');
+  var host = String(match[1] || '').toLowerCase();
+  var path = String(match[2] || '');
+  var allowed = (
+    (host === 'www.mariagefreres.com' && /^\/(en|fr)\//.test(path) && /\.html$/i.test(path)) ||
+    (host === 'www.mariagefreres.co.jp' && /^\/view\/item\//.test(path))
+  );
+  if (!allowed) throw new Error('公式商品URLは mariagefreres.com または mariagefreres.co.jp の商品ページだけ指定できます。');
+  return url;
+}
+
+function mfImageCollectorNormalizeTargetRequestInput_(input) {
+  return {
+    target_name: String(input.target_name || input.targetName || '').normalize('NFKC').replace(/\s+/g, ' ').trim(),
+    target_ref: mfImageCollectorNormalizeTargetRequestRef_(input.target_ref || input.targetRef || ''),
+    target_url: mfImageCollectorNormalizeTargetRequestUrl_(input.target_url || input.targetUrl || '')
+  };
+}
+
+function mfImageCollectorTargetRequestIdentity_(input) {
+  if (input.target_ref) return 'ref:' + input.target_ref;
+  return 'name:' + mfImageCollectorNormalizeTargetRequestName_(input.target_name);
+}
+
+function mfImageCollectorFindOpenTargetQueueRow_(sheet, headers, input) {
+  var identity = mfImageCollectorTargetRequestIdentity_(input);
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { row_number: 0, request: null };
+  var values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  for (var i = 0; i < values.length; i += 1) {
+    var request = mfImageCollectorQueueRowToObject_(headers, values[i]);
+    var status = String(request.status || '').trim();
+    if (status !== 'pending' && status !== 'processing') continue;
+    var rowInput = {
+      target_name: request.target_name || '',
+      target_ref: request.target_ref || '',
+      target_url: request.target_url || ''
+    };
+    if (mfImageCollectorTargetRequestIdentity_(rowInput) === identity) {
+      return { row_number: i + 2, request: request };
+    }
+  }
+  return { row_number: 0, request: null };
+}
+
+function mfImageCollectorTargetRequestId_(input) {
+  var raw = [
+    new Date().toISOString(),
+    mfImageCollectorTargetRequestIdentity_(input),
+    input.target_url || '',
+    Math.random()
+  ].join('|');
+  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_1, raw, Utilities.Charset.UTF_8);
+  return digest.map(function(byte) {
+    var value = byte < 0 ? byte + 256 : byte;
+    return ('0' + value.toString(16)).slice(-2);
+  }).join('').slice(0, 24);
+}
+
+function mfImageCollectorGetTargetDiscoveryRequest_(payload) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var sheet = mfImageCollectorGetOrCreateTargetQueueSheet_();
+    var headers = mfImageCollectorSheetHeaders_(sheet);
+    var statusCol = headers.indexOf('status') + 1;
+    var startedCol = headers.indexOf('started_at') + 1;
+    if (statusCol < 1) throw new Error('target queue status column is missing.');
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) return { ok: true, request: null };
+    var values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+    for (var i = 0; i < values.length; i += 1) {
+      var request = mfImageCollectorQueueRowToObject_(headers, values[i]);
+      if (String(request.status || '').trim() !== 'pending') continue;
+      var rowNumber = i + 2;
+      sheet.getRange(rowNumber, statusCol).setValue('processing');
+      if (startedCol > 0) sheet.getRange(rowNumber, startedCol).setValue(new Date());
+      request.status = 'processing';
+      request.started_at = new Date().toISOString();
+      return {
+        ok: true,
+        request: {
+          request_id: request.request_id,
+          target_name: request.target_name,
+          target_ref: request.target_ref,
+          target_url: request.target_url,
+          status: request.status
+        }
+      };
+    }
+    return { ok: true, request: null };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function mfImageCollectorCompleteTargetDiscoveryRequest_(payload) {
+  var requestId = String(payload.request_id || '').trim();
+  if (!requestId) throw new Error('request_id is required.');
+  var status = String(payload.status || '').trim();
+  if (['completed', 'not_found', 'ambiguous', 'error'].indexOf(status) < 0) {
+    throw new Error('Unsupported target request completion status: ' + status);
+  }
+
+  var sheet = mfImageCollectorGetOrCreateTargetQueueSheet_();
+  var headers = mfImageCollectorSheetHeaders_(sheet);
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) throw new Error('Target request not found: ' + requestId);
+  var requestIdCol = headers.indexOf('request_id');
+  if (requestIdCol < 0) throw new Error('target queue request_id column is missing.');
+  var values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  for (var i = 0; i < values.length; i += 1) {
+    if (String(values[i][requestIdCol] || '').trim() !== requestId) continue;
+    var rowNumber = i + 2;
+    mfImageCollectorSetTargetQueueRowValues_(sheet, rowNumber, {
+      status: status,
+      completed_at: new Date(),
+      result_reference: String(payload.result_reference || '').trim(),
+      result_name: String(payload.result_name || '').trim(),
+      result_status: String(payload.result_status || status).trim(),
+      message: String(payload.message || '').slice(0, 2000)
+    });
+    return { ok: true, request_id: requestId, status: status, row_number: rowNumber };
+  }
+  throw new Error('Target request not found: ' + requestId);
+}
+
+function mfImageCollectorSetTargetQueueRowValues_(sheet, rowNumber, updates) {
+  var headers = mfImageCollectorSheetHeaders_(sheet);
+  for (var key in updates) {
+    if (!Object.prototype.hasOwnProperty.call(updates, key)) continue;
+    var col = headers.indexOf(key) + 1;
+    if (col > 0) sheet.getRange(rowNumber, col).setValue(updates[key]);
+  }
 }
 
 function mfImageCollectorApplyReviewValidation_(sheet) {
