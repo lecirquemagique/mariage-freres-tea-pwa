@@ -92,6 +92,8 @@ function parseArgs(argv) {
     discoverUrlsOnly: false,
     discoverNewReferences: false,
     backfillOfficialDescriptions: false,
+    enrichIncompleteRecords: false,
+    enrichRef: '',
     writeStructuredReviewCandidates: false,
     taxonomyDryRun: false,
     statusJson: false,
@@ -119,6 +121,14 @@ function parseArgs(argv) {
     else if (arg === '--discover-urls-only') args.discoverUrlsOnly = true;
     else if (arg === '--discover-new-references') args.discoverNewReferences = true;
     else if (arg === '--backfill-official-descriptions') args.backfillOfficialDescriptions = true;
+    else if (arg === '--enrich-incomplete-records') args.enrichIncompleteRecords = true;
+    else if (arg === '--enrich-ref') {
+      args.enrichRef = argv[++i] || '';
+      args.enrichIncompleteRecords = true;
+    } else if (arg.startsWith('--enrich-ref=')) {
+      args.enrichRef = arg.slice('--enrich-ref='.length);
+      args.enrichIncompleteRecords = true;
+    }
     else if (arg === '--write-structured-review-candidates') args.writeStructuredReviewCandidates = true;
     else if (arg === '--taxonomy-dry-run') args.taxonomyDryRun = true;
     else if (arg === '--status-json') args.statusJson = true;
@@ -831,6 +841,19 @@ function reviewCandidateIdentity(candidate) {
   return `${type}|${reference}|${normalizeText(candidate?.existing_version_key || '')}`;
 }
 
+function evidenceLevelRank(level) {
+  return {
+    image_only: 1,
+    official_verified: 2,
+    official_page_verified: 2,
+    official_page_and_name_verified: 3,
+  }[normalizeText(level)] || 0;
+}
+
+function strongerEvidenceLevel(left, right) {
+  return evidenceLevelRank(right) > evidenceLevelRank(left) ? right : left;
+}
+
 function sourceLanguageFromUrl(rawUrl) {
   try {
     const url = new URL(rawUrl);
@@ -1524,6 +1547,17 @@ function cacheReviewCandidate(cache, candidate) {
   if (!cache) return false;
   const item = { ...candidate };
   item.detection_id = item.detection_id || reviewCandidateKey(item);
+  if (item.detection_type === 'unregistered_reference') {
+    const imageReviewId = reviewCandidateKey({ ...item, detection_type: 'unregistered_reference_image' });
+    if (!cache.review_candidates[item.detection_id] && cache.review_candidates[imageReviewId]) {
+      item.detection_type = 'unregistered_reference_image';
+      item.discovery_evidence_type = item.discovery_evidence_type || 'image_only';
+      item.evidence_level = item.evidence_level || 'official_verified';
+      item.official_page_verified = true;
+      item.official_page_url = item.official_page_url || item.official_url || '';
+      item.detection_id = imageReviewId;
+    }
+  }
   const existing = cache.review_candidates[item.detection_id];
   if (existing) {
     const beforeFingerprint = reviewCandidateWriteBackFingerprint(existing);
@@ -1557,6 +1591,16 @@ function cacheReviewCandidate(cache, candidate) {
       evidence_url: existing.evidence_url || item.evidence_url || '',
       source_type: existing.source_type || item.source_type || '',
       confidence: existing.confidence || item.confidence || '',
+      discovered_image_url: existing.discovered_image_url || item.discovered_image_url || '',
+      discovered_image_type: existing.discovered_image_type || item.discovered_image_type || '',
+      discovered_image_source_url: existing.discovered_image_source_url || item.discovered_image_source_url || '',
+      resolved_image_url: existing.resolved_image_url || item.resolved_image_url || '',
+      image_width: existing.image_width || item.image_width || 0,
+      image_height: existing.image_height || item.image_height || 0,
+      discovery_evidence_type: existing.discovery_evidence_type || item.discovery_evidence_type || '',
+      evidence_level: strongerEvidenceLevel(existing.evidence_level, item.evidence_level) || existing.evidence_level || item.evidence_level || '',
+      official_page_url: existing.official_page_url || item.official_page_url || '',
+      official_page_verified: existing.official_page_verified || item.official_page_verified || false,
       structured_fact: { ...(existing.structured_fact || {}), ...(item.structured_fact || {}) },
       discovery_sources: mergeArrayValues(existing.discovery_sources, item.discovery_sources, (entry) => `${entry.source || ''}|${entry.url || ''}`),
       similar_master_candidates: mergeArrayValues(existing.similar_master_candidates, item.similar_master_candidates, (entry) => entry.reference || entry.version_key || JSON.stringify(entry)).slice(0, 5),
@@ -1604,7 +1648,124 @@ function discoveryCacheCandidates(cache, product) {
     }));
 }
 
-function updateDiscoveryCache({ cache, candidates, product, pageUrl, masterReferences, debug }) {
+function buildImageOnlyReviewCandidate({ reference, info, candidate, pageUrl, detectedAt }) {
+  return {
+    detected_at: detectedAt || nowIso(),
+    reference,
+    official_name: '',
+    detection_type: 'unregistered_reference_image',
+    official_url: '',
+    source_language: sourceLanguageFromUrl(pageUrl),
+    existing_reference: '',
+    existing_version_key: '',
+    existing_name: '',
+    diff_summary: `Unregistered ${reference} ${info.imageType} image was discovered while collecting an official page.`,
+    evidence: `evidence_level=image_only; image_type=${info.imageType}; image_url=${candidate.url}; discovered_from_page=${pageUrl}`,
+    discovered_image_url: candidate.url,
+    discovered_image_type: info.imageType,
+    discovered_image_source_url: pageUrl,
+    discovery_evidence_type: 'image_only',
+    evidence_level: 'image_only',
+    resolved_image_url: candidate.url,
+    image_width: candidate.naturalWidth || candidate.width || 0,
+    image_height: candidate.naturalHeight || candidate.height || 0,
+    official_page_url: '',
+    official_page_verified: false,
+    discovery_sources: [{ source: 'image_collector', source_type: 'image', discovery_source: 'image_only', language: sourceLanguageFromUrl(pageUrl), url: pageUrl }],
+    status: '要確認',
+    human_decision: '',
+    target_version_key: '',
+    comment: '',
+  };
+}
+
+function enrichImageReviewWithVerifiedPage({ imageReview, verifiedPage, source, masterProducts }) {
+  const reference = imageReview.reference;
+  const review = buildUnregisteredReferenceReview({
+    reference,
+    facts: verifiedPage.facts,
+    url: verifiedPage.url,
+    source,
+    sourceLanguage: verifiedPage.language,
+    discoverySource: 'image_official_reverify',
+    snippet: verifiedPage.facts?.snippet || '',
+    masterProducts,
+  });
+  Object.assign(review, {
+    detection_type: 'unregistered_reference_image',
+    discovered_image_url: imageReview.discovered_image_url,
+    discovered_image_type: imageReview.discovered_image_type,
+    discovered_image_source_url: imageReview.discovered_image_source_url,
+    discovery_evidence_type: 'image_only',
+    evidence_level: verifiedPage.exact_name_match ? 'official_page_and_name_verified' : 'official_verified',
+    resolved_image_url: imageReview.resolved_image_url || imageReview.discovered_image_url,
+    image_width: imageReview.image_width || 0,
+    image_height: imageReview.image_height || 0,
+    official_page_url: verifiedPage.url,
+    official_page_verified: true,
+    evidence: mergeUniqueTextLines(
+      imageReview.evidence,
+      `evidence_level=official_verified; verified_product_page=${verifiedPage.url}; exact_reference=${reference}; image_url=${imageReview.discovered_image_url}`
+    ),
+    discovery_sources: mergeArrayValues(imageReview.discovery_sources, review.discovery_sources, (entry) => `${entry.discovery_source || entry.source || ''}|${entry.url || ''}`),
+  });
+  review.detection_id = reviewCandidateKey(review);
+  return review;
+}
+
+async function verifyImageDiscoveredReference({ context, reference, config, pageUrl, debug }) {
+  const input = { name: '', reference, url: '' };
+  const source = {
+    id: 'image-official-reverify',
+    source: 'image_reverify',
+    target_ref: reference,
+  };
+  const page = await context.newPage();
+  const candidateUrls = [];
+  const seenUrls = new Set();
+  try {
+    for (const searchUrl of productSearchUrls(reference)) {
+      if (debug) console.log(`[image-reverify-search] ${reference} ${searchUrl}`);
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
+      await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
+      await sleep(config.settleDelayMs || 2500);
+      const title = await page.title().catch(() => '');
+      const bodyText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+      if (/cloudflare|verify you are human|vérifiez que vous êtes humain|just a moment/i.test(`${title}\n${bodyText}`)) {
+        return { ok: false, reason: 'browser_verification' };
+      }
+      for (const candidate of await collectProductSearchCandidates(page)) {
+        if (!looksLikeProductUrl(candidate.href)) continue;
+        if (seenUrls.has(candidate.href)) continue;
+        const text = `${candidate.text}\n${candidate.closestText}\n${candidate.href}`;
+        if (!referenceRegex(reference).test(text) && !candidate.href.toUpperCase().includes(reference)) continue;
+        seenUrls.add(candidate.href);
+        candidateUrls.push({ url: candidate.href, source_url: searchUrl });
+      }
+    }
+
+    if (looksLikeProductUrl(pageUrl) && !seenUrls.has(pageUrl)) {
+      seenUrls.add(pageUrl);
+      candidateUrls.unshift({ url: pageUrl, source_url: 'discovered-from-page' });
+    }
+
+    const verified = [];
+    for (const item of candidateUrls.slice(0, 10)) {
+      const inspected = await inspectTargetedProductPage(page, item.url, input, config, debug, item.source_url);
+      if (inspected.ok && inspected.refs.includes(reference)) verified.push(inspected);
+    }
+    if (verified.length !== 1) {
+      return { ok: false, reason: verified.length ? 'ambiguous_verified_pages' : 'no_verified_product', candidate_urls: candidateUrls.map((item) => item.url) };
+    }
+    return { ok: true, page: verified[0], source, candidate_urls: candidateUrls.map((item) => item.url) };
+  } catch (error) {
+    return { ok: false, reason: 'error', error_message: error.message, candidate_urls: candidateUrls.map((item) => item.url) };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+async function updateDiscoveryCache({ cache, candidates, product, pageUrl, masterReferences, masterProducts = [], context = null, config = {}, debug }) {
   const detectedAt = nowIso();
   let added = 0;
   let reviewAdded = 0;
@@ -1622,23 +1783,15 @@ function updateDiscoveryCache({ cache, candidates, product, pageUrl, masterRefer
     if (!reference) continue;
     if (!masterReferences.has(reference)) {
       if (info.imageType !== 'liqueur') {
-        const review = {
-          detected_at: detectedAt,
-          reference,
-          official_name: '',
-          detection_type: 'unregistered_reference_image',
-          official_url: candidate.url,
-          source_language: sourceLanguageFromUrl(pageUrl),
-          existing_reference: '',
-          existing_version_key: '',
-          existing_name: '',
-          diff_summary: `Unregistered ${reference} ${info.imageType} image was discovered while collecting an official page.`,
-          evidence: `image_type=${info.imageType}; image_url=${candidate.url}; discovered_from_page=${pageUrl}`,
-          status: '要確認',
-          human_decision: '',
-          target_version_key: '',
-          comment: '',
-        };
+        let review = buildImageOnlyReviewCandidate({ reference, info, candidate, pageUrl, detectedAt });
+        if (context) {
+          const verified = await verifyImageDiscoveredReference({ context, reference, config, pageUrl, debug });
+          if (verified.ok) {
+            review = enrichImageReviewWithVerifiedPage({ imageReview: review, verifiedPage: verified.page, source: verified.source, masterProducts });
+          } else {
+            review.evidence = mergeUniqueTextLines(review.evidence, `official_reverify=${verified.reason}; candidate_urls=${(verified.candidate_urls || []).join(',')}; error=${verified.error_message || ''}`);
+          }
+        }
         if (cacheReviewCandidate(cache, review)) reviewAdded += 1;
       }
       continue;
@@ -1924,7 +2077,7 @@ async function inspectTargetedProductPage(page, url, input, config, debug, sourc
     return { ok: false, url: finalUrl, facts, refs: [], t_references: tReferences, sales_references: salesReferences, reject_reason: 'no_verified_reference', source_url: sourceUrl };
   }
   const officialName = facts.h1 || facts.title || '';
-  if (!targetedNameMatches(input.name, officialName)) {
+  if (input.name && !targetedNameMatches(input.name, officialName)) {
     return { ok: false, url: finalUrl, facts, refs: primaryReferences, t_references: tReferences, sales_references: salesReferences, official_name: officialName, reject_reason: 'name_mismatch', source_url: sourceUrl };
   }
 
@@ -2596,6 +2749,7 @@ async function processProduct({
   keepPagesOpen = false,
   discoveryCache = null,
   masterReferences = new Set(),
+  masterProducts = [],
 }) {
   const pageInfo = await getProductPage(context, product, { useExistingPages });
   const page = pageInfo.page;
@@ -2642,7 +2796,7 @@ async function processProduct({
     const discoveredCandidates = discoveryCache ? discoveryCacheCandidates(discoveryCache, product) : [];
     const allCandidates = [...domCandidates, ...cacheCandidates, ...networkCandidates, ...discoveredCandidates];
     if (discoveryCache) {
-      updateDiscoveryCache({ cache: discoveryCache, candidates: allCandidates, product, pageUrl, masterReferences, debug });
+      await updateDiscoveryCache({ cache: discoveryCache, candidates: allCandidates, product, pageUrl, masterReferences, masterProducts, context, config, debug });
     }
 
     if (debug) {
@@ -3707,11 +3861,135 @@ async function runOfficialDescriptionBackfill({ context, config, master, baseDir
   }
 }
 
+function productNeedsEnrichment(product) {
+  const master = product?.master || {};
+  const productUrlStatus = normalizeProductUrlStatus(master.productUrlStatus || product?.urlDiscovery?.status);
+  if (!hasValue(product?.productUrl)) {
+    if (productUrlStatus === 'not_found') return false;
+    return true;
+  }
+  if (productUrlStatus === 'error') return true;
+  return !hasValue(master.officialDescription) ||
+    !hasValue(master.officialCategory) ||
+    !hasValue(master.teaTypeTag) ||
+    !hasValue(master.flavorTags);
+}
+
+function selectEnrichmentProducts(masterProducts, refs = null, limit = 5) {
+  const refFilter = refs?.length ? new Set(refs.map((ref) => String(ref || '').toUpperCase())) : null;
+  const selected = [];
+  for (const product of masterProducts || []) {
+    if (refFilter && ![...refFilter].some((ref) => productHasReference(product, ref))) continue;
+    if (!refFilter && !productNeedsEnrichment(product)) continue;
+    selected.push(product);
+    if (!refFilter && selected.length >= limit) break;
+  }
+  return selected;
+}
+
+async function runEnrichIncompleteRecords({ context, config, master, baseDir, args }) {
+  const refs = args.enrichRef
+    ? args.enrichRef.split(',').map((ref) => normalizeTargetReference(ref) || normalizeText(ref).toUpperCase()).filter(Boolean)
+    : args.refs;
+  const products = selectEnrichmentProducts(master?.products || [], refs, config.batchSize || 5);
+  const vocabulary = structuredFactVocabulary(master?.products || []);
+  const masterReferences = new Set((master?.products || []).flatMap((product) => [
+    product.reference,
+    product.tReference,
+    ...(product.salesReferences || []),
+  ]).filter(Boolean));
+  const page = await context.newPage();
+  const results = [];
+  try {
+    for (const product of products) {
+      let productUrl = product.productUrl || '';
+      let discovery = null;
+      if (!hasValue(productUrl)) {
+        discovery = await discoverProductPageUrl(context, product, config, args.debug, null, masterReferences);
+        if (discovery.success) productUrl = discovery.url;
+      }
+      if (!hasValue(productUrl)) {
+        results.push({ reference: product.reference, status: 'skipped', reason: 'official_product_page_unverified', url_discovery: discovery });
+        continue;
+      }
+      const inspected = await inspectTargetedProductPage(page, productUrl, { name: product.name || '', reference: product.reference, url: productUrl }, config, args.debug, 'master-product-url');
+      if (!inspected.ok) {
+        results.push({ reference: product.reference, status: 'error', reason: inspected.reject_reason, official_url: productUrl, master_write: 'not_attempted' });
+        continue;
+      }
+      const structured = structuredFactReviewCandidatesForProduct({ product, facts: inspected.facts, vocabulary });
+      const descriptionValue = buildOfficialDescriptionBackfillValue({
+        product,
+        facts: inspected.facts,
+        language: sourceLanguageFromUrl(inspected.url),
+        config,
+      });
+      const translationReview = descriptionValue.needs_translation
+        ? buildOfficialDescriptionTranslationReviewCandidate({
+            product,
+            facts: inspected.facts,
+            descriptionValue,
+            category: normalizeOfficialCategoryForMaster(inspected.facts.category || ''),
+          })
+        : null;
+      const reviewCandidates = [
+        ...structured.reviewCandidates,
+        ...(translationReview ? [translationReview] : []),
+      ];
+      let writeBackResults = [];
+      if (args.writeBack === true && reviewCandidates.length) {
+        writeBackResults = await writeBackReviewCandidates({ config, baseDir, candidates: reviewCandidates, debug: args.debug });
+      }
+      results.push({
+        reference: product.reference,
+        version_key: product.master?.versionKey || '',
+        status: 'ok',
+        official_url: inspected.url,
+        official_name: inspected.official_name,
+        enrichment_reasons: {
+          official_page_unverified: !hasValue(product.productUrl) || normalizeProductUrlStatus(product.master?.productUrlStatus) !== 'available',
+          official_description_missing: !hasValue(product.master?.officialDescription),
+          official_category_missing: !hasValue(product.master?.officialCategory),
+          tea_type_tag_missing: !hasValue(product.master?.teaTypeTag),
+          flavor_tags_missing: !hasValue(product.master?.flavorTags),
+        },
+        description_status: descriptionValue.needs_translation ? 'translation_review_required' : (descriptionValue.japanese_description ? 'jp_or_override_available' : 'not_found'),
+        structured_suggestions: structured.officialStructuredFacts?.structured_review_suggestions || [],
+        review_candidates_would_create: reviewCandidates.map((candidate) => ({
+          detection_id: candidate.detection_id,
+          detection_type: candidate.detection_type,
+          reference: candidate.reference,
+          target_column: candidate.target_column || '',
+          suggested_value: candidate.suggested_value || '',
+        })),
+        write_back: { attempted: args.writeBack === true, results: writeBackResults },
+        master_write: 'not_attempted',
+      });
+    }
+  } finally {
+    await page.close().catch(() => {});
+  }
+  const result = {
+    ok: true,
+    mode: 'enrich_incomplete_records',
+    selected: products.length,
+    dry_run: args.writeBack !== true,
+    master_write: 'not_attempted',
+    results,
+  };
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
 async function runNewReferenceDiscovery({ context, config, paths, master, discoveryCache, baseDir, args }) {
   const sources = config.newReferenceDiscovery?.sources || defaultNewReferenceDiscoverySources();
   const state = normalizeNewReferenceDiscoveryState(readJson(paths.newReferenceDiscoveryStateFile, {}), sources);
   const masterProducts = master?.products || [];
-  const masterReferences = new Set(masterProducts.map((product) => product.reference).filter(Boolean));
+  const masterReferences = new Set(masterProducts.flatMap((product) => [
+    product.reference,
+    product.tReference,
+    ...(product.salesReferences || []),
+  ]).filter(Boolean));
   const vocabulary = structuredFactVocabulary(masterProducts);
   const maxPages = Number.isFinite(config.newReferenceDiscovery?.maxPagesPerRun) ? config.newReferenceDiscovery.maxPagesPerRun : 8;
   const maxPagesPerSource = Number.isFinite(config.newReferenceDiscovery?.maxPagesPerSourcePerRun)
@@ -3922,6 +4200,9 @@ async function main() {
   if (targetedDiscoveryRequested && !args.connectCdp) {
     throw new Error('--connect-cdp is required for targeted tea discovery.');
   }
+  if (args.enrichIncompleteRecords && !args.connectCdp) {
+    throw new Error('--connect-cdp is required for enrichment.');
+  }
 
   const paths = {
     profileDir: resolveProjectPath(baseDir, config.profileDir || 'browser-profile'),
@@ -3951,27 +4232,31 @@ async function main() {
       console.log(JSON.stringify(taxonomyDryRun(master?.products || config.products || [], args.refs), null, 2));
       return;
     }
-  if (!targetedDiscoveryRequested && !args.statusJson && !args.dryRun) {
+  if (!targetedDiscoveryRequested && !args.enrichIncompleteRecords && !args.statusJson && !args.dryRun) {
     await normalizeNotFoundProductUrlWriteBacks({ config, baseDir, state, master, debug: args.debug });
   }
   const products = selectProducts(config, state, args.refs, master?.products || null);
-  const masterReferences = new Set((master?.products || config.products || []).map((product) => product.reference).filter(Boolean));
+  const masterReferences = new Set((master?.products || config.products || []).flatMap((product) => [
+    product.reference,
+    product.tReference,
+    ...(product.salesReferences || []),
+  ]).filter(Boolean));
 
   if (args.statusJson) {
     console.log(JSON.stringify(buildStatusSummary(config, state, master, products, discoveryCache, newReferenceDiscoveryState)));
     return;
   }
 
-  if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && products.length === 0) {
+  if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords && products.length === 0) {
     console.log('No pending products selected.');
     return;
   }
 
-  if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions) {
+  if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords) {
     console.log(`Selected ${products.length} product(s)${master ? ` from master rows=${master.rowCount}` : ' from config'}.`);
   }
 
-  if (args.dryRun && !targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions) {
+  if (args.dryRun && !targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords) {
     for (const product of products) {
       console.log(JSON.stringify({
         reference: product.reference,
@@ -4041,6 +4326,11 @@ async function main() {
 
     if (args.backfillOfficialDescriptions) {
       await runOfficialDescriptionBackfill({ context, config, master, baseDir, args });
+      return;
+    }
+
+    if (args.enrichIncompleteRecords) {
+      await runEnrichIncompleteRecords({ context, config, master, baseDir, args });
       return;
     }
 
@@ -4181,6 +4471,7 @@ async function main() {
         keepPagesOpen: Boolean(args.connectCdp),
         discoveryCache,
         masterReferences,
+        masterProducts: master?.products || config.products || [],
       });
       try {
         await writeBackImageResults({ config, baseDir, product, result, debug: args.debug });
