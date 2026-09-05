@@ -630,6 +630,16 @@ function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
     sales_references: candidate.sales_references || {},
     sales_prefix: candidate.sales_prefix || '',
     sku_only: candidate.sku_only === true,
+    discovered_image_url: candidate.discovered_image_url || '',
+    discovered_image_type: candidate.discovered_image_type || '',
+    discovered_image_source_url: candidate.discovered_image_source_url || '',
+    discovery_evidence_type: candidate.discovery_evidence_type || '',
+    evidence_level: candidate.evidence_level || '',
+    resolved_image_url: candidate.resolved_image_url || '',
+    image_width: candidate.image_width || 0,
+    image_height: candidate.image_height || 0,
+    official_page_url: candidate.official_page_url || '',
+    official_page_verified: candidate.official_page_verified === true,
     master_absence_confirmed: candidate.master_absence_confirmed === true,
     similar_master_candidates: candidate.similar_master_candidates || [],
     structured_fact: candidate.structured_fact || null
@@ -1217,10 +1227,14 @@ textarea{display:block;width:100%;min-height:56px}
 .pill{border:1px solid #ddd;background:#fafafa;border-radius:4px;padding:4px 8px}
 .candidate{font-weight:700}
 .evidence{margin:8px 0;line-height:1.45}
+.thumb{width:128px;height:128px;object-fit:contain;border:1px solid #ddd;background:#fafafa}
+.image-card{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap}
+.image-meta{min-width:260px;flex:1}
 .actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .error{background:#fff2f2;border:1px solid #f2b8b8;color:#8a1f1f;padding:10px;margin:10px 0}
 </style></head><body><h2>変更候補レビュー</h2><div id="summary">読み込み中...</div><div id="items">読み込み中...</div><script>
 function esc(s){return String(s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function parseInfo(it){try{return JSON.parse(it['公式情報JSON']||'{}')||{};}catch(e){return {};}}
 function dbStatus(it){return it['DB存在確認']||(it['DB既存T']||it['DB既存VersionKey']||it['DB既存名']?'DB既存データあり':'DB既存データなし');}
 function fail(where,e){document.getElementById(where).innerHTML='<div class="error">'+esc((e&&e.message)||e||'読み込みエラー')+'</div>';}
 function link(label,url){return url?'<div class="url"><b>'+esc(label)+'</b>: <a href="'+esc(url)+'" target="_blank">'+esc(url)+'</a></div>':'';}
@@ -1236,6 +1250,14 @@ function renderStructured(it,idx){
   var confidence=it['confidence']||'';
   return '<div class="item structured"><div class="head"><span>'+esc(it['公式名'])+'</span><span class="muted">'+esc(it['Tリファレンス番号'])+'</span></div><div class="muted">'+esc(it['検出種別'])+' / '+esc(it['ステータス'])+'</div><div class="section"><h3>'+esc(it['対象列'])+'</h3><div class="change"><span class="pill">現在: '+esc(it['現在値']||'なし')+'</span><span>→</span><span class="pill candidate">候補: '+esc(it['候補値'])+'</span></div></div><div class="section"><h3>根拠</h3><div class="evidence">'+esc(it['根拠原文']||'')+'</div><div class="muted">'+esc(lang)+'公式 / '+esc(source)+' / confidence: '+esc(confidence)+'</div>'+link('公式ページ',it['根拠URL']||it['公式URL'])+'</div>'+structuredActionControls(it,idx)+'</div>';
 }
+function renderImageReview(it,idx){
+  var info=parseInfo(it);
+  var imageUrl=info.resolved_image_url||info.discovered_image_url||'';
+  var verified=info.official_page_verified===true;
+  var label=verified?'公式商品ページ確認済み':'画像のみ・公式商品ページ未確認';
+  var img=imageUrl?'<img class="thumb" src="'+esc(imageUrl)+'" onerror="this.replaceWith(document.createTextNode(\\'画像なし\\'))">':'<div class="thumb muted">画像なし</div>';
+  return '<div class="item"><div class="head">'+esc(it['Tリファレンス番号'])+' '+esc(it['公式名']||'')+'</div><div class="muted">'+esc(it['検出種別'])+' / '+esc(label)+' / '+esc(it['ステータス'])+'</div><div class="section image-card">'+img+'<div class="image-meta"><div class="kv">画像種別: '+esc(info.discovered_image_type||'')+'</div><div class="kv">証拠状態: '+esc(info.evidence_level||info.discovery_evidence_type||'image_only')+'</div><div class="kv">サイズ: '+esc(info.image_width||'')+' x '+esc(info.image_height||'')+'</div>'+link('発見元',info.discovered_image_source_url||'')+link('画像URL',imageUrl)+link('公式商品ページ',info.official_page_url||it['公式URL'])+'</div></div><div class="section"><h3>差分・根拠</h3><div class="kv">'+esc(it['差分概要'])+'</div><div class="kv"><b>根拠</b><br>'+esc(it['Collectorが取得した根拠'])+'</div></div>'+actionControls(it,idx)+'</div>';
+}
 function renderGeneric(it,idx){
   return '<div class="item"><div class="head">'+esc(it['Tリファレンス番号'])+' '+esc(it['公式名'])+'</div><div class="muted">'+esc(it['検出種別'])+' / '+esc(it['確認言語']||it['言語'])+' / '+esc(it['検出日時'])+' / '+esc(it['ステータス'])+'</div><div class="section"><h3>現在の公式情報</h3><div class="kv">公式名: '+esc(it['公式名'])+'</div><div class="kv">確認言語: '+esc(it['確認言語']||it['言語'])+'</div>'+link('FR',it['FR公式URL'])+link('EN',it['EN公式URL'])+link('JP',it['JP公式URL'])+link('代表URL',it['公式URL'])+'<div class="kv">名称差: '+esc(it['公式名称差']||'')+'</div><div class="kv">説明: '+esc(it['公式説明抜粋']||'')+'</div></div><div class="section"><h3>DBの現在情報</h3><div class="kv">'+esc(dbStatus(it))+'</div><div class="kv">DB既存T: '+esc(it['DB既存T']||'なし')+'</div><div class="kv">DB VersionKey: '+esc(it['DB既存VersionKey']||'なし')+'</div><div class="kv">DB Name: '+esc(it['DB既存名']||'なし')+'</div><div class="kv">類似候補: '+esc(it['DB類似候補']||'[]')+'</div></div><div class="section"><h3>差分・根拠</h3><div class="kv">'+esc(it['差分概要'])+'</div><div class="kv"><b>根拠</b><br>'+esc(it['Collectorが取得した根拠'])+'</div><div class="kv">Discovery source: '+esc(it['Discovery source']||'')+'</div></div>'+actionControls(it,idx)+'</div>';
 }
@@ -1245,6 +1267,7 @@ function load(){
 }
 function render(items){
   document.getElementById('items').innerHTML=(items||[]).map(function(it,idx){
+    if(it['検出種別']==='unregistered_reference_image')return renderImageReview(it,idx);
     return it['検出種別']==='structured_fact'?renderStructured(it,idx):renderGeneric(it,idx);
   }).join('')||'要確認はありません';
 }
