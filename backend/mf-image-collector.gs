@@ -1508,9 +1508,9 @@ function mfImageCollectorTaxonomyDryRun_() {
     if (currentTeaType !== newTeaType) reasons.push('茶種タグ normalized');
     if (currentOfficialCategory !== newOfficialCategory) reasons.push('現在のカテゴリ normalized');
     if (currentAroma !== aroma.value) reasons.push('香味大分類 normalized/derived from 香味詳細タグ');
-    if (aroma.evidence_derived.length) reasons.push('香味大分類 derived from trusted evidence text');
-    if (aroma.unknown.length) reasons.push('unknown aroma category kept out: ' + aroma.unknown.join('、'));
-    if (!reasons.length) continue;
+    if (currentAroma !== aroma.value && aroma.evidence_derived.length) reasons.push('香味大分類 derived from trusted evidence text');
+    if (currentAroma !== aroma.value && aroma.unknown.length) reasons.push('unknown aroma category kept out: ' + aroma.unknown.join('、'));
+    if (currentTeaType === newTeaType && currentOfficialCategory === newOfficialCategory && currentAroma === aroma.value) continue;
 
     summary.changed_rows += 1;
     if (currentTeaType !== newTeaType) {
