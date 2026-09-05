@@ -122,10 +122,12 @@ function mfImageCollectorDoPost(e) {
       return mfImageCollectorJson_(mfImageCollectorTaxonomyDryRun_());
     }
     if (payload.action === 'taxonomyApply') {
-      return mfImageCollectorJson_(mfImageCollectorApplyTaxonomy_(payload));
+      mfImageCollectorAssertSecret_(payload);
+      return mfImageCollectorJson_(mfImageCollectorApplyTaxonomyInternal_(payload));
     }
     if (payload.action === 'taxonomyRollback') {
-      return mfImageCollectorJson_(mfImageCollectorRollbackTaxonomy_(payload));
+      mfImageCollectorAssertSecret_(payload);
+      return mfImageCollectorJson_(mfImageCollectorRollbackTaxonomyInternal_(payload));
     }
     if (payload.action === 'updateMasterNewTeaDefaults') {
       return mfImageCollectorJson_(mfImageCollectorUpdateMasterNewTeaDefaults_(payload));
@@ -350,7 +352,7 @@ function mfImageCollectorShowTaxonomyApplyConfirm() {
     ui.ButtonSet.OK_CANCEL
   );
   if (response !== ui.Button.OK) return;
-  var result = mfImageCollectorApplyTaxonomy_({ batch_id: batchId, dry_run: false });
+  var result = mfImageCollectorApplyTaxonomyInternal_({ batch_id: batchId, dry_run: false });
   if (!result.ok) {
     ui.alert('分類整理を反映', '中止: ' + (result.error || 'conflict') + '\nconflict数: ' + ((result.conflicts || []).length), ui.ButtonSet.OK);
     return;
@@ -373,7 +375,7 @@ function mfImageCollectorShowTaxonomyRollbackConfirm() {
     ui.ButtonSet.OK_CANCEL
   );
   if (response !== ui.Button.OK) return;
-  var result = mfImageCollectorRollbackTaxonomy_({ batch_id: latest.batch_id, dry_run: false });
+  var result = mfImageCollectorRollbackTaxonomyInternal_({ batch_id: latest.batch_id, dry_run: false });
   ui.alert(
     '分類整理を元に戻す',
     '戻したセル: ' + (result.rollback_count || 0) +
@@ -1542,8 +1544,7 @@ function mfImageCollectorTaxonomyDryRun_() {
   return { ok: true, dry_run: true, summary: summary, rows: rows };
 }
 
-function mfImageCollectorApplyTaxonomy_(payload) {
-  mfImageCollectorAssertSecret_(payload);
+function mfImageCollectorApplyTaxonomyInternal_(payload) {
   var dryRun = payload.dry_run !== false;
   var ss = mfImageCollectorOpenSpreadsheet_();
   var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
@@ -1609,8 +1610,7 @@ function mfImageCollectorApplyTaxonomy_(payload) {
   };
 }
 
-function mfImageCollectorRollbackTaxonomy_(payload) {
-  mfImageCollectorAssertSecret_(payload);
+function mfImageCollectorRollbackTaxonomyInternal_(payload) {
   var dryRun = payload.dry_run !== false;
   var ss = mfImageCollectorOpenSpreadsheet_();
   var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
