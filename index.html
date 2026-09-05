@@ -749,7 +749,10 @@ const SALES_FORMAT_REFERENCE_FIELDS=[
   'TEリファレンス',
   'TFリファレンス',
   '水出し用リファレンス',
-  'TPリファレンス'
+  'TPリファレンス',
+  'TAリファレンス',
+  'TJリファレンス',
+  'TJCリファレンス'
 ];
 
 const $=x=>document.getElementById(x);
@@ -807,6 +810,25 @@ function salesFormatIconPath(code){
     String(code||'').toLowerCase()+
     '.png'
   );
+}
+
+function displayReference(row){
+  const teaRef=String(row['Tリファレンス番号']||'').trim();
+  if(teaRef){
+    return teaRef;
+  }
+
+  const salesRef=SALES_FORMAT_REFERENCE_FIELDS
+    .flatMap(key=>sp(row[key]))
+    .map(x=>String(x||'').trim().toUpperCase())
+    .find(Boolean);
+  if(salesRef){
+    return salesRef;
+  }
+
+  const versionKey=String(row['VersionKey']||'').trim();
+  const m=versionKey.match(/^([A-Z]+\d[A-Z0-9]*)-B\d{2}$/i);
+  return m ? m[1].toUpperCase() : versionKey;
 }
 
 
@@ -1515,7 +1537,7 @@ function render(){
           <div class="body">
 
             <span class="ref">
-              ${esc(r['Tリファレンス番号'])}
+              ${esc(displayReference(r))}
             </span>
 
             <span class="name">

@@ -15,6 +15,7 @@ const IMAGE_TYPE_FOLDERS = {
 const DRIVE_THUMBNAIL_SIZE = 'w1200';
 const PRODUCT_URL_DISCOVERY_VERSION = 'official-search-fr-en-jp-v1';
 const PRODUCT_URL_NOT_FOUND_MESSAGE = 'No official product page with exact reference was verified.';
+const SALES_SKU_PREFIXES = ['TFG', 'TJC', 'TB', 'TC', 'TE', 'TF', 'TP', 'TA', 'TJ'];
 const MASTER_COLUMNS = {
   reference: 'Tリファレンス番号',
   name: '現在の公式名',
@@ -44,6 +45,26 @@ const MASTER_COLUMNS = {
   timeTags: '時間帯タグ',
   icedTeaRecommended: 'アイスティー推奨',
   caffeineFree: 'テインフリー',
+  tfgReference: '水出し用リファレンス',
+  tbReference: 'TBリファレンス',
+  tcReference: 'TCリファレンス',
+  teReference: 'TEリファレンス',
+  tfReference: 'TFリファレンス',
+  tpReference: 'TPリファレンス',
+  taReference: 'TAリファレンス',
+  tjReference: 'TJリファレンス',
+  tjcReference: 'TJCリファレンス',
+};
+const SALES_SKU_MASTER_COLUMNS = {
+  TFG: MASTER_COLUMNS.tfgReference,
+  TB: MASTER_COLUMNS.tbReference,
+  TC: MASTER_COLUMNS.tcReference,
+  TE: MASTER_COLUMNS.teReference,
+  TF: MASTER_COLUMNS.tfReference,
+  TP: MASTER_COLUMNS.tpReference,
+  TA: MASTER_COLUMNS.taReference,
+  TJ: MASTER_COLUMNS.tjReference,
+  TJC: MASTER_COLUMNS.tjcReference,
 };
 const MIME_EXT = {
   'image/jpeg': '.jpg',
@@ -196,6 +217,23 @@ function normalizeText(value) {
 
 function hasValue(value) {
   return normalizeText(value).length > 0;
+}
+
+function isTeaReference(value) {
+  return /^T\d{2,6}$/i.test(normalizeText(value));
+}
+
+function isLegacyMasterTeaReference(value) {
+  return /^T\d+$/i.test(normalizeText(value));
+}
+
+function isSalesSkuReference(value) {
+  return Boolean(salesSkuParts(value));
+}
+
+function canonicalProductReference(value) {
+  const ref = normalizeText(value).toUpperCase();
+  return isTeaReference(ref) || isSalesSkuReference(ref) ? ref : '';
 }
 
 function normalizeImageStatus(value) {
@@ -492,6 +530,34 @@ function findGasUrlFromAppConfig(baseDir) {
   return appConfig.match(/GAS_API_URL:\s*['"]([^'"]+)['"]/)?.[1] || '';
 }
 
+function salesSkuReferencesFromMasterRow(row) {
+  const values = [];
+  for (const column of Object.values(SALES_SKU_MASTER_COLUMNS)) {
+    for (const token of splitMasterListValue(row[column] || '')) {
+      if (isSalesSkuReference(token)) values.push(token.toUpperCase());
+    }
+  }
+  return [...new Set(values)];
+}
+
+function salesSkuReferencesByPrefix(refs) {
+  const out = {};
+  for (const ref of refs || []) {
+    const parts = salesSkuParts(ref);
+    if (!parts) continue;
+    out[parts.prefix] = mergeUniqueDelimitedValues(out[parts.prefix] || '', parts.sku);
+  }
+  return out;
+}
+
+function primaryReferenceFromMasterRow(row) {
+  const tReference = normalizeText(row[MASTER_COLUMNS.reference]).toUpperCase();
+  if (isLegacyMasterTeaReference(tReference)) return tReference;
+  const versionPrefix = normalizeText(row[MASTER_COLUMNS.versionKey]).toUpperCase().match(/^([A-Z]+\d[A-Z0-9]*)-[BN]\d{2}$/)?.[1] || '';
+  if (canonicalProductReference(versionPrefix)) return versionPrefix;
+  return salesSkuReferencesFromMasterRow(row)[0] || '';
+}
+
 async function fetchMasterProducts(config, baseDir, debug) {
   const source = config.masterSource || {};
   if (source.enabled === false) return null;
@@ -518,11 +584,17 @@ async function fetchMasterProducts(config, baseDir, debug) {
 
   const products = payload.rows
     .map((row) => {
-      const reference = normalizeText(row[MASTER_COLUMNS.reference]);
+      const tReference = normalizeText(row[MASTER_COLUMNS.reference]).toUpperCase();
+      const reference = primaryReferenceFromMasterRow(row);
       const productUrl = normalizeText(row[MASTER_COLUMNS.productUrl]);
       if (!reference) return null;
+      const salesReferences = salesSkuReferencesFromMasterRow(row);
       return {
         reference,
+        tReference,
+        primaryReference: reference,
+        primaryReferenceType: isLegacyMasterTeaReference(tReference) ? 'tea' : 'sales_sku',
+        salesReferences,
         name: normalizeText(row[MASTER_COLUMNS.name]) || normalizeText(row[MASTER_COLUMNS.fallbackName]),
         productUrl,
         master: {
@@ -584,12 +656,14 @@ function candidateReferenceTokens(candidate) {
     candidate.closestText,
     candidate.sectionText,
   ].join(' ');
-  return [...new Set([...hay.matchAll(/(^|[^a-z0-9])(t\d{2,5}|tp\d{2,5})([^a-z0-9]|$)/gi)].map((match) => match[2].toUpperCase()))];
+  return [...new Set([...extractTeaReferences(hay), ...extractSalesSkuReferences(hay)])];
 }
 
 function candidateHasConflictingReference(candidate, product) {
   const expected = String(product.reference || '').toUpperCase();
-  return candidateReferenceTokens(candidate).some((token) => token !== expected);
+  return candidateReferenceTokens(candidate)
+    .filter((token) => isLegacyMasterTeaReference(token))
+    .some((token) => token !== expected);
 }
 
 function candidateHaystack(candidate) {
@@ -642,10 +716,12 @@ function imageInfoFromOfficialUrl(rawUrl) {
     }
     if (!/\/media\/catalog\/product\//i.test(pathname)) return null;
     const file = path.basename(pathname);
-    const match = file.match(/^(t\d{2,5})(-\d+p)?\.(jpe?g|png|webp|avif)$/i);
+    const match = file.match(/^((?:t\d{2,6})|(?:(?:tfg|tjc|tb|tc|te|tf|tp|ta)\d{2,6})|(?:tj[a-z0-9]{2,8}))(-\d+p)?\.(jpe?g|png|webp|avif)$/i);
     if (!match) return null;
+    const reference = match[1].toUpperCase();
+    if (!canonicalProductReference(reference)) return null;
     return {
-      reference: match[1].toUpperCase(),
+      reference,
       imageType: match[2] ? 'teaThumbnail' : 'tea',
       cacheKeyName: file,
     };
@@ -692,7 +768,7 @@ function classifyCandidate(candidate, product, imageType) {
     if (/-\d+p\.(jpe?g|png|webp|avif)(?:[?#]|$)/i.test(candidate.url || '')) reject += 15;
     if (/liqueur|liquor|liquore|color_liqueur/.test(hay)) reject += 8;
     if (/thes-au-poids|tea-by-the-weight|te-al-peso/.test(hay)) score += 2;
-    if (candidateHasExactReference(candidate, product) && /t\d{2,5}(-\d+p)?\.(jpe?g|png|webp|avif)/.test(hay)) score += 5;
+    if (candidateHasExactReference(candidate, product) && /[a-z]+\d[a-z0-9]*(-\d+p)?\.(jpe?g|png|webp|avif)/.test(hay)) score += 5;
   }
 
   if (/logo|payment|paiement|livraison|delivery|shipping|secure|sprite|icon|favicon|jardin/.test(hay)) reject += 10;
@@ -1299,7 +1375,7 @@ function structuredFactReviewCandidate({ product, facts, suggestion }) {
 }
 
 function productForStructuredFacts(reference, masterProducts = [], facts = {}) {
-  const existing = (masterProducts || []).find((product) => product.reference === reference);
+  const existing = findMasterProductByReference(masterProducts, reference);
   if (existing) return existing;
   return {
     reference,
@@ -1329,6 +1405,16 @@ function mergeUniqueTextLines(...values) {
     }
   }
   return out.join('\n');
+}
+
+function mergeUniqueDelimitedValues(...values) {
+  const out = [];
+  for (const value of values) {
+    for (const token of splitMasterListValue(value || '')) {
+      if (token && !out.includes(token)) out.push(token);
+    }
+  }
+  return out.join('、');
 }
 
 function mergeObjectValues(left, right) {
@@ -1638,7 +1724,7 @@ function looksLikeProductUrl(url) {
     if (parsed.hostname === 'www.mariagefreres.com' && (parsed.pathname.startsWith('/fr/') || parsed.pathname.startsWith('/en/'))) {
       if (!parsed.pathname.endsWith('.html')) return false;
       if (/checkout|customer|catalogsearch|wishlist|review|contacts/i.test(parsed.pathname)) return false;
-      if (!/(^|-)t\d{2,5}([-.]|$)/i.test(parsed.pathname)) return false;
+      if (!/(^|-)(?:t\d{2,6}|(?:tfg|tjc|tb|tc|te|tf|tp|ta)\d{2,6}|tj[a-z0-9]{2,8})([-.]|$)/i.test(parsed.pathname)) return false;
       return true;
     }
     if (parsed.hostname === 'www.mariagefreres.co.jp' && /^\/view\/item\/\d+/.test(parsed.pathname)) {
@@ -1665,7 +1751,7 @@ async function collectProductSearchCandidates(page) {
 
 function normalizeTargetReference(value) {
   const ref = normalizeText(value).toUpperCase();
-  return ref ? ref.match(/^T\d{2,6}$/)?.[0] || '' : '';
+  return canonicalProductReference(ref);
 }
 
 function targetedNameMatches(targetName, officialName) {
@@ -1728,10 +1814,14 @@ function preferredTargetedPage(pages) {
 }
 
 function targetedMasterMatches(reference, officialName, masterProducts) {
+  const normalizedReference = String(reference || '').toUpperCase();
   const exact = (masterProducts || [])
-    .filter((product) => String(product.reference || '').toUpperCase() === reference)
+    .filter((product) => productHasReference(product, normalizedReference))
     .map((product) => ({
       reference: product.reference,
+      t_reference: product.tReference || '',
+      primary_reference_type: product.primaryReferenceType || '',
+      sales_references: product.salesReferences || [],
       version_key: product.master?.versionKey || '',
       name: product.name || '',
       official_url: product.productUrl || '',
@@ -1748,6 +1838,10 @@ function mergeTargetedUnregisteredReview({ reference, pages, primaryPage, source
   const namesByLanguage = targetedOfficialNamesByLanguage(pages);
   const descriptionsByLanguage = targetedDescriptionsByLanguage(pages);
   const categoriesByLanguage = targetedCategoriesByLanguage(pages);
+  const allSalesReferences = [...new Set(pages.flatMap((page) => page.sales_references || []))];
+  const salesReferences = salesSkuReferencesByPrefix(allSalesReferences);
+  const skuOnly = primaryPage.sku_only === true && !primaryPage.t_references?.length;
+  const tReference = skuOnly ? '' : (primaryPage.t_references?.[0] || (isTeaReference(reference) ? reference : ''));
   const candidate = buildUnregisteredReferenceReview({
     reference,
     facts: primaryPage.facts,
@@ -1758,6 +1852,12 @@ function mergeTargetedUnregisteredReview({ reference, pages, primaryPage, source
     snippet: primaryPage.facts?.snippet || '',
     masterProducts,
   });
+  candidate.primary_reference = reference;
+  candidate.primary_reference_type = skuOnly || isSalesSkuReference(reference) ? 'sales_sku' : 'tea';
+  candidate.t_reference = tReference;
+  candidate.sales_references = salesReferences;
+  candidate.sales_prefix = salesSkuParts(reference)?.prefix || '';
+  candidate.sku_only = skuOnly;
   candidate.source_language = Object.keys(urlsByLanguage).join('+') || primaryPage.language;
   candidate.fr_official_url = urlsByLanguage.FR || '';
   candidate.en_official_url = urlsByLanguage.EN || '';
@@ -1780,6 +1880,9 @@ function mergeTargetedUnregisteredReview({ reference, pages, primaryPage, source
     `discovery_source=targeted_search`,
     `target_name=${source.target_name || ''}`,
     `target_ref=${source.target_ref || ''}`,
+    `primary_reference_type=${candidate.primary_reference_type}`,
+    `t_reference=${candidate.t_reference || ''}`,
+    `sales_references=${Object.values(salesReferences).filter(Boolean).join(',')}`,
     `matched_urls=${pages.map((page) => page.url).join(',')}`,
   ].join('; ');
   candidate.detection_id = reviewCandidateKey(candidate);
@@ -1801,16 +1904,28 @@ async function inspectTargetedProductPage(page, url, input, config, debug, sourc
     return { ok: false, url: finalUrl, reject_reason: 'not_product_page', source_url: sourceUrl };
   }
 
-  const refs = [...new Set(extractVerifiedProductTeaReferences(combinedText, facts))];
-  if (input.reference && !refs.includes(input.reference)) {
-    return { ok: false, url: finalUrl, facts, refs, reject_reason: `target_ref_mismatch:${input.reference}`, source_url: sourceUrl };
+  const productIdentityText = [
+    facts.url,
+    facts.canonical,
+    facts.title,
+    facts.h1,
+    facts.productSummary,
+    facts.productFlavorSummary,
+    facts.productDescription,
+    facts.ingredientsText,
+  ].join('\n');
+  const tReferences = [...new Set(extractVerifiedProductTeaReferences(combinedText, facts))];
+  const salesReferences = [...new Set(extractSalesSkuReferences(productIdentityText))];
+  const primaryReferences = tReferences.length ? tReferences : salesReferences;
+  if (input.reference && !primaryReferences.includes(input.reference) && !salesReferences.includes(input.reference)) {
+    return { ok: false, url: finalUrl, facts, refs: primaryReferences, t_references: tReferences, sales_references: salesReferences, reject_reason: `target_ref_mismatch:${input.reference}`, source_url: sourceUrl };
   }
-  if (!refs.length) {
-    return { ok: false, url: finalUrl, facts, refs, reject_reason: 'no_verified_reference', source_url: sourceUrl };
+  if (!primaryReferences.length) {
+    return { ok: false, url: finalUrl, facts, refs: [], t_references: tReferences, sales_references: salesReferences, reject_reason: 'no_verified_reference', source_url: sourceUrl };
   }
   const officialName = facts.h1 || facts.title || '';
   if (!targetedNameMatches(input.name, officialName)) {
-    return { ok: false, url: finalUrl, facts, refs, official_name: officialName, reject_reason: 'name_mismatch', source_url: sourceUrl };
+    return { ok: false, url: finalUrl, facts, refs: primaryReferences, t_references: tReferences, sales_references: salesReferences, official_name: officialName, reject_reason: 'name_mismatch', source_url: sourceUrl };
   }
 
   const result = {
@@ -1819,11 +1934,15 @@ async function inspectTargetedProductPage(page, url, input, config, debug, sourc
     source_url: sourceUrl,
     language: sourceLanguageFromUrl(finalUrl) || sourceLanguageFromUrl(facts.url),
     official_name: officialName,
-    refs,
+    refs: primaryReferences,
+    t_references: tReferences,
+    sales_references: salesReferences,
+    reference_type: tReferences.length ? 'tea' : 'sales_sku',
+    sku_only: tReferences.length === 0 && salesReferences.length > 0,
     exact_name_match: targetedExactNameMatches(input.name, officialName),
     facts,
   };
-  if (debug) console.log(`[target-verified] ${refs.join(',')} ${officialName} ${finalUrl}`);
+  if (debug) console.log(`[target-verified] ${primaryReferences.join(',')} ${officialName} ${finalUrl}`);
   return result;
 }
 
@@ -1834,6 +1953,10 @@ function summarizeTargetedPage(page) {
     language: page.language,
     official_name: page.official_name,
     references: page.refs,
+    t_references: page.t_references || [],
+    sales_references: page.sales_references || [],
+    reference_type: page.reference_type || '',
+    sku_only: page.sku_only === true,
     exact_name_match: page.exact_name_match,
     h1: page.facts?.h1 || '',
     category: page.facts?.category || '',
@@ -1883,7 +2006,7 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
           if (!looksLikeProductUrl(candidate.href)) continue;
           if (seenUrls.has(candidate.href)) continue;
           const text = `${candidate.text}\n${candidate.closestText}\n${candidate.href}`;
-          if (input.reference && !referenceRegex(input.reference).test(text)) continue;
+          if (input.reference && !referenceRegex(input.reference).test(text) && !targetedNameMatches(input.name, text)) continue;
           if (!input.reference && !targetedNameMatches(input.name, text)) continue;
           seenUrls.add(candidate.href);
           candidateUrls.push({ url: candidate.href, source_url: searchUrl, priority: 1 });
@@ -1906,7 +2029,7 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
 
     const pagesByReference = new Map();
     for (const verified of verifiedPages) {
-      const refs = input.reference ? [input.reference] : verified.refs;
+      const refs = verified.refs;
       for (const ref of refs) {
         if (!pagesByReference.has(ref)) pagesByReference.set(ref, []);
         pagesByReference.get(ref).push(verified);
@@ -1975,6 +2098,10 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
       resolved: true,
       target_input: input,
       resolved_reference: resolved.reference,
+      reference_type: primaryPage.reference_type || (isSalesSkuReference(resolved.reference) ? 'sales_sku' : 'tea'),
+      t_reference: primaryPage.t_references?.[0] || (isTeaReference(resolved.reference) ? resolved.reference : ''),
+      sales_references: salesSkuReferencesByPrefix(resolved.pages.flatMap((page) => page.sales_references || [])),
+      sku_only: primaryPage.sku_only === true,
       official_name: primaryPage.official_name,
       source_language: primaryPage.language,
       fr_official_url: targetedOfficialUrlByLanguage(resolved.pages).FR || '',
@@ -3182,7 +3309,16 @@ function teaReferenceNumber(reference) {
 
 function findMasterProductByReference(masterProducts, reference) {
   const normalized = String(reference || '').trim().toUpperCase();
-  return (masterProducts || []).find((product) => String(product.reference || '').toUpperCase() === normalized) || null;
+  return (masterProducts || []).find((product) => productHasReference(product, normalized)) || null;
+}
+
+function productHasReference(product, reference) {
+  const normalized = String(reference || '').trim().toUpperCase();
+  if (!normalized) return false;
+  if (String(product?.reference || '').toUpperCase() === normalized) return true;
+  if (String(product?.tReference || '').toUpperCase() === normalized) return true;
+  if (String(product?.master?.versionKey || '').toUpperCase().startsWith(`${normalized}-B`)) return true;
+  return (product?.salesReferences || []).some((ref) => String(ref || '').toUpperCase() === normalized);
 }
 
 function resolveSalesSkuParent({ sku, pageRefs, masterProducts }) {
