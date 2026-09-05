@@ -9,6 +9,7 @@
 var MF_IMAGE_COLLECTOR_FOLDER_ID = '192M8W9aopop-k0H_xHMJBWkEVy3fK4eX';
 var MF_IMAGE_COLLECTOR_SHEET_NAME = '銘柄マスター';
 var MF_IMAGE_COLLECTOR_REVIEW_SHEET_NAME = '変更候補レビュー';
+var MF_IMAGE_COLLECTOR_TAXONOMY_LOG_SHEET_NAME = '分類変更履歴';
 var MF_IMAGE_COLLECTOR_SECRET_PROPERTY = 'MF_COLLECTOR_WRITE_SECRET';
 var MF_IMAGE_COLLECTOR_REVIEW_HEADERS = [
   '検出ID',
@@ -58,6 +59,22 @@ var MF_IMAGE_COLLECTOR_REVIEW_DECISIONS = [
   '誤検出',
   '保留'
 ];
+var MF_IMAGE_COLLECTOR_TAXONOMY_COLUMNS = ['茶種タグ', '現在のカテゴリ', '香味大分類'];
+var MF_IMAGE_COLLECTOR_TAXONOMY_LOG_HEADERS = [
+  'batch_id',
+  'timestamp',
+  'status',
+  'rollback_at',
+  'rollback_status',
+  'row_number',
+  'VersionKey',
+  'Tリファレンス番号',
+  '銘柄名',
+  'column',
+  'before',
+  'after',
+  'reason'
+];
 
 function doPost(e) {
   return mfImageCollectorDoPost(e);
@@ -103,6 +120,12 @@ function mfImageCollectorDoPost(e) {
     if (payload.action === 'taxonomyDryRun') {
       mfImageCollectorAssertSecret_(payload);
       return mfImageCollectorJson_(mfImageCollectorTaxonomyDryRun_());
+    }
+    if (payload.action === 'taxonomyApply') {
+      return mfImageCollectorJson_(mfImageCollectorApplyTaxonomy_(payload));
+    }
+    if (payload.action === 'taxonomyRollback') {
+      return mfImageCollectorJson_(mfImageCollectorRollbackTaxonomy_(payload));
     }
     if (payload.action === 'updateMasterNewTeaDefaults') {
       return mfImageCollectorJson_(mfImageCollectorUpdateMasterNewTeaDefaults_(payload));
@@ -280,6 +303,8 @@ function mfImageCollectorOnOpen(e) {
     .addItem('要確認件数を表示', 'mfImageCollectorShowReviewSummary')
     .addItem('レビュー更新', 'mfImageCollectorRefreshReviewSheet')
     .addItem('分類整理 dry-run', 'mfImageCollectorShowTaxonomyDryRun')
+    .addItem('分類整理を反映', 'mfImageCollectorShowTaxonomyApplyConfirm')
+    .addItem('分類整理を元に戻す', 'mfImageCollectorShowTaxonomyRollbackConfirm')
     .addToUi();
 }
 
@@ -309,6 +334,53 @@ function mfImageCollectorShowTaxonomyDryRun() {
       '\n香味大分類変更行: ' + result.summary.aroma_changed_rows +
       '\n未知分類: ' + Object.keys(result.summary.unknown_old_categories).join(', '),
     SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+function mfImageCollectorShowTaxonomyApplyConfirm() {
+  var ui = SpreadsheetApp.getUi();
+  var dryRun = mfImageCollectorTaxonomyDryRun_();
+  var batchId = mfImageCollectorTaxonomyBatchId_();
+  var response = ui.alert(
+    '分類整理を反映',
+    '変更行数: ' + dryRun.summary.changed_rows +
+      '\n変更セル数: ' + dryRun.summary.changed_cells +
+      '\nbatch_id: ' + batchId +
+      '\n\nこの処理は銘柄マスターを書き換えます。実行しますか？',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (response !== ui.Button.OK) return;
+  var result = mfImageCollectorApplyTaxonomy_({ batch_id: batchId, dry_run: false });
+  if (!result.ok) {
+    ui.alert('分類整理を反映', '中止: ' + (result.error || 'conflict') + '\nconflict数: ' + ((result.conflicts || []).length), ui.ButtonSet.OK);
+    return;
+  }
+  ui.alert('分類整理を反映', '完了: ' + result.applied_count + 'セル\nbatch_id: ' + result.batch_id, ui.ButtonSet.OK);
+}
+
+function mfImageCollectorShowTaxonomyRollbackConfirm() {
+  var ui = SpreadsheetApp.getUi();
+  var latest = mfImageCollectorLatestAppliedTaxonomyBatch_();
+  if (!latest) {
+    ui.alert('分類整理を元に戻す', 'rollback可能なbatchがありません。', ui.ButtonSet.OK);
+    return;
+  }
+  var response = ui.alert(
+    '分類整理を元に戻す',
+    'batch_id: ' + latest.batch_id +
+      '\n対象セル数: ' + latest.count +
+      '\n\n保存済みbefore値へ戻します。実行しますか？',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (response !== ui.Button.OK) return;
+  var result = mfImageCollectorRollbackTaxonomy_({ batch_id: latest.batch_id, dry_run: false });
+  ui.alert(
+    '分類整理を元に戻す',
+    '戻したセル: ' + (result.rollback_count || 0) +
+      '\nconflict数: ' + (result.conflict_count || 0) +
+      '\nbatch_id: ' + result.batch_id +
+      (result.error ? '\n' + result.error : ''),
+    ui.ButtonSet.OK
   );
 }
 
@@ -1468,6 +1540,294 @@ function mfImageCollectorTaxonomyDryRun_() {
     });
   }
   return { ok: true, dry_run: true, summary: summary, rows: rows };
+}
+
+function mfImageCollectorApplyTaxonomy_(payload) {
+  mfImageCollectorAssertSecret_(payload);
+  var dryRun = payload.dry_run !== false;
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var dryRunResult = mfImageCollectorTaxonomyDryRun_();
+  var changes = mfImageCollectorTaxonomyChangeCells_(dryRunResult.rows);
+  var validation = mfImageCollectorValidateTaxonomyApply_(values, headers, dryRunResult.summary, changes);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      dry_run: dryRun,
+      error: 'taxonomy apply validation failed',
+      conflicts: validation.conflicts
+    };
+  }
+  var batchId = String(payload.batch_id || '').trim() || mfImageCollectorTaxonomyBatchId_();
+  if (dryRun) {
+    return {
+      ok: true,
+      dry_run: true,
+      batch_id: batchId,
+      would_apply_count: changes.length,
+      summary: dryRunResult.summary,
+      changes: changes
+    };
+  }
+
+  var logSheet = mfImageCollectorGetOrCreateTaxonomyLogSheet_(ss);
+  var timestamp = new Date();
+  var logRows = changes.map(function(change) {
+    return MF_IMAGE_COLLECTOR_TAXONOMY_LOG_HEADERS.map(function(header) {
+      if (header === 'batch_id') return batchId;
+      if (header === 'timestamp') return timestamp;
+      if (header === 'status') return 'applied';
+      if (header === 'rollback_at') return '';
+      if (header === 'rollback_status') return '';
+      if (header === 'row_number') return change.row_number;
+      if (header === 'VersionKey') return change.version_key;
+      if (header === 'Tリファレンス番号') return change.reference;
+      if (header === '銘柄名') return change.name;
+      if (header === 'column') return change.column;
+      if (header === 'before') return change.before;
+      if (header === 'after') return change.after;
+      if (header === 'reason') return change.reason;
+      return '';
+    });
+  });
+  if (logRows.length) {
+    logSheet.getRange(logSheet.getLastRow() + 1, 1, logRows.length, MF_IMAGE_COLLECTOR_TAXONOMY_LOG_HEADERS.length).setValues(logRows);
+  }
+  for (var i = 0; i < changes.length; i += 1) {
+    var col = headers.indexOf(changes[i].column);
+    sheet.getRange(changes[i].row_number, col + 1).setValue(changes[i].after);
+  }
+  return {
+    ok: true,
+    dry_run: false,
+    batch_id: batchId,
+    applied_count: changes.length,
+    summary: dryRunResult.summary
+  };
+}
+
+function mfImageCollectorRollbackTaxonomy_(payload) {
+  mfImageCollectorAssertSecret_(payload);
+  var dryRun = payload.dry_run !== false;
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var logSheet = mfImageCollectorGetOrCreateTaxonomyLogSheet_(ss);
+  var batchId = String(payload.batch_id || '').trim();
+  if (!batchId) {
+    var latest = mfImageCollectorLatestAppliedTaxonomyBatch_();
+    if (!latest) throw new Error('No taxonomy batch is available for rollback.');
+    batchId = latest.batch_id;
+  }
+  var logValues = logSheet.getDataRange().getValues();
+  var logHeaders = logValues[0].map(function(value) { return String(value).trim(); });
+  var rollbackRows = [];
+  for (var i = 1; i < logValues.length; i += 1) {
+    if (String(logValues[i][logHeaders.indexOf('batch_id')] || '').trim() !== batchId) continue;
+    if (String(logValues[i][logHeaders.indexOf('status')] || '').trim() !== 'applied') continue;
+    if (String(logValues[i][logHeaders.indexOf('rollback_status')] || '').trim()) continue;
+    rollbackRows.push(mfImageCollectorTaxonomyLogRowToChange_(logValues[i], logHeaders, i + 1));
+  }
+  if (!rollbackRows.length) {
+    return { ok: false, dry_run: dryRun, batch_id: batchId, error: 'No unapplied rollback rows found for batch. It may already be rolled back.' };
+  }
+
+  var conflicts = [];
+  var toRollback = [];
+  for (var r = 0; r < rollbackRows.length; r += 1) {
+    var change = rollbackRows[r];
+    var col = headers.indexOf(change.column);
+    var rowIndex = change.row_number - 1;
+    if (col < 0 || rowIndex < 1 || rowIndex >= values.length) {
+      conflicts.push({ change: change, error: 'target row or column not found' });
+      continue;
+    }
+    var currentVersionKey = String(values[rowIndex][headers.indexOf('VersionKey')] || '').trim();
+    var currentValue = String(values[rowIndex][col] || '').trim();
+    if (currentVersionKey !== change.version_key) {
+      conflicts.push({ change: change, current_version_key: currentVersionKey, error: 'VersionKey mismatch' });
+      continue;
+    }
+    if (currentValue !== change.after) {
+      conflicts.push({ change: change, current_value: currentValue, error: 'after value mismatch' });
+      continue;
+    }
+    toRollback.push(change);
+  }
+  if (dryRun) {
+    return {
+      ok: true,
+      dry_run: true,
+      batch_id: batchId,
+      would_rollback_count: toRollback.length,
+      conflict_count: conflicts.length,
+      conflicts: conflicts
+    };
+  }
+
+  var now = new Date();
+  for (var j = 0; j < toRollback.length; j += 1) {
+    var targetCol = headers.indexOf(toRollback[j].column);
+    sheet.getRange(toRollback[j].row_number, targetCol + 1).setValue(toRollback[j].before);
+    mfImageCollectorMarkTaxonomyRollbackLog_(logSheet, logHeaders, toRollback[j].log_row_number, now, 'rolled_back');
+  }
+  for (var c = 0; c < conflicts.length; c += 1) {
+    mfImageCollectorMarkTaxonomyRollbackLog_(logSheet, logHeaders, conflicts[c].change.log_row_number, now, 'conflict');
+  }
+  return {
+    ok: conflicts.length === 0,
+    dry_run: false,
+    batch_id: batchId,
+    rollback_count: toRollback.length,
+    conflict_count: conflicts.length,
+    conflicts: conflicts
+  };
+}
+
+function mfImageCollectorTaxonomyChangeCells_(rows) {
+  var changes = [];
+  for (var i = 0; i < rows.length; i += 1) {
+    var row = rows[i];
+    var reason = (row.reasons || []).join('; ');
+    if (row.current_tea_type_tags !== row.new_tea_type_tags) {
+      changes.push(mfImageCollectorTaxonomyChangeCell_(row, '茶種タグ', row.current_tea_type_tags, row.new_tea_type_tags, reason));
+    }
+    if (row.current_official_category !== row.new_official_category) {
+      changes.push(mfImageCollectorTaxonomyChangeCell_(row, '現在のカテゴリ', row.current_official_category, row.new_official_category, reason));
+    }
+    if (row.current_aroma_categories !== row.new_aroma_categories) {
+      changes.push(mfImageCollectorTaxonomyChangeCell_(row, '香味大分類', row.current_aroma_categories, row.new_aroma_categories, reason));
+    }
+  }
+  return changes;
+}
+
+function mfImageCollectorTaxonomyChangeCell_(row, column, before, after, reason) {
+  return {
+    row_number: row.row_number,
+    version_key: row.version_key,
+    reference: row.reference,
+    name: row.name,
+    column: column,
+    before: before,
+    after: after,
+    reason: reason
+  };
+}
+
+function mfImageCollectorValidateTaxonomyApply_(values, headers, summary, changes) {
+  var conflicts = [];
+  var versionCol = headers.indexOf('VersionKey');
+  if (versionCol < 0) conflicts.push({ error: 'VersionKey column not found' });
+  var seen = {};
+  for (var i = 1; versionCol >= 0 && i < values.length; i += 1) {
+    var versionKey = String(values[i][versionCol] || '').trim();
+    if (!versionKey) conflicts.push({ row_number: i + 1, error: 'VersionKey is empty' });
+    if (versionKey && seen[versionKey]) conflicts.push({ row_number: i + 1, version_key: versionKey, error: 'duplicate VersionKey' });
+    seen[versionKey] = true;
+  }
+  if (Object.keys(summary.unknown_old_categories || {}).length) {
+    conflicts.push({ error: 'unknown aroma categories exist', unknown_old_categories: summary.unknown_old_categories });
+  }
+  for (var c = 0; c < changes.length; c += 1) {
+    var change = changes[c];
+    if (MF_IMAGE_COLLECTOR_TAXONOMY_COLUMNS.indexOf(change.column) < 0) {
+      conflicts.push({ change: change, error: 'column is not allowed for taxonomy apply' });
+      continue;
+    }
+    var rowIndex = change.row_number - 1;
+    var col = headers.indexOf(change.column);
+    if (rowIndex < 1 || rowIndex >= values.length || col < 0) {
+      conflicts.push({ change: change, error: 'target row or column not found' });
+      continue;
+    }
+    var actualVersionKey = versionCol >= 0 ? String(values[rowIndex][versionCol] || '').trim() : '';
+    var actualBefore = String(values[rowIndex][col] || '').trim();
+    if (actualVersionKey !== change.version_key) {
+      conflicts.push({ change: change, actual_version_key: actualVersionKey, error: 'VersionKey mismatch' });
+    }
+    if (actualBefore !== change.before) {
+      conflicts.push({ change: change, actual_before: actualBefore, error: 'before value mismatch' });
+    }
+    if ((change.column === '茶種タグ' || change.column === '現在のカテゴリ') && String(change.after || '').indexOf('紅茶') >= 0) {
+      conflicts.push({ change: change, error: '紅茶 remains in classification value' });
+    }
+    if (change.column === '香味大分類') {
+      var invalid = mfImageCollectorDelimitedValues_(change.after).filter(function(token) {
+        return mfImageCollectorAromaCategoryOrder_().indexOf(token) < 0;
+      });
+      if (invalid.length) conflicts.push({ change: change, invalid_categories: invalid, error: 'invalid aroma category' });
+    }
+  }
+  return { ok: conflicts.length === 0, conflicts: conflicts };
+}
+
+function mfImageCollectorGetOrCreateTaxonomyLogSheet_(ss) {
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_TAXONOMY_LOG_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(MF_IMAGE_COLLECTOR_TAXONOMY_LOG_SHEET_NAME);
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, MF_IMAGE_COLLECTOR_TAXONOMY_LOG_HEADERS.length).setValues([MF_IMAGE_COLLECTOR_TAXONOMY_LOG_HEADERS]);
+    return sheet;
+  }
+  var headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0].map(function(value) { return String(value).trim(); });
+  for (var i = 0; i < MF_IMAGE_COLLECTOR_TAXONOMY_LOG_HEADERS.length; i += 1) {
+    if (headers.indexOf(MF_IMAGE_COLLECTOR_TAXONOMY_LOG_HEADERS[i]) < 0) {
+      sheet.getRange(1, sheet.getLastColumn() + 1).setValue(MF_IMAGE_COLLECTOR_TAXONOMY_LOG_HEADERS[i]);
+    }
+  }
+  return sheet;
+}
+
+function mfImageCollectorTaxonomyLogRowToChange_(row, headers, logRowNumber) {
+  function value(header) {
+    return String(row[headers.indexOf(header)] || '').trim();
+  }
+  return {
+    log_row_number: logRowNumber,
+    row_number: Number(value('row_number')),
+    version_key: value('VersionKey'),
+    reference: value('Tリファレンス番号'),
+    name: value('銘柄名'),
+    column: value('column'),
+    before: value('before'),
+    after: value('after'),
+    reason: value('reason')
+  };
+}
+
+function mfImageCollectorMarkTaxonomyRollbackLog_(sheet, headers, rowNumber, when, status) {
+  sheet.getRange(rowNumber, headers.indexOf('rollback_at') + 1).setValue(when);
+  sheet.getRange(rowNumber, headers.indexOf('rollback_status') + 1).setValue(status);
+}
+
+function mfImageCollectorLatestAppliedTaxonomyBatch_() {
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_TAXONOMY_LOG_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return null;
+  var values = sheet.getDataRange().getValues();
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var batches = {};
+  for (var i = 1; i < values.length; i += 1) {
+    var status = String(values[i][headers.indexOf('status')] || '').trim();
+    var rollbackStatus = String(values[i][headers.indexOf('rollback_status')] || '').trim();
+    if (status !== 'applied' || rollbackStatus) continue;
+    var batchId = String(values[i][headers.indexOf('batch_id')] || '').trim();
+    if (!batchId) continue;
+    batches[batchId] = (batches[batchId] || 0) + 1;
+  }
+  var ids = Object.keys(batches).sort();
+  if (!ids.length) return null;
+  var latest = ids[ids.length - 1];
+  return { batch_id: latest, count: batches[latest] };
+}
+
+function mfImageCollectorTaxonomyBatchId_() {
+  return 'taxonomy-' + Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Asia/Tokyo', 'yyyyMMdd-HHmmss') + '-' + Math.random().toString(36).slice(2, 8);
 }
 
 function mfImageCollectorEmptyTaxonomySummary_(masterRows) {
