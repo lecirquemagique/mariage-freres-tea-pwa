@@ -1679,8 +1679,13 @@ function buildImageOnlyReviewCandidate({ reference, info, candidate, pageUrl, de
   };
 }
 
-function enrichImageReviewWithVerifiedPage({ imageReview, verifiedPage, source, masterProducts }) {
+function enrichImageReviewWithVerifiedPage({ imageReview, verifiedPage, verifiedPages = [], source, masterProducts }) {
   const reference = imageReview.reference;
+  const pages = verifiedPages.length ? verifiedPages : [verifiedPage].filter(Boolean);
+  const urlsByLanguage = targetedOfficialUrlByLanguage(pages);
+  const namesByLanguage = targetedOfficialNamesByLanguage(pages);
+  const descriptionsByLanguage = targetedDescriptionsByLanguage(pages);
+  const categoriesByLanguage = targetedCategoriesByLanguage(pages);
   const review = buildUnregisteredReferenceReview({
     reference,
     facts: verifiedPage.facts,
@@ -1703,11 +1708,25 @@ function enrichImageReviewWithVerifiedPage({ imageReview, verifiedPage, source, 
     image_height: imageReview.image_height || 0,
     official_page_url: verifiedPage.url,
     official_page_verified: true,
+    source_language: Object.keys(urlsByLanguage).join('+') || verifiedPage.language,
+    fr_official_url: urlsByLanguage.FR || '',
+    en_official_url: urlsByLanguage.EN || '',
+    jp_official_url: urlsByLanguage.JP || '',
+    official_urls_by_language: urlsByLanguage,
+    official_names_by_language: namesByLanguage,
+    description_snippets_by_language: descriptionsByLanguage,
+    categories_by_language: categoriesByLanguage,
+    official_name_differences: Object.entries(namesByLanguage).map(([lang, name]) => `${lang}: ${name}`).join('\n'),
+    description_excerpt: preferredDescriptionByLanguage(descriptionsByLanguage),
     evidence: mergeUniqueTextLines(
       imageReview.evidence,
-      `evidence_level=official_verified; verified_product_page=${verifiedPage.url}; exact_reference=${reference}; image_url=${imageReview.discovered_image_url}`
+      `evidence_level=official_verified; verified_product_pages=${pages.map((item) => item.url).join(',')}; exact_reference=${reference}; image_url=${imageReview.discovered_image_url}`
     ),
-    discovery_sources: mergeArrayValues(imageReview.discovery_sources, review.discovery_sources, (entry) => `${entry.discovery_source || entry.source || ''}|${entry.url || ''}`),
+    discovery_sources: mergeArrayValues(
+      imageReview.discovery_sources,
+      pages.map((item) => ({ source: source.id, source_type: source.source, discovery_source: 'image_official_reverify', language: item.language, url: item.url })),
+      (entry) => `${entry.discovery_source || entry.source || ''}|${entry.url || ''}`
+    ),
   });
   review.detection_id = reviewCandidateKey(review);
   return review;
@@ -1754,10 +1773,22 @@ async function verifyImageDiscoveredReference({ context, reference, config, page
       const inspected = await inspectTargetedProductPage(page, item.url, input, config, debug, item.source_url);
       if (inspected.ok && inspected.refs.includes(reference)) verified.push(inspected);
     }
-    if (verified.length !== 1) {
-      return { ok: false, reason: verified.length ? 'ambiguous_verified_pages' : 'no_verified_product', candidate_urls: candidateUrls.map((item) => item.url) };
+    const groups = verifiedProductGroups(verified, reference);
+    if (groups.length !== 1) {
+      return {
+        ok: false,
+        reason: groups.length ? 'ambiguous_verified_products' : 'no_verified_product',
+        candidate_urls: candidateUrls.map((item) => item.url),
+        verified_groups: groups.map((group) => ({
+          identity: group.identity,
+          reference: group.reference,
+          reference_type: group.reference_type,
+          urls: group.pages.map((verifiedPage) => verifiedPage.url),
+        })),
+      };
     }
-    return { ok: true, page: verified[0], source, candidate_urls: candidateUrls.map((item) => item.url) };
+    const group = groups[0];
+    return { ok: true, page: preferredTargetedPage(group.pages), pages: group.pages, group, source, candidate_urls: candidateUrls.map((item) => item.url) };
   } catch (error) {
     return { ok: false, reason: 'error', error_message: error.message, candidate_urls: candidateUrls.map((item) => item.url) };
   } finally {
@@ -1787,7 +1818,7 @@ async function updateDiscoveryCache({ cache, candidates, product, pageUrl, maste
         if (context) {
           const verified = await verifyImageDiscoveredReference({ context, reference, config, pageUrl, debug });
           if (verified.ok) {
-            review = enrichImageReviewWithVerifiedPage({ imageReview: review, verifiedPage: verified.page, source: verified.source, masterProducts });
+            review = enrichImageReviewWithVerifiedPage({ imageReview: review, verifiedPage: verified.page, verifiedPages: verified.pages, source: verified.source, masterProducts });
           } else {
             review.evidence = mergeUniqueTextLines(review.evidence, `official_reverify=${verified.reason}; candidate_urls=${(verified.candidate_urls || []).join(',')}; error=${verified.error_message || ''}`);
           }
@@ -1964,6 +1995,55 @@ function preferredTargetedPage(pages) {
     const right = priority[b.language] ?? 9;
     return left - right || a.url.localeCompare(b.url);
   })[0] || null;
+}
+
+function canonicalVerifiedPageIdentity(reference, page) {
+  const ref = String(reference || '').trim().toUpperCase();
+  const referenceType = isSalesSkuReference(ref) && !(page?.t_references || []).includes(ref) ? 'sales_sku' : 'tea';
+  return `${referenceType}|${ref}`;
+}
+
+function uniqueVerifiedPagesByUrl(pages) {
+  const seen = new Set();
+  const out = [];
+  for (const page of pages || []) {
+    const key = String(page.url || '').toLowerCase();
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    out.push(page);
+  }
+  return out;
+}
+
+function verifiedProductGroups(verifiedPages, preferredReference = '') {
+  const groups = new Map();
+  const preferred = String(preferredReference || '').trim().toUpperCase();
+  for (const page of verifiedPages || []) {
+    for (const ref of page.refs || []) {
+      const reference = String(ref || '').trim().toUpperCase();
+      if (!reference) continue;
+      if (preferred && reference !== preferred) continue;
+      const identity = canonicalVerifiedPageIdentity(reference, page);
+      if (!groups.has(identity)) {
+        groups.set(identity, {
+          identity,
+          reference,
+          reference_type: identity.startsWith('sales_sku|') ? 'sales_sku' : 'tea',
+          pages: [],
+          exact_name_pages: 0,
+        });
+      }
+      const group = groups.get(identity);
+      if (!group.pages.some((existing) => String(existing.url || '').toLowerCase() === String(page.url || '').toLowerCase())) {
+        group.pages.push(page);
+        if (page.exact_name_match) group.exact_name_pages += 1;
+      }
+    }
+  }
+  return [...groups.values()].map((group) => ({
+    ...group,
+    pages: uniqueVerifiedPagesByUrl(group.pages),
+  }));
 }
 
 function targetedMasterMatches(reference, officialName, masterProducts) {
@@ -2180,20 +2260,7 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
       });
     }
 
-    const pagesByReference = new Map();
-    for (const verified of verifiedPages) {
-      const refs = verified.refs;
-      for (const ref of refs) {
-        if (!pagesByReference.has(ref)) pagesByReference.set(ref, []);
-        pagesByReference.get(ref).push(verified);
-      }
-    }
-
-    const referenceGroups = [...pagesByReference.entries()].map(([reference, pages]) => ({
-      reference,
-      pages,
-      exact_name_pages: pages.filter((item) => item.exact_name_match).length,
-    }));
+    const referenceGroups = verifiedProductGroups(verifiedPages, input.reference);
     const preferredGroups = input.reference
       ? referenceGroups.filter((group) => group.reference === input.reference)
       : referenceGroups.filter((group) => group.exact_name_pages > 0);
@@ -2251,7 +2318,7 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
       resolved: true,
       target_input: input,
       resolved_reference: resolved.reference,
-      reference_type: primaryPage.reference_type || (isSalesSkuReference(resolved.reference) ? 'sales_sku' : 'tea'),
+      reference_type: resolved.reference_type || primaryPage.reference_type || (isSalesSkuReference(resolved.reference) ? 'sales_sku' : 'tea'),
       t_reference: primaryPage.t_references?.[0] || (isTeaReference(resolved.reference) ? resolved.reference : ''),
       sales_references: salesSkuReferencesByPrefix(resolved.pages.flatMap((page) => page.sales_references || [])),
       sku_only: primaryPage.sku_only === true,
