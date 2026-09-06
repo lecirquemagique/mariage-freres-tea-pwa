@@ -1138,13 +1138,20 @@ function masterHasSuggestedValue(product, column, suggestedValue) {
 
 function addStructuredSuggestion(suggestions, product, suggestion) {
   if (!suggestion?.column || !suggestion?.suggested_value) return;
-  if (masterHasSuggestedValue(product, suggestion.column, suggestion.suggested_value)) return;
-  const key = `${suggestion.column}|${suggestion.suggested_value}`;
+  const normalizedSuggestion = { ...suggestion };
+  if (normalizedSuggestion.column === MASTER_COLUMNS.flavorCategory) {
+    const normalizedCategories = normalizeAromaCategoriesForMaster(normalizedSuggestion.suggested_value, '').categories;
+    if (normalizedCategories.length !== 1) return;
+    normalizedSuggestion.suggested_value = normalizedCategories[0];
+  }
+  if (!normalizedSuggestion.suggested_value) return;
+  if (masterHasSuggestedValue(product, normalizedSuggestion.column, normalizedSuggestion.suggested_value)) return;
+  const key = `${normalizedSuggestion.column}|${normalizedSuggestion.suggested_value}`;
   if (suggestions.some((item) => `${item.column}|${item.suggested_value}` === key)) return;
   suggestions.push({
     confidence: 'medium',
     requires_human_review: true,
-    ...suggestion,
+    ...normalizedSuggestion,
   });
 }
 
@@ -1363,6 +1370,8 @@ function buildOfficialStructuredFacts({ product, facts, language, vocabulary, tr
 }
 
 function structuredFactReviewCandidate({ product, facts, suggestion }) {
+  const targetVersionKey = normalizeText(product.master?.versionKey || '');
+  if (!targetVersionKey) return null;
   const currentValue = normalizeText(product.master?.[suggestion.column] || '');
   const candidate = {
     detected_at: nowIso(),
@@ -1372,9 +1381,9 @@ function structuredFactReviewCandidate({ product, facts, suggestion }) {
     official_url: suggestion.evidence_url || facts?.url || product.productUrl || '',
     source_language: suggestion.evidence_language || sourceLanguageFromUrl(facts?.url) || '',
     existing_reference: product.reference,
-    existing_version_key: product.master?.versionKey || '',
+    existing_version_key: targetVersionKey,
     existing_name: product.name || '',
-    target_version_key: product.master?.versionKey || '',
+    target_version_key: targetVersionKey,
     target_column: suggestion.column,
     current_value: currentValue,
     suggested_value: suggestion.suggested_value,
@@ -1397,17 +1406,47 @@ function structuredFactReviewCandidate({ product, facts, suggestion }) {
   return candidate;
 }
 
-function productForStructuredFacts(reference, masterProducts = [], facts = {}) {
-  const existing = findMasterProductByReference(masterProducts, reference);
-  if (existing) return existing;
-  return {
-    reference,
-    name: facts?.h1 || '',
-    productUrl: facts?.url || '',
-    master: {
-      versionKey: '',
-    },
-  };
+function normalizeUrlForCompare(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || '').trim());
+    url.hash = '';
+    url.search = '';
+    url.pathname = url.pathname.replace(/\/+$/, '');
+    return url.toString().toLowerCase();
+  } catch {
+    return normalizeText(rawUrl).replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+function resolveStructuredFactMasterProduct({ reference, masterProducts = [], facts = {}, officialName = '', debug = false }) {
+  const normalizedReference = String(reference || '').trim().toUpperCase();
+  if (!normalizedReference) return null;
+  const candidates = (masterProducts || []).filter((product) =>
+    productHasReference(product, normalizedReference) && hasValue(product.master?.versionKey)
+  );
+  if (candidates.length === 1) return candidates[0];
+
+  const pageUrls = [
+    facts?.url,
+    facts?.canonical,
+    facts?.source_url,
+  ].map(normalizeUrlForCompare).filter(Boolean);
+  if (pageUrls.length) {
+    const urlMatches = candidates.filter((product) => pageUrls.includes(normalizeUrlForCompare(product.productUrl || product.master?.productUrl || '')));
+    if (urlMatches.length === 1) return urlMatches[0];
+  }
+
+  const normalizedOfficialName = normalizeNameForCompare(officialName || facts?.h1 || facts?.title || '');
+  if (normalizedOfficialName) {
+    const nameMatches = candidates.filter((product) => normalizeNameForCompare(product.name || '') === normalizedOfficialName);
+    if (nameMatches.length === 1) return nameMatches[0];
+  }
+
+  if (debug && candidates.length !== 1) {
+    const keys = candidates.map((product) => product.master?.versionKey || '').filter(Boolean).join(',');
+    console.log(`[structured_fact] target row ambiguous reference=${normalizedReference} candidates=${candidates.length}${keys ? ` version_keys=${keys}` : ''}`);
+  }
+  return null;
 }
 
 function structuredFactReviewCandidatesForProduct({ product, facts, vocabulary }) {
@@ -1415,7 +1454,7 @@ function structuredFactReviewCandidatesForProduct({ product, facts, vocabulary }
   const officialStructuredFacts = buildOfficialStructuredFacts({ product, facts, language, vocabulary });
   const reviewCandidates = officialStructuredFacts.structured_review_suggestions.map((suggestion) =>
     structuredFactReviewCandidate({ product, facts, suggestion })
-  );
+  ).filter(Boolean);
   return { officialStructuredFacts, reviewCandidates };
 }
 
@@ -2287,8 +2326,16 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
     const masterMatches = targetedMasterMatches(resolved.reference, primaryPage.official_name, master?.products || []);
     const existingMaster = masterMatches.exact.length > 0;
     const vocabulary = structuredFactVocabulary(master?.products || []);
-    const structuredProduct = productForStructuredFacts(resolved.reference, master?.products || [], primaryPage.facts);
-    const structured = structuredFactReviewCandidatesForProduct({ product: structuredProduct, facts: primaryPage.facts, vocabulary });
+    const structuredProduct = resolveStructuredFactMasterProduct({
+      reference: resolved.reference,
+      masterProducts: master?.products || [],
+      facts: primaryPage.facts,
+      officialName: primaryPage.official_name,
+      debug: args.debug,
+    });
+    const structured = structuredProduct
+      ? structuredFactReviewCandidatesForProduct({ product: structuredProduct, facts: primaryPage.facts, vocabulary })
+      : { officialStructuredFacts: null, reviewCandidates: [] };
     const structuredCandidates = existingMaster
       ? structured.reviewCandidates.filter((candidate) => hasValue(candidate.target_version_key))
       : [];
@@ -4293,10 +4340,12 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
 
           if (pageIsProduct) {
             for (const ref of pageRefs) {
-              const structuredProduct = productForStructuredFacts(ref, masterProducts, facts);
-              const structuredFacts = structuredFactReviewCandidatesForProduct({ product: structuredProduct, facts, vocabulary });
-              for (const candidate of structuredFacts.reviewCandidates) {
-                if (cacheReviewCandidate(discoveryCache, candidate)) createdOrQueuedReviews += 1;
+              const structuredProduct = resolveStructuredFactMasterProduct({ reference: ref, masterProducts, facts, officialName: facts.h1, debug: args.debug });
+              if (structuredProduct) {
+                const structuredFacts = structuredFactReviewCandidatesForProduct({ product: structuredProduct, facts, vocabulary });
+                for (const candidate of structuredFacts.reviewCandidates) {
+                  if (cacheReviewCandidate(discoveryCache, candidate)) createdOrQueuedReviews += 1;
+                }
               }
               if (masterReferences.has(ref)) {
                 existingReferences += 1;

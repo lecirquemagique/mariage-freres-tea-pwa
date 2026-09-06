@@ -169,6 +169,10 @@ function mfImageCollectorDoPost(e) {
         items: mfImageCollectorGetReviewItems(String(payload.status || '要確認'))
       });
     }
+    if (payload.action === 'repairStructuredFactTargetVersions') {
+      mfImageCollectorAssertSecret_(payload);
+      return mfImageCollectorJson_(mfImageCollectorRepairStructuredFactTargetVersions_(payload));
+    }
     if (payload.action === 'completeTargetDiscoveryRequest') {
       mfImageCollectorAssertSecret_(payload);
       return mfImageCollectorJson_(mfImageCollectorCompleteTargetDiscoveryRequest_(payload));
@@ -1487,6 +1491,169 @@ function mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, ver
     }
   }
   return -1;
+}
+
+function mfImageCollectorRepairStructuredFactTargetVersions_(payload) {
+  var dryRun = payload.dry_run !== false;
+  var reviewSheet = mfImageCollectorGetOrCreateReviewSheet_();
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var masterSheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!masterSheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+
+  var reviewValues = reviewSheet.getDataRange().getValues();
+  if (reviewValues.length < 2) return { ok: true, dry_run: dryRun, repaired: 0, candidates: [], skipped: [] };
+  var reviewHeaders = reviewValues[0].map(function(value) { return String(value).trim(); });
+  var masterValues = masterSheet.getDataRange().getValues();
+  var masterHeaders = masterValues[0].map(function(value) { return String(value).trim(); });
+  var targetVersionCol = reviewHeaders.indexOf('対象VersionKey');
+  var dbVersionCol = reviewHeaders.indexOf('DB既存VersionKey');
+  var dbRefCol = reviewHeaders.indexOf('DB既存T');
+  var dbNameCol = reviewHeaders.indexOf('DB既存名');
+  if (targetVersionCol < 0 || dbVersionCol < 0 || dbRefCol < 0 || dbNameCol < 0) {
+    throw new Error('Review sheet is missing DB/target VersionKey columns.');
+  }
+
+  var candidates = [];
+  var skipped = [];
+  for (var i = 1; i < reviewValues.length; i += 1) {
+    var review = {};
+    for (var j = 0; j < reviewHeaders.length; j += 1) review[reviewHeaders[j]] = reviewValues[i][j];
+    if (String(review['検出種別'] || '').trim() !== 'structured_fact') continue;
+    if (String(review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim()) continue;
+    var resolved = mfImageCollectorResolveStructuredFactMasterRow_(masterValues, masterHeaders, review);
+    if (resolved.ok) {
+      var update = {
+        row_number: i + 1,
+        reference: String(review['Tリファレンス番号'] || '').trim(),
+        target_column: String(review['対象列'] || '').trim(),
+        suggested_value: String(review['候補値'] || '').trim(),
+        version_key: resolved.version_key,
+        master_row_number: resolved.row_number,
+        name: resolved.name,
+        reason: resolved.reason
+      };
+      candidates.push(update);
+      if (!dryRun) {
+        reviewSheet.getRange(i + 1, targetVersionCol + 1).setValue(resolved.version_key);
+        reviewSheet.getRange(i + 1, dbVersionCol + 1).setValue(resolved.version_key);
+        reviewSheet.getRange(i + 1, dbRefCol + 1).setValue(resolved.reference);
+        reviewSheet.getRange(i + 1, dbNameCol + 1).setValue(resolved.name);
+      }
+    } else {
+      skipped.push({
+        row_number: i + 1,
+        reference: String(review['Tリファレンス番号'] || '').trim(),
+        target_column: String(review['対象列'] || '').trim(),
+        suggested_value: String(review['候補値'] || '').trim(),
+        reason: resolved.reason,
+        matches: resolved.matches || []
+      });
+    }
+  }
+  return { ok: true, dry_run: dryRun, repaired: dryRun ? 0 : candidates.length, candidates: candidates, skipped: skipped };
+}
+
+function mfImageCollectorResolveStructuredFactMasterRow_(values, headers, review) {
+  var reference = String(review['Tリファレンス番号'] || '').trim().toUpperCase();
+  if (!reference) return { ok: false, reason: 'reference missing' };
+  var versionCol = headers.indexOf('VersionKey');
+  var refCol = headers.indexOf('Tリファレンス番号');
+  var nameCol = headers.indexOf('現在の公式名');
+  var urlCol = headers.indexOf('公式商品ページURL');
+  if (versionCol < 0 || refCol < 0) return { ok: false, reason: 'required master columns missing' };
+
+  var matches = [];
+  for (var i = 1; i < values.length; i += 1) {
+    var versionKey = String(values[i][versionCol] || '').trim();
+    if (!versionKey) continue;
+    var rowRef = String(values[i][refCol] || '').trim().toUpperCase();
+    var versionPrefix = String(versionKey || '').trim().toUpperCase().match(/^([A-Z]+\d[A-Z0-9]*)-[BN]\d{2}$/);
+    if (rowRef !== reference && (!versionPrefix || versionPrefix[1] !== reference)) continue;
+    matches.push({
+      row_number: i + 1,
+      version_key: versionKey,
+      reference: rowRef,
+      name: nameCol >= 0 ? String(values[i][nameCol] || '').trim() : '',
+      url: urlCol >= 0 ? String(values[i][urlCol] || '').trim() : ''
+    });
+  }
+  if (matches.length === 1) return mfImageCollectorStructuredFactResolvedRow_(matches[0], 'single reference match');
+
+  var urls = mfImageCollectorStructuredFactReviewUrls_(review);
+  if (urls.length) {
+    var urlMatches = matches.filter(function(match) {
+      return urls.indexOf(mfImageCollectorNormalizeUrlForCompare_(match.url)) >= 0;
+    });
+    if (urlMatches.length === 1) return mfImageCollectorStructuredFactResolvedRow_(urlMatches[0], 'official URL match');
+  }
+
+  var name = mfImageCollectorNormalizeNameForCompare_(review['公式名']);
+  if (name) {
+    var nameMatches = matches.filter(function(match) {
+      return mfImageCollectorNormalizeNameForCompare_(match.name) === name;
+    });
+    if (nameMatches.length === 1) return mfImageCollectorStructuredFactResolvedRow_(nameMatches[0], 'official name match');
+  }
+
+  return {
+    ok: false,
+    reason: matches.length ? 'target row ambiguous' : 'no master row for reference',
+    matches: matches.map(function(match) { return { row_number: match.row_number, version_key: match.version_key, name: match.name, url: match.url }; })
+  };
+}
+
+function mfImageCollectorStructuredFactResolvedRow_(match, reason) {
+  return {
+    ok: true,
+    reason: reason,
+    row_number: match.row_number,
+    version_key: match.version_key,
+    reference: match.reference,
+    name: match.name
+  };
+}
+
+function mfImageCollectorStructuredFactReviewUrls_(review) {
+  var values = [
+    review['公式URL'],
+    review['根拠URL'],
+    review['FR公式URL'],
+    review['EN公式URL'],
+    review['JP公式URL']
+  ];
+  try {
+    var info = JSON.parse(String(review['公式情報JSON'] || '{}') || '{}');
+    if (info.official_page_url) values.push(info.official_page_url);
+    if (info.urls_by_language) {
+      values.push(info.urls_by_language.FR);
+      values.push(info.urls_by_language.EN);
+      values.push(info.urls_by_language.JP);
+    }
+  } catch (error) {
+  }
+  var out = [];
+  for (var i = 0; i < values.length; i += 1) {
+    var normalized = mfImageCollectorNormalizeUrlForCompare_(values[i]);
+    if (normalized && out.indexOf(normalized) < 0) out.push(normalized);
+  }
+  return out;
+}
+
+function mfImageCollectorNormalizeUrlForCompare_(rawUrl) {
+  var value = String(rawUrl || '').trim();
+  if (!value) return '';
+  return value.replace(/[?#].*$/, '').replace(/\/+$/, '').toLowerCase();
+}
+
+function mfImageCollectorNormalizeNameForCompare_(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .replace(/[®™]/g, '')
+    .replace(/[’‘´`]/g, "'")
+    .replace(/[^A-Za-z0-9À-ÿ一-龠ぁ-んァ-ヶー]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
 }
 
 function mfImageCollectorNextVersionKey_(values, headers, reference) {
