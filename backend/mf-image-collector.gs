@@ -1509,7 +1509,8 @@ function mfImageCollectorRepairStructuredFactTargetVersions_(payload) {
   var dbVersionCol = reviewHeaders.indexOf('DB既存VersionKey');
   var dbRefCol = reviewHeaders.indexOf('DB既存T');
   var dbNameCol = reviewHeaders.indexOf('DB既存名');
-  if (targetVersionCol < 0 || dbVersionCol < 0 || dbRefCol < 0 || dbNameCol < 0) {
+  var suggestedValueCol = reviewHeaders.indexOf('候補値');
+  if (targetVersionCol < 0 || dbVersionCol < 0 || dbRefCol < 0 || dbNameCol < 0 || suggestedValueCol < 0) {
     throw new Error('Review sheet is missing DB/target VersionKey columns.');
   }
 
@@ -1522,11 +1523,25 @@ function mfImageCollectorRepairStructuredFactTargetVersions_(payload) {
     if (String(review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim()) continue;
     var resolved = mfImageCollectorResolveStructuredFactMasterRow_(masterValues, masterHeaders, review);
     if (resolved.ok) {
+      var normalizedSuggestedValue = mfImageCollectorRepairStructuredFactSuggestedValue_(review);
+      if (!normalizedSuggestedValue.ok) {
+        skipped.push({
+          row_number: i + 1,
+          reference: String(review['Tリファレンス番号'] || '').trim(),
+          target_column: String(review['対象列'] || '').trim(),
+          suggested_value: String(review['候補値'] || '').trim(),
+          reason: normalizedSuggestedValue.reason,
+          matches: [{ row_number: resolved.row_number, version_key: resolved.version_key, name: resolved.name }]
+        });
+        continue;
+      }
       var update = {
         row_number: i + 1,
         reference: String(review['Tリファレンス番号'] || '').trim(),
         target_column: String(review['対象列'] || '').trim(),
-        suggested_value: String(review['候補値'] || '').trim(),
+        suggested_value: normalizedSuggestedValue.value,
+        original_suggested_value: normalizedSuggestedValue.original_value,
+        suggested_value_changed: normalizedSuggestedValue.changed,
         version_key: resolved.version_key,
         master_row_number: resolved.row_number,
         name: resolved.name,
@@ -1538,6 +1553,9 @@ function mfImageCollectorRepairStructuredFactTargetVersions_(payload) {
         reviewSheet.getRange(i + 1, dbVersionCol + 1).setValue(resolved.version_key);
         reviewSheet.getRange(i + 1, dbRefCol + 1).setValue(resolved.reference);
         reviewSheet.getRange(i + 1, dbNameCol + 1).setValue(resolved.name);
+        if (normalizedSuggestedValue.changed) {
+          reviewSheet.getRange(i + 1, suggestedValueCol + 1).setValue(normalizedSuggestedValue.value);
+        }
       }
     } else {
       skipped.push({
@@ -1551,6 +1569,30 @@ function mfImageCollectorRepairStructuredFactTargetVersions_(payload) {
     }
   }
   return { ok: true, dry_run: dryRun, repaired: dryRun ? 0 : candidates.length, candidates: candidates, skipped: skipped };
+}
+
+function mfImageCollectorRepairStructuredFactSuggestedValue_(review) {
+  var targetColumn = String(review['対象列'] || '').trim();
+  var original = String(review['候補値'] || '').trim();
+  if (targetColumn !== '香味大分類') {
+    return { ok: true, value: original, original_value: original, changed: false };
+  }
+  var normalized = mfImageCollectorNormalizeStructuredFactValue_(targetColumn, original);
+  if (!normalized) {
+    return {
+      ok: false,
+      reason: 'unknown aroma taxonomy value',
+      value: '',
+      original_value: original,
+      changed: false
+    };
+  }
+  return {
+    ok: true,
+    value: normalized,
+    original_value: original,
+    changed: normalized !== original
+  };
 }
 
 function mfImageCollectorResolveStructuredFactMasterRow_(values, headers, review) {
