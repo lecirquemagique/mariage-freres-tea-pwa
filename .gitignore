@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+config.json
+
+node_modules/
+pnpm-lock.yaml
+browser-profile/
+chrome-cdp-profile/
+images/
+logs/
+collector-state.json
+opportunistic-discoveries.json
+new-reference-discovery-state.json
+tmp/
+*.local.json
