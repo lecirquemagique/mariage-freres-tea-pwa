@@ -93,6 +93,9 @@ function parseArgs(argv) {
     discoverNewReferences: false,
     backfillOfficialDescriptions: false,
     enrichIncompleteRecords: false,
+    auditIncompleteRecords: false,
+    auditAll: false,
+    auditLimit: null,
     enrichRef: '',
     writeStructuredReviewCandidates: false,
     taxonomyDryRun: false,
@@ -122,6 +125,17 @@ function parseArgs(argv) {
     else if (arg === '--discover-new-references') args.discoverNewReferences = true;
     else if (arg === '--backfill-official-descriptions') args.backfillOfficialDescriptions = true;
     else if (arg === '--enrich-incomplete-records') args.enrichIncompleteRecords = true;
+    else if (arg === '--audit-incomplete-records') args.auditIncompleteRecords = true;
+    else if (arg === '--audit-all') {
+      args.auditIncompleteRecords = true;
+      args.auditAll = true;
+    } else if (arg === '--audit-limit') {
+      args.auditIncompleteRecords = true;
+      args.auditLimit = Number(argv[++i]);
+    } else if (arg.startsWith('--audit-limit=')) {
+      args.auditIncompleteRecords = true;
+      args.auditLimit = Number(arg.slice('--audit-limit='.length));
+    }
     else if (arg === '--enrich-ref') {
       args.enrichRef = argv[++i] || '';
       args.enrichIncompleteRecords = true;
@@ -4260,6 +4274,377 @@ async function runEnrichIncompleteRecords({ context, config, master, baseDir, ar
   return result;
 }
 
+function auditTimestamp() {
+  return new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-');
+}
+
+function productIsPrimaryAuditCandidate(product) {
+  const master = product?.master || {};
+  return hasValue(product?.productUrl) && (
+    !hasValue(master.officialDescription) ||
+    !hasValue(master.flavorCategory) ||
+    !hasValue(master.flavorTags)
+  );
+}
+
+function selectAuditIncompleteProducts(masterProducts, args, limit) {
+  const refs = args.enrichRef
+    ? args.enrichRef.split(',').map((ref) => normalizeTargetReference(ref) || normalizeText(ref).toUpperCase()).filter(Boolean)
+    : args.refs;
+  const refFilter = refs?.length ? new Set(refs.map((ref) => String(ref || '').toUpperCase())) : null;
+  const selected = [];
+  for (const product of masterProducts || []) {
+    if (refFilter) {
+      if (![...refFilter].some((ref) => productHasReference(product, ref))) continue;
+    } else if (!productIsPrimaryAuditCandidate(product)) {
+      continue;
+    }
+    selected.push(product);
+    if (Number.isFinite(limit) && limit >= 0 && selected.length >= limit) break;
+  }
+  return selected;
+}
+
+function auditMissingFields(product) {
+  const master = product?.master || {};
+  return {
+    official_description: !hasValue(master.officialDescription),
+    aroma_category: !hasValue(master.flavorCategory),
+    flavor_tags: !hasValue(master.flavorTags),
+  };
+}
+
+function classifyEnrichmentAuditEntry({ inspected, descriptionValue, structuredCandidates, missing }) {
+  const reasons = [];
+  if (!inspected?.ok) {
+    const reason = inspected?.reject_reason || 'unknown_error';
+    if (/mismatch/i.test(reason)) return { classification: 'URL不一致', reasons: [reason] };
+    if (/not_product_page|no_verified_reference/i.test(reason)) return { classification: '要確認', reasons: [reason] };
+    return { classification: 'error', reasons: [reason] };
+  }
+
+  const descriptionFound = hasValue(descriptionValue?.original_description);
+  const structuredFound = (structuredCandidates || []).length > 0;
+  const canComplement =
+    (missing.official_description && (hasValue(descriptionValue?.japanese_description) || descriptionValue?.needs_translation)) ||
+    ((missing.aroma_category || missing.flavor_tags) && structuredFound);
+
+  if (canComplement) {
+    if (missing.official_description && descriptionValue?.needs_translation) reasons.push('official_description_requires_translation_review');
+    if (missing.official_description && hasValue(descriptionValue?.japanese_description)) reasons.push('official_description_can_be_backfilled');
+    if ((missing.aroma_category || missing.flavor_tags) && structuredFound) reasons.push('structured_fact_candidates_found');
+    return { classification: '補完可能', reasons };
+  }
+
+  if (!descriptionFound && !structuredFound) return { classification: '情報不足', reasons: ['no_product_description_or_structured_fact_candidates'] };
+  return { classification: '要確認', reasons: ['official_information_found_but_no_safe_complement_for_missing_fields'] };
+}
+
+function summarizeAuditCurrent(product) {
+  const master = product?.master || {};
+  return {
+    official_description: master.officialDescription || '',
+    aroma_category: master.flavorCategory || '',
+    flavor_tags: master.flavorTags || '',
+  };
+}
+
+function buildAuditEntryBase(product) {
+  const reference = product?.reference || '';
+  return {
+    version_key: product?.master?.versionKey || '',
+    reference,
+    t_reference: product?.tReference || (/^T\d+$/i.test(reference) ? reference : ''),
+    sku_only: isSalesSkuReference(reference) && !hasValue(product?.tReference),
+    name: product?.name || '',
+    official_url: product?.productUrl || '',
+    current: summarizeAuditCurrent(product),
+    missing: auditMissingFields(product),
+    official: {
+      page_valid: false,
+      identity_match: false,
+      languages_checked: [],
+      description_found: false,
+      description_excerpt: '',
+      ingredients_found: false,
+      ingredients_excerpt: '',
+    },
+    structured_fact_candidates: [],
+    translation_review_candidate: null,
+    classification: '',
+    reasons: [],
+  };
+}
+
+function preferredPageWithDescription(pages) {
+  return preferredTargetedPage((pages || []).filter((page) => hasValue(page.facts?.productDescription))) ||
+    preferredTargetedPage(pages);
+}
+
+function compactObjectValuesByLanguage(pages, valueFn, maxLength = 1200) {
+  const out = {};
+  for (const page of pages || []) {
+    const language = page.language || sourceLanguageFromUrl(page.url);
+    const value = compactSnippet(valueFn(page) || '', maxLength);
+    if (!language || !value || out[language]) continue;
+    out[language] = value;
+  }
+  return out;
+}
+
+function mergeAuditStructuredCandidates(pages, product, vocabulary) {
+  const out = [];
+  const seen = new Set();
+  let officialStructuredFacts = null;
+  for (const page of pages || []) {
+    const structured = structuredFactReviewCandidatesForProduct({ product, facts: page.facts, vocabulary });
+    if (!officialStructuredFacts) officialStructuredFacts = structured.officialStructuredFacts;
+    for (const candidate of structured.reviewCandidates) {
+      const key = [
+        candidate.target_version_key || '',
+        candidate.target_column || '',
+        candidate.suggested_value || '',
+        candidate.evidence_language || '',
+        candidate.evidence_url || '',
+        candidate.source_type || '',
+      ].join('|');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(candidate);
+    }
+  }
+  return { officialStructuredFacts, reviewCandidates: out };
+}
+
+async function collectAuditVerifiedPages({ page, product, config }) {
+  const input = {
+    name: product.name || '',
+    reference: product.reference,
+    url: product.productUrl || '',
+  };
+  const seenUrls = new Set();
+  const candidateUrls = [];
+  const addCandidate = (url, sourceUrl, priority = 1) => {
+    const normalized = normalizeText(url);
+    if (!normalized || seenUrls.has(normalized)) return;
+    if (!looksLikeProductUrl(normalized)) return;
+    seenUrls.add(normalized);
+    candidateUrls.push({ url: normalized, source_url: sourceUrl, priority });
+  };
+
+  addCandidate(product.productUrl, 'master-product-url', 0);
+  for (const query of targetedSearchQueries(input)) {
+    for (const searchUrl of productSearchUrls(query)) {
+      try {
+        await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeoutMs || 90000 });
+        await page.waitForLoadState('networkidle', { timeout: config.networkIdleTimeoutMs || 45000 }).catch(() => {});
+        await sleep(config.settleDelayMs || 2500);
+        const candidates = await collectProductSearchCandidates(page);
+        const referencePattern = referenceRegex(input.reference);
+        for (const candidate of candidates) {
+          if (!looksLikeProductUrl(candidate.href)) continue;
+          const text = `${candidate.text || ''}\n${candidate.closestText || ''}\n${candidate.href}`;
+          if (!referencePattern.test(text) && !targetedNameMatches(input.name, text)) continue;
+          addCandidate(candidate.href, searchUrl, 1);
+        }
+      } catch (error) {
+        candidateUrls.push({ url: '', source_url: searchUrl, priority: 9, error: error.message });
+      }
+    }
+  }
+
+  const verified = [];
+  const rejected = [];
+  for (const item of candidateUrls.filter((candidate) => candidate.url).sort((a, b) => a.priority - b.priority).slice(0, 30)) {
+    const inspected = await inspectTargetedProductPage(page, item.url, input, config, false, item.source_url);
+    if (inspected.ok) verified.push(inspected);
+    else rejected.push({
+      url: inspected.url || item.url,
+      source_url: item.source_url,
+      reject_reason: inspected.reject_reason,
+      references: inspected.refs || [],
+      t_references: inspected.t_references || [],
+      sales_references: inspected.sales_references || [],
+    });
+  }
+
+  const groups = verifiedProductGroups(verified, input.reference);
+  const matchingGroup = groups.length === 1 ? groups[0] : null;
+  return {
+    candidate_urls: candidateUrls.filter((candidate) => candidate.url).map((candidate) => candidate.url),
+    search_errors: candidateUrls.filter((candidate) => candidate.error).map((candidate) => ({
+      source_url: candidate.source_url,
+      error: candidate.error,
+    })),
+    verified_pages: verified,
+    rejected_candidates: rejected,
+    group: matchingGroup,
+    ambiguous: groups.length > 1,
+  };
+}
+
+async function auditIncompleteProduct({ page, product, config, vocabulary }) {
+  const entry = buildAuditEntryBase(product);
+  if (!hasValue(product.productUrl)) {
+    entry.classification = 'URL無効';
+    entry.reasons = ['official_product_page_url_missing'];
+    return entry;
+  }
+
+  try {
+    const pageDiscovery = await collectAuditVerifiedPages({ page, product, config });
+    const verifiedPages = pageDiscovery.group?.pages || [];
+    const primaryPage = preferredTargetedPage(verifiedPages);
+    const descriptionPage = preferredPageWithDescription(verifiedPages);
+
+    if (!primaryPage) {
+      const firstReject = pageDiscovery.rejected_candidates[0] || {};
+      const reason = pageDiscovery.ambiguous
+        ? 'ambiguous_verified_pages'
+        : (firstReject.reject_reason || pageDiscovery.search_errors[0]?.error || 'official_page_verification_failed');
+      entry.official.page_valid = !/not_product_page|404|invalid/i.test(reason);
+      entry.official.identity_match = false;
+      entry.official.candidate_urls = pageDiscovery.candidate_urls;
+      entry.official.rejected_candidates = pageDiscovery.rejected_candidates;
+      entry.official.search_errors = pageDiscovery.search_errors;
+      entry.reasons = [reason];
+      if (/mismatch/i.test(reason)) entry.classification = 'URL不一致';
+      else if (/not_product_page|404|invalid/i.test(reason)) entry.classification = 'URL無効';
+      else if (/no_verified_reference|ambiguous/i.test(reason)) entry.classification = '要確認';
+      else entry.classification = 'error';
+      return entry;
+    }
+
+    const structured = mergeAuditStructuredCandidates(verifiedPages, product, vocabulary);
+    const descriptionFacts = descriptionPage?.facts || primaryPage.facts;
+    const descriptionValue = buildOfficialDescriptionBackfillValue({
+      product,
+      facts: descriptionFacts,
+      language: sourceLanguageFromUrl(descriptionPage?.url || primaryPage.url),
+      config,
+    });
+    const translationReview = descriptionValue.needs_translation
+      ? buildOfficialDescriptionTranslationReviewCandidate({
+          product,
+          facts: descriptionFacts,
+          descriptionValue,
+          category: normalizeOfficialCategoryForMaster(descriptionFacts.category || ''),
+        })
+      : null;
+    const classified = classifyEnrichmentAuditEntry({
+      inspected: primaryPage,
+      descriptionValue,
+      structuredCandidates: structured.reviewCandidates,
+      missing: entry.missing,
+    });
+
+    entry.official = {
+      page_valid: true,
+      identity_match: true,
+      languages_checked: [...new Set(verifiedPages.map((verifiedPage) => verifiedPage.language || sourceLanguageFromUrl(verifiedPage.url)).filter(Boolean))],
+      description_found: hasValue(descriptionValue.original_description),
+      description_excerpt: compactSnippet(descriptionValue.original_description || '', 500),
+      descriptions_by_language: compactObjectValuesByLanguage(verifiedPages, (verifiedPage) => verifiedPage.facts?.productDescription, 1200),
+      ingredients_found: verifiedPages.some((verifiedPage) => hasValue(verifiedPage.facts?.ingredientsText)),
+      ingredients_excerpt: compactSnippet((verifiedPages.find((verifiedPage) => hasValue(verifiedPage.facts?.ingredientsText))?.facts?.ingredientsText || ''), 500),
+      ingredients_by_language: compactObjectValuesByLanguage(verifiedPages, (verifiedPage) => verifiedPage.facts?.ingredientsText, 1200),
+      official_name: primaryPage.official_name || '',
+      page_url: primaryPage.url || product.productUrl,
+      official_urls_by_language: targetedOfficialUrlByLanguage(verifiedPages),
+      official_names_by_language: targetedOfficialNamesByLanguage(verifiedPages),
+      reference_type: primaryPage.reference_type || '',
+      verified_references: [...new Set(verifiedPages.flatMap((verifiedPage) => verifiedPage.refs || []))],
+      sales_references: [...new Set(verifiedPages.flatMap((verifiedPage) => verifiedPage.sales_references || []))],
+      candidate_urls: pageDiscovery.candidate_urls,
+      rejected_candidates: pageDiscovery.rejected_candidates,
+      search_errors: pageDiscovery.search_errors,
+    };
+    entry.structured_fact_candidates = structured.reviewCandidates.map((candidate) => ({
+      detection_type: candidate.detection_type,
+      target_version_key: candidate.target_version_key || '',
+      target_column: candidate.target_column || '',
+      current_value: candidate.current_value || '',
+      suggested_value: candidate.suggested_value || '',
+      evidence_text: candidate.evidence_text || '',
+      evidence_language: candidate.evidence_language || '',
+      evidence_url: candidate.evidence_url || '',
+      source_type: candidate.source_type || '',
+      confidence: candidate.confidence || '',
+    }));
+    entry.translation_review_candidate = translationReview;
+    entry.classification = classified.classification;
+    entry.reasons = classified.reasons;
+    return entry;
+  } catch (error) {
+    entry.classification = 'error';
+    entry.reasons = [error.message];
+    return entry;
+  }
+}
+
+function summarizeEnrichmentAudit({ master, candidates, entries, pagesChecked, outputFile }) {
+  const byClassification = (name) => entries.filter((entry) => entry.classification === name).length;
+  const complementable = entries.filter((entry) => entry.classification === '補完可能');
+  return {
+    ok: true,
+    mode: 'audit_incomplete_records',
+    output_file: outputFile,
+    total_master_rows: master?.rowCount || 0,
+    primary_candidates: candidates.length,
+    pages_checked: pagesChecked,
+    complementable: byClassification('補完可能'),
+    insufficient_information: byClassification('情報不足'),
+    url_mismatch: byClassification('URL不一致'),
+    invalid_url: byClassification('URL無効'),
+    needs_review: byClassification('要確認'),
+    errors: byClassification('error'),
+    complementable_missing: {
+      official_description: complementable.filter((entry) => entry.missing.official_description).length,
+      aroma_category: complementable.filter((entry) => entry.missing.aroma_category).length,
+      flavor_tags: complementable.filter((entry) => entry.missing.flavor_tags).length,
+      sku_only: complementable.filter((entry) => entry.sku_only).length,
+      black_book_unlisted: complementable.filter((entry) => normalizeText(entry.black_book_listed) === 'いいえ').length,
+    },
+  };
+}
+
+async function runIncompleteRecordsAudit({ context, config, master, paths, args }) {
+  if (args.writeBack === true) {
+    throw new Error('--audit-incomplete-records is read-only and cannot be used with --write-back.');
+  }
+  if (args.writeStructuredReviewCandidates) {
+    throw new Error('--audit-incomplete-records is read-only and cannot be used with --write-structured-review-candidates.');
+  }
+
+  const limit = args.auditAll ? Infinity : (Number.isFinite(args.auditLimit) ? args.auditLimit : (config.batchSize || 5));
+  const candidates = selectAuditIncompleteProducts(master?.products || [], args, limit);
+  const vocabulary = structuredFactVocabulary(master?.products || []);
+  const page = await context.newPage();
+  const entries = [];
+  let pagesChecked = 0;
+  try {
+    for (const product of candidates) {
+      const entry = await auditIncompleteProduct({ page, product, config, vocabulary });
+      if (hasValue(product.productUrl)) pagesChecked += 1;
+      entry.black_book_listed = product.master?.['黒い本掲載'] || '';
+      entries.push(entry);
+    }
+  } finally {
+    await page.close().catch(() => {});
+  }
+
+  const outputFile = path.join(paths.logsDir, `enrichment-audit-${auditTimestamp()}.json`);
+  const summary = summarizeEnrichmentAudit({ master, candidates, entries, pagesChecked, outputFile });
+  writeJson(outputFile, {
+    ...summary,
+    generated_at: nowIso(),
+    read_only: true,
+    entries,
+  });
+  console.log(JSON.stringify(summary, null, 2));
+  return { summary, entries };
+}
+
 async function runNewReferenceDiscovery({ context, config, paths, master, discoveryCache, baseDir, args }) {
   const sources = config.newReferenceDiscovery?.sources || defaultNewReferenceDiscoverySources();
   const state = normalizeNewReferenceDiscoveryState(readJson(paths.newReferenceDiscoveryStateFile, {}), sources);
@@ -4484,6 +4869,11 @@ async function main() {
   if (args.enrichIncompleteRecords && !args.connectCdp) {
     throw new Error('--connect-cdp is required for enrichment.');
   }
+  if (args.auditIncompleteRecords) {
+    if (args.writeBack === true) throw new Error('--audit-incomplete-records is read-only and cannot be used with --write-back.');
+    if (args.writeStructuredReviewCandidates) throw new Error('--audit-incomplete-records is read-only and cannot be used with --write-structured-review-candidates.');
+    if (!args.connectCdp) throw new Error('--connect-cdp is required for incomplete-record audit.');
+  }
 
   const paths = {
     profileDir: resolveProjectPath(baseDir, config.profileDir || 'browser-profile'),
@@ -4495,9 +4885,11 @@ async function main() {
   };
   paths.resultLog = path.join(paths.logsDir, `results-${new Date().toISOString().slice(0, 10)}.jsonl`);
 
-  fs.mkdirSync(paths.profileDir, { recursive: true });
-  fs.mkdirSync(paths.imagesDir, { recursive: true });
   fs.mkdirSync(paths.logsDir, { recursive: true });
+  if (!args.auditIncompleteRecords) {
+    fs.mkdirSync(paths.profileDir, { recursive: true });
+    fs.mkdirSync(paths.imagesDir, { recursive: true });
+  }
 
   const headless = args.authSetup ? false : args.headless === true ? true : args.headed ? false : config.headless !== false;
   const state = readJson(paths.stateFile, { products: {} });
@@ -4513,7 +4905,7 @@ async function main() {
       console.log(JSON.stringify(taxonomyDryRun(master?.products || config.products || [], args.refs), null, 2));
       return;
     }
-  if (!targetedDiscoveryRequested && !args.enrichIncompleteRecords && !args.statusJson && !args.dryRun) {
+  if (!targetedDiscoveryRequested && !args.enrichIncompleteRecords && !args.auditIncompleteRecords && !args.statusJson && !args.dryRun) {
     await normalizeNotFoundProductUrlWriteBacks({ config, baseDir, state, master, debug: args.debug });
   }
   const products = selectProducts(config, state, args.refs, master?.products || null);
@@ -4521,6 +4913,7 @@ async function main() {
     !args.discoverNewReferences &&
     !args.backfillOfficialDescriptions &&
     !args.enrichIncompleteRecords &&
+    !args.auditIncompleteRecords &&
     !args.statusJson &&
     !args.dryRun &&
     !args.authSetup;
@@ -4536,16 +4929,16 @@ async function main() {
     return;
   }
 
-  if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords && products.length === 0 && !(normalCollectorMode && args.connectCdp && writeBackRequired(config))) {
+  if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords && !args.auditIncompleteRecords && products.length === 0 && !(normalCollectorMode && args.connectCdp && writeBackRequired(config))) {
     console.log('No pending products selected.');
     return;
   }
 
-  if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords) {
+  if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords && !args.auditIncompleteRecords) {
     console.log(`Selected ${products.length} product(s)${master ? ` from master rows=${master.rowCount}` : ' from config'}.`);
   }
 
-  if (args.dryRun && !targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords) {
+  if (args.dryRun && !targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords && !args.auditIncompleteRecords) {
     for (const product of products) {
       console.log(JSON.stringify({
         reference: product.reference,
@@ -4627,7 +5020,7 @@ async function main() {
       }
     }
 
-    if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords && products.length === 0 && !targetQueueRequest) {
+    if (!targetedDiscoveryRequested && !args.discoverNewReferences && !args.backfillOfficialDescriptions && !args.enrichIncompleteRecords && !args.auditIncompleteRecords && products.length === 0 && !targetQueueRequest) {
       console.log('No pending products selected.');
       return;
     }
@@ -4643,6 +5036,11 @@ async function main() {
 
     if (args.backfillOfficialDescriptions) {
       await runOfficialDescriptionBackfill({ context, config, master, baseDir, args });
+      return;
+    }
+
+    if (args.auditIncompleteRecords) {
+      await runIncompleteRecordsAudit({ context, config, master, paths, args });
       return;
     }
 
