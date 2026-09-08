@@ -96,6 +96,9 @@ function parseArgs(argv) {
     auditIncompleteRecords: false,
     auditAll: false,
     auditLimit: null,
+    planEnrichmentReviewWriteback: '',
+    reportEnrichmentDataIssues: '',
+    versionKeys: null,
     enrichRef: '',
     writeStructuredReviewCandidates: false,
     taxonomyDryRun: false,
@@ -136,6 +139,12 @@ function parseArgs(argv) {
       args.auditIncompleteRecords = true;
       args.auditLimit = Number(arg.slice('--audit-limit='.length));
     }
+    else if (arg === '--limit') args.auditLimit = Number(argv[++i]);
+    else if (arg.startsWith('--limit=')) args.auditLimit = Number(arg.slice('--limit='.length));
+    else if (arg === '--plan-enrichment-review-writeback') args.planEnrichmentReviewWriteback = argv[++i] || '';
+    else if (arg.startsWith('--plan-enrichment-review-writeback=')) args.planEnrichmentReviewWriteback = arg.slice('--plan-enrichment-review-writeback='.length);
+    else if (arg === '--report-enrichment-data-issues') args.reportEnrichmentDataIssues = argv[++i] || '';
+    else if (arg.startsWith('--report-enrichment-data-issues=')) args.reportEnrichmentDataIssues = arg.slice('--report-enrichment-data-issues='.length);
     else if (arg === '--enrich-ref') {
       args.enrichRef = argv[++i] || '';
       args.enrichIncompleteRecords = true;
@@ -156,6 +165,8 @@ function parseArgs(argv) {
     else if (arg.startsWith('--config=')) args.config = arg.slice('--config='.length);
     else if (arg === '--refs') args.refs = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
     else if (arg.startsWith('--refs=')) args.refs = arg.slice('--refs='.length).split(',').map((s) => s.trim()).filter(Boolean);
+    else if (arg === '--version-keys') args.versionKeys = argv[++i].split(',').map((s) => s.trim()).filter(Boolean);
+    else if (arg.startsWith('--version-keys=')) args.versionKeys = arg.slice('--version-keys='.length).split(',').map((s) => s.trim()).filter(Boolean);
   }
   return args;
 }
@@ -4645,6 +4656,379 @@ async function runIncompleteRecordsAudit({ context, config, master, paths, args 
   return { summary, entries };
 }
 
+function normalizeAuditListFilter(values = []) {
+  return new Set((values || []).map((value) => normalizeText(value).toUpperCase()).filter(Boolean));
+}
+
+function auditRecordMatchesFilters(record, args) {
+  const refs = normalizeAuditListFilter(args.refs || []);
+  const versionKeys = normalizeAuditListFilter(args.versionKeys || []);
+  if (refs.size && !refs.has(normalizeText(record.reference).toUpperCase()) && !refs.has(normalizeText(record.t_reference).toUpperCase())) return false;
+  if (versionKeys.size && !versionKeys.has(normalizeText(record.version_key).toUpperCase())) return false;
+  return true;
+}
+
+function masterIndexesForAuditPlan(masterProducts = []) {
+  const byVersionKey = new Map();
+  const duplicateVersionKeys = new Set();
+  for (const product of masterProducts || []) {
+    const key = normalizeText(product.master?.versionKey).toUpperCase();
+    if (!key) continue;
+    if (byVersionKey.has(key)) duplicateVersionKeys.add(key);
+    else byVersionKey.set(key, product);
+  }
+  return { byVersionKey, duplicateVersionKeys };
+}
+
+function normalizeReviewPlanCandidateValue(column, value) {
+  const normalized = normalizeText(value);
+  if (column === MASTER_COLUMNS.flavorCategory) {
+    const categories = normalizeAromaCategoriesForMaster(normalized, '').categories;
+    if (categories.length === 1) return categories[0];
+    return '';
+  }
+  return normalized;
+}
+
+function auditEvidenceLooksLikeAllergenTrace(candidate) {
+  const evidence = normalizeText(candidate?.evidence_text || candidate?.evidence);
+  if (!evidence) return false;
+  const value = normalizeText(candidate?.suggested_value || candidate?.normalized_value);
+  if (!/(果実|ナッツ)/.test(value)) return false;
+  return /\b(?:may contain|peut contenir|contains?)\b.{0,80}\b(?:traces?|fruits?\s+à\s+coque|nuts?)\b/i.test(evidence);
+}
+
+function auditEvidenceNoiseReasons(candidate) {
+  const reasons = [];
+  const evidence = normalizeText(candidate?.evidence_text || candidate?.evidence);
+  const sourceType = normalizeText(candidate?.source_type || '');
+  const sourceDom = normalizeText(candidate?.source_dom || '');
+  const allowedSources = new Set(['ingredients', 'description', 'product_summary', 'preparation']);
+  if (!evidence) reasons.push('missing_evidence');
+  if (!allowedSources.has(sourceType)) reasons.push('unsafe_source_type');
+  if (/breadcrumb|navigation|recommendation|carousel|footer|header|menu/i.test(sourceDom)) reasons.push('unsafe_source_dom');
+  const uiNoisePatterns = [
+    { reason: 'purchase_ui_evidence', pattern: /\b(?:add to cart|ajouter au panier|notify me|prévenez-moi|qty|quantity|quantit[ée]|choose weight|choisir le poids|my cart|shopping bag)\b/i },
+    { reason: 'shipping_or_payment_evidence', pattern: /\b(?:delivery|shipping|livraison|exp[ée]dition|payment|paiement|secure payment|free shipping)\b/i },
+    { reason: 'price_evidence', pattern: /(?:€|\bEUR\b|\bprix\b|\bprice\b|\b\d+[,.]\d{2}\s*€)/i },
+    { reason: 'ref_ui_evidence', pattern: /\bR[ÉE]F(?:[.:]|\s)+T[A-Z0-9-]+\b/i },
+    { reason: 'category_navigation_evidence', pattern: /\b(?:home|accueil)\s*[>/|]\s*(?:tea|th[ée])\b/i },
+    { reason: 'availability_evidence', pattern: /\b(?:in stock|out of stock|availability|available soon|en stock|rupture de stock|disponibilit[ée])\b/i },
+  ];
+  for (const item of uiNoisePatterns) {
+    if (item.pattern.test(evidence)) reasons.push(item.reason);
+  }
+  if (auditEvidenceLooksLikeAllergenTrace(candidate)) reasons.push('allergen_trace_evidence');
+  return [...new Set(reasons)];
+}
+
+function structuredPlanCandidateSafety(candidate, record, masterIndexes) {
+  const reasons = [];
+  const targetVersionKey = normalizeText(candidate?.target_version_key || '').toUpperCase();
+  const column = normalizeText(candidate?.target_column || candidate?.field || '');
+  const suggestedValue = normalizeText(candidate?.suggested_value || '');
+  const normalizedValue = normalizeReviewPlanCandidateValue(column, suggestedValue);
+  if (!targetVersionKey) reasons.push('missing_target_version_key');
+  if (!column) reasons.push('missing_target_column');
+  if (!suggestedValue) reasons.push('missing_suggested_value');
+  if (column === MASTER_COLUMNS.flavorCategory && !normalizedValue) reasons.push('unknown_aroma_category');
+  if (targetVersionKey && !masterIndexes.byVersionKey.has(targetVersionKey)) reasons.push('target_version_key_not_in_current_master');
+  if (targetVersionKey && masterIndexes.duplicateVersionKeys.has(targetVersionKey)) reasons.push('duplicate_version_key_in_current_master');
+  const recordVersionKey = normalizeText(record.version_key).toUpperCase();
+  if (targetVersionKey && recordVersionKey && targetVersionKey !== recordVersionKey) reasons.push('target_version_key_record_mismatch');
+  const product = masterIndexes.byVersionKey.get(recordVersionKey);
+  if (product && record.reference && !productHasReference(product, record.reference)) reasons.push('record_reference_not_in_current_master_identity');
+  if (record.sku_only && /^T\d+$/i.test(normalizeText(record.t_reference || ''))) reasons.push('sku_only_generated_t_reference');
+  reasons.push(...auditEvidenceNoiseReasons(candidate));
+  return {
+    safety_status: reasons.length ? 'excluded' : 'included',
+    safety_reasons: [...new Set(reasons)],
+    normalized_value: normalizedValue,
+  };
+}
+
+function buildStructuredPlanCandidate(candidate, record, masterIndexes) {
+  const safety = structuredPlanCandidateSafety(candidate, record, masterIndexes);
+  return {
+    candidate_type: 'structured_fact',
+    field: normalizeText(candidate.target_column || ''),
+    suggested_value: normalizeText(candidate.suggested_value || ''),
+    normalized_value: safety.normalized_value,
+    target_version_key: normalizeText(candidate.target_version_key || ''),
+    evidence: normalizeText(candidate.evidence_text || ''),
+    evidence_language: normalizeText(candidate.evidence_language || ''),
+    source_type: normalizeText(candidate.source_type || ''),
+    source_dom: normalizeText(candidate.source_dom || ''),
+    confidence: normalizeText(candidate.confidence || ''),
+    source_url: normalizeText(candidate.evidence_url || ''),
+    safety_status: safety.safety_status,
+    safety_reasons: safety.safety_reasons,
+  };
+}
+
+function buildTranslationPlanCandidate(record, masterIndexes) {
+  const translation = record.translation_review_candidate;
+  if (!translation) return null;
+  const reasons = [];
+  if (record.missing?.official_description !== true) reasons.push('official_description_already_present');
+  const targetVersionKey = normalizeText(translation.version_key || record.version_key || '').toUpperCase();
+  if (!targetVersionKey) reasons.push('missing_target_version_key');
+  if (targetVersionKey && !masterIndexes.byVersionKey.has(targetVersionKey)) reasons.push('target_version_key_not_in_current_master');
+  const product = masterIndexes.byVersionKey.get(targetVersionKey);
+  if (product && record.reference && !productHasReference(product, record.reference)) reasons.push('record_reference_not_in_current_master_identity');
+  const evidence = normalizeText(translation.original_description || '');
+  if (!evidence) reasons.push('missing_evidence');
+  return {
+    candidate_type: 'official_description_translation',
+    field: MASTER_COLUMNS.officialDescription,
+    suggested_value: '',
+    normalized_value: '',
+    target_version_key: targetVersionKey,
+    evidence,
+    evidence_language: normalizeText(translation.source_language || ''),
+    source_type: 'description',
+    source_dom: 'product description',
+    confidence: 'medium',
+    source_url: normalizeText(translation.source_url || ''),
+    needs_human_translation: true,
+    safety_status: reasons.length ? 'excluded' : 'included',
+    safety_reasons: [...new Set(reasons)],
+  };
+}
+
+function planCandidateDedupeKey(candidate) {
+  return [
+    normalizeText(candidate.target_version_key).toUpperCase(),
+    normalizeText(candidate.field),
+    normalizeText(candidate.normalized_value || candidate.suggested_value),
+    normalizeText(candidate.candidate_type),
+  ].join('|');
+}
+
+function recordBaseExclusionReasons(record, masterIndexes) {
+  const reasons = [];
+  if (record.classification !== '補完可能') reasons.push(`classification_${record.classification || 'missing'}`);
+  if (record.official?.identity_match !== true) reasons.push('identity_match_not_true');
+  const versionKey = normalizeText(record.version_key).toUpperCase();
+  if (!versionKey) reasons.push('missing_version_key');
+  if (!hasValue(record.reference)) reasons.push('missing_reference');
+  if (versionKey && !masterIndexes.byVersionKey.has(versionKey)) reasons.push('version_key_not_in_current_master');
+  if (versionKey && masterIndexes.duplicateVersionKeys.has(versionKey)) reasons.push('duplicate_version_key_in_current_master');
+  const product = masterIndexes.byVersionKey.get(versionKey);
+  if (product && record.reference && !productHasReference(product, record.reference)) reasons.push('record_reference_not_in_current_master_identity');
+  if (record.sku_only && /^T\d+$/i.test(normalizeText(record.t_reference || ''))) reasons.push('sku_only_generated_t_reference');
+  if (/-N\d{2}$/i.test(versionKey) && /^T\d{7,}$/i.test(normalizeText(record.reference))) reasons.push('legacy_n01_review_required');
+  return [...new Set(reasons)];
+}
+
+function buildEnrichmentReviewPlan({ audit, auditPath, master, paths, args }) {
+  const masterIndexes = masterIndexesForAuditPlan(master?.products || []);
+  const records = [];
+  const globalSeen = new Set();
+  const exclusionReasons = {};
+  let totalIncludedCandidates = 0;
+  let totalExcludedCandidates = 0;
+  let excludedRecords = 0;
+  let complementableRecords = 0;
+  const limit = Number.isFinite(args.auditLimit) ? args.auditLimit : null;
+
+  const addExclusionReasons = (reasons) => {
+    for (const reason of reasons || []) {
+      exclusionReasons[reason] = (exclusionReasons[reason] || 0) + 1;
+    }
+  };
+
+  for (const record of audit.entries || []) {
+    if (!auditRecordMatchesFilters(record, args)) continue;
+    if (record.classification === '補完可能') complementableRecords += 1;
+    const baseReasons = recordBaseExclusionReasons(record, masterIndexes);
+    const includedCandidates = [];
+    const excludedCandidates = [];
+
+    const candidateInputs = [
+      ...(record.structured_fact_candidates || []).map((candidate) => buildStructuredPlanCandidate(candidate, record, masterIndexes)),
+      buildTranslationPlanCandidate(record, masterIndexes),
+    ].filter(Boolean);
+
+    for (const candidate of candidateInputs) {
+      if (baseReasons.length && candidate.safety_status === 'included') {
+        candidate.safety_status = 'excluded';
+        candidate.safety_reasons = [...new Set([...(candidate.safety_reasons || []), ...baseReasons])];
+      }
+      const key = planCandidateDedupeKey(candidate);
+      if (candidate.safety_status === 'included' && globalSeen.has(key)) {
+        candidate.safety_status = 'excluded';
+        candidate.safety_reasons = [...new Set([...(candidate.safety_reasons || []), 'duplicate_candidate'])];
+      }
+      if (candidate.safety_status === 'included') {
+        globalSeen.add(key);
+        includedCandidates.push(candidate);
+      } else {
+        excludedCandidates.push(candidate);
+        addExclusionReasons(candidate.safety_reasons);
+      }
+    }
+
+    let recordReasons = baseReasons;
+    if (!candidateInputs.length) recordReasons = [...new Set([...recordReasons, 'no_review_candidates'])];
+    if (!includedCandidates.length) recordReasons = [...new Set([...recordReasons, 'no_safe_candidates'])];
+    addExclusionReasons(recordReasons);
+
+    if (includedCandidates.length || excludedCandidates.length || recordReasons.length) {
+      records.push({
+        version_key: record.version_key || '',
+        reference: record.reference || '',
+        name: record.name || '',
+        sku_only: record.sku_only === true,
+        official_url: record.official_url || '',
+        classification: record.classification || '',
+        included_candidates: includedCandidates,
+        excluded_candidates: excludedCandidates,
+        record_exclusion_reasons: recordReasons,
+      });
+    }
+    totalIncludedCandidates += includedCandidates.length;
+    totalExcludedCandidates += excludedCandidates.length;
+    if (!includedCandidates.length) excludedRecords += 1;
+    if (limit !== null && records.filter((item) => item.included_candidates.length).length >= limit) break;
+  }
+
+  const includedRecords = records.filter((record) => record.included_candidates.length > 0).length;
+  const outputFile = path.join(paths.logsDir, `enrichment-review-plan-${auditTimestamp()}.json`);
+  const plan = {
+    ok: true,
+    mode: 'enrichment_review_plan',
+    read_only: true,
+    source_audit: auditPath,
+    generated_at: nowIso(),
+    total_entries: (audit.entries || []).length,
+    complementable_records: complementableRecords,
+    included_records: includedRecords,
+    included_candidates: totalIncludedCandidates,
+    excluded_records: excludedRecords,
+    excluded_candidates: totalExcludedCandidates,
+    exclusion_reasons: Object.fromEntries(Object.entries(exclusionReasons).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))),
+    records,
+  };
+  writeJson(outputFile, plan);
+  return { outputFile, plan };
+}
+
+function suspectedDataIssueType(record) {
+  const versionKey = normalizeText(record.version_key).toUpperCase();
+  const reference = normalizeText(record.reference).toUpperCase();
+  const reasons = (record.reasons || []).join('|');
+  const rejected = record.official?.rejected_candidates || [];
+  const rejectedSalesRefs = rejected.flatMap((candidate) => candidate.sales_references || []);
+  if (/-N\d{2}$/i.test(versionKey) && /^T\d{7,}$/i.test(reference)) return 'legacy_n01_long_ref';
+  if (record.classification === 'URL無効') return 'invalid_product_url';
+  if (/name_mismatch/i.test(reasons)) return 'name_mismatch';
+  if (/official_page_verification_failed/i.test(reasons)) return 'official_page_verification_failed';
+  if (rejectedSalesRefs.length && /^T\d+$/i.test(reference)) return 'sales_sku_as_t';
+  if (/not_product_page|no_verified_reference/i.test(reasons)) return 'official_page_missing';
+  return 'unknown';
+}
+
+function suggestedDataIssueAction(issueType) {
+  return {
+    sales_sku_as_t: 'Review whether the Master reference should be represented as a sales SKU-only record or sales SKU field; do not auto-convert.',
+    legacy_n01_long_ref: 'Review legacy N01 row identity and normalize manually if confirmed.',
+    invalid_product_url: 'Review and replace the official product URL manually if a valid product page exists.',
+    name_mismatch: 'Review whether the Master row points to the wrong official product page or a renamed product.',
+    official_page_missing: 'Re-run targeted discovery or inspect official sites manually.',
+    official_page_verification_failed: 'Retry verification later; inspect Cloudflare/browser errors if repeated.',
+    unknown: 'Manual review required.',
+  }[issueType] || 'Manual review required.';
+}
+
+function buildEnrichmentDataIssuesReport({ audit, auditPath, paths, args }) {
+  const issueClassifications = new Set(['URL不一致', 'URL無効', 'error']);
+  const records = [];
+  for (const record of audit.entries || []) {
+    if (!auditRecordMatchesFilters(record, args)) continue;
+    if (!issueClassifications.has(record.classification)) continue;
+    const rejected = record.official?.rejected_candidates || [];
+    const issueType = suspectedDataIssueType(record);
+    records.push({
+      version_key: record.version_key || '',
+      reference: record.reference || '',
+      name: record.name || '',
+      current_official_url: record.official_url || '',
+      current_ref: record.t_reference || record.reference || '',
+      discovered_refs: [...new Set([
+        ...(record.official?.verified_references || []),
+        ...rejected.flatMap((candidate) => candidate.references || []),
+        ...rejected.flatMap((candidate) => candidate.t_references || []),
+        ...rejected.flatMap((candidate) => candidate.sales_references || []),
+      ].filter(Boolean))],
+      discovered_urls: [...new Set([
+        ...(record.official?.candidate_urls || []),
+        ...rejected.map((candidate) => candidate.url).filter(Boolean),
+      ])],
+      classification: record.classification || '',
+      mismatch_reason: (record.reasons || []).join('; '),
+      rejected_candidates: rejected,
+      search_errors: record.official?.search_errors || [],
+      suspected_issue_type: issueType,
+      suggested_action: suggestedDataIssueAction(issueType),
+      confidence: issueType === 'unknown' ? 'low' : 'medium',
+    });
+  }
+  const outputFile = path.join(paths.logsDir, `enrichment-data-issues-${auditTimestamp()}.json`);
+  const report = {
+    ok: true,
+    mode: 'enrichment_data_issues_report',
+    read_only: true,
+    source_audit: auditPath,
+    generated_at: nowIso(),
+    total_entries: (audit.entries || []).length,
+    issue_records: records.length,
+    suspected_issue_type_counts: records.reduce((acc, record) => {
+      acc[record.suspected_issue_type] = (acc[record.suspected_issue_type] || 0) + 1;
+      return acc;
+    }, {}),
+    records,
+  };
+  writeJson(outputFile, report);
+  return { outputFile, report };
+}
+
+async function runEnrichmentReviewPlan({ master, paths, args, baseDir }) {
+  const auditPath = resolveProjectPath(baseDir, args.planEnrichmentReviewWriteback);
+  const audit = readJson(auditPath, null);
+  if (!audit || !Array.isArray(audit.entries)) throw new Error(`Invalid enrichment audit JSON: ${auditPath}`);
+  const { outputFile, plan } = buildEnrichmentReviewPlan({ audit, auditPath, master, paths, args });
+  console.log(JSON.stringify({
+    ok: true,
+    mode: plan.mode,
+    output_file: outputFile,
+    total_entries: plan.total_entries,
+    complementable_records: plan.complementable_records,
+    included_records: plan.included_records,
+    included_candidates: plan.included_candidates,
+    excluded_records: plan.excluded_records,
+    excluded_candidates: plan.excluded_candidates,
+    exclusion_reasons: plan.exclusion_reasons,
+  }, null, 2));
+  return plan;
+}
+
+async function runEnrichmentDataIssuesReport({ paths, args, baseDir }) {
+  const auditPath = resolveProjectPath(baseDir, args.reportEnrichmentDataIssues);
+  const audit = readJson(auditPath, null);
+  if (!audit || !Array.isArray(audit.entries)) throw new Error(`Invalid enrichment audit JSON: ${auditPath}`);
+  const { outputFile, report } = buildEnrichmentDataIssuesReport({ audit, auditPath, paths, args });
+  console.log(JSON.stringify({
+    ok: true,
+    mode: report.mode,
+    output_file: outputFile,
+    total_entries: report.total_entries,
+    issue_records: report.issue_records,
+    suspected_issue_type_counts: report.suspected_issue_type_counts,
+  }, null, 2));
+  return report;
+}
+
 async function runNewReferenceDiscovery({ context, config, paths, master, discoveryCache, baseDir, args }) {
   const sources = config.newReferenceDiscovery?.sources || defaultNewReferenceDiscoverySources();
   const state = normalizeNewReferenceDiscoveryState(readJson(paths.newReferenceDiscoveryStateFile, {}), sources);
@@ -4853,11 +5237,19 @@ async function main() {
   const baseDir = process.cwd();
   const configPath = resolveProjectPath(baseDir, args.config);
   const fallbackConfigPath = path.join(baseDir, 'collector', 'config.example.json');
-  const configlessMode = args.taxonomyDryRun || hasValue(args.targetName) || hasValue(args.targetRef) || hasValue(args.targetUrl);
+  const enrichmentReviewPlanRequested = hasValue(args.planEnrichmentReviewWriteback);
+  const enrichmentDataIssuesReportRequested = hasValue(args.reportEnrichmentDataIssues);
+  const configlessMode = args.taxonomyDryRun || enrichmentDataIssuesReportRequested || hasValue(args.targetName) || hasValue(args.targetRef) || hasValue(args.targetUrl);
   const config = readJson(configPath, readJson(fallbackConfigPath, configlessMode ? {} : null));
   if (!config) throw new Error(`Config not found: ${configPath}`);
   if (args.writeBack !== null) {
     config.writeBack = { ...(config.writeBack || {}), enabled: args.writeBack };
+  }
+  if ((enrichmentReviewPlanRequested || enrichmentDataIssuesReportRequested) && args.writeBack === true) {
+    throw new Error('Enrichment review plan/report modes are read-only and cannot be used with --write-back.');
+  }
+  if ((enrichmentReviewPlanRequested || enrichmentDataIssuesReportRequested) && args.writeStructuredReviewCandidates) {
+    throw new Error('Enrichment review plan/report modes are read-only and cannot be used with --write-structured-review-candidates.');
   }
   const targetedDiscoveryRequested = hasValue(args.targetName) || hasValue(args.targetRef) || hasValue(args.targetUrl);
   if ((hasValue(args.targetRef) || hasValue(args.targetUrl)) && !hasValue(args.targetName)) {
@@ -4886,7 +5278,7 @@ async function main() {
   paths.resultLog = path.join(paths.logsDir, `results-${new Date().toISOString().slice(0, 10)}.jsonl`);
 
   fs.mkdirSync(paths.logsDir, { recursive: true });
-  if (!args.auditIncompleteRecords) {
+  if (!args.auditIncompleteRecords && !enrichmentReviewPlanRequested && !enrichmentDataIssuesReportRequested) {
     fs.mkdirSync(paths.profileDir, { recursive: true });
     fs.mkdirSync(paths.imagesDir, { recursive: true });
   }
@@ -4896,7 +5288,7 @@ async function main() {
   const discoveryCache = loadDiscoveryCache(paths.discoveryCacheFile);
   const newReferenceDiscoverySources = config.newReferenceDiscovery?.sources || defaultNewReferenceDiscoverySources();
   const newReferenceDiscoveryState = normalizeNewReferenceDiscoveryState(readJson(paths.newReferenceDiscoveryStateFile, {}), newReferenceDiscoverySources);
-  const useConfigProducts = args.useConfigProducts || config.masterSource?.enabled === false;
+  const useConfigProducts = args.useConfigProducts || enrichmentDataIssuesReportRequested || config.masterSource?.enabled === false;
   const master = useConfigProducts ? null : await fetchMasterProducts(config, baseDir, args.debug);
   if (!master && !useConfigProducts) {
     throw new Error('Master products are required for normal collector runs. Use --use-config-products only for explicit local tests.');
@@ -4905,6 +5297,15 @@ async function main() {
       console.log(JSON.stringify(taxonomyDryRun(master?.products || config.products || [], args.refs), null, 2));
       return;
     }
+  if (enrichmentReviewPlanRequested) {
+    if (!master) throw new Error('Current Master products are required for enrichment review plan generation.');
+    await runEnrichmentReviewPlan({ master, paths, args, baseDir });
+    return;
+  }
+  if (enrichmentDataIssuesReportRequested) {
+    await runEnrichmentDataIssuesReport({ paths, args, baseDir });
+    return;
+  }
   if (!targetedDiscoveryRequested && !args.enrichIncompleteRecords && !args.auditIncompleteRecords && !args.statusJson && !args.dryRun) {
     await normalizeNotFoundProductUrlWriteBacks({ config, baseDir, state, master, debug: args.debug });
   }
