@@ -16,6 +16,7 @@ const DRIVE_THUMBNAIL_SIZE = 'w1200';
 const PRODUCT_URL_DISCOVERY_VERSION = 'official-search-fr-en-jp-v1';
 const PRODUCT_URL_NOT_FOUND_MESSAGE = 'No official product page with exact reference was verified.';
 const SALES_SKU_PREFIXES = ['TFG', 'TJC', 'TB', 'TC', 'TE', 'TF', 'TP', 'TA', 'TJ'];
+const PRIMARY_REFERENCE_BACKFILL_BATCH_SIZE = 100;
 const MASTER_COLUMNS = {
   primaryReference: 'Primary Reference',
   reference: 'Tリファレンス番号',
@@ -96,11 +97,16 @@ function parseArgs(argv) {
     enrichIncompleteRecords: false,
     auditIncompleteRecords: false,
     auditPrimaryReferenceBackfill: false,
+    planPrimaryReferenceColumn: false,
+    ensurePrimaryReferenceColumn: false,
+    planPrimaryReferenceBackfill: '',
+    applyPrimaryReferenceBackfill: '',
     auditAll: false,
     auditLimit: null,
     planEnrichmentReviewWriteback: '',
     applyEnrichmentReviewPlan: '',
     reportEnrichmentDataIssues: '',
+    writeMaster: false,
     writeReview: false,
     versionKeys: null,
     enrichRef: '',
@@ -134,6 +140,12 @@ function parseArgs(argv) {
     else if (arg === '--enrich-incomplete-records') args.enrichIncompleteRecords = true;
     else if (arg === '--audit-incomplete-records') args.auditIncompleteRecords = true;
     else if (arg === '--audit-primary-reference-backfill') args.auditPrimaryReferenceBackfill = true;
+    else if (arg === '--plan-primary-reference-column') args.planPrimaryReferenceColumn = true;
+    else if (arg === '--ensure-primary-reference-column') args.ensurePrimaryReferenceColumn = true;
+    else if (arg === '--plan-primary-reference-backfill') args.planPrimaryReferenceBackfill = argv[++i] || '';
+    else if (arg.startsWith('--plan-primary-reference-backfill=')) args.planPrimaryReferenceBackfill = arg.slice('--plan-primary-reference-backfill='.length);
+    else if (arg === '--apply-primary-reference-backfill') args.applyPrimaryReferenceBackfill = argv[++i] || '';
+    else if (arg.startsWith('--apply-primary-reference-backfill=')) args.applyPrimaryReferenceBackfill = arg.slice('--apply-primary-reference-backfill='.length);
     else if (arg === '--audit-all') {
       args.auditIncompleteRecords = true;
       args.auditAll = true;
@@ -153,6 +165,7 @@ function parseArgs(argv) {
     else if (arg === '--report-enrichment-data-issues') args.reportEnrichmentDataIssues = argv[++i] || '';
     else if (arg.startsWith('--report-enrichment-data-issues=')) args.reportEnrichmentDataIssues = arg.slice('--report-enrichment-data-issues='.length);
     else if (arg === '--write-review') args.writeReview = true;
+    else if (arg === '--write-master') args.writeMaster = true;
     else if (arg === '--enrich-ref') {
       args.enrichRef = argv[++i] || '';
       args.enrichIncompleteRecords = true;
@@ -524,6 +537,36 @@ async function writeBackReviewCandidate({ config, baseDir, candidate, debug }) {
   return data;
 }
 
+async function postGasAction({ config, baseDir, action, payload = {}, debug }) {
+  const settings = getWriteBackSettings(config, baseDir);
+  if (!settings) return null;
+  const body = {
+    action,
+    secret: settings.secret,
+    ...payload,
+  };
+  if (debug) {
+    const keys = Object.keys(payload).sort().join(',');
+    console.log(`[gas-action] ${action} payload_keys=${keys}`);
+  }
+  const response = await fetch(settings.gasApiUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(formatWriteBackResponseError(`${action} did not return JSON`, settings, response, text));
+  }
+  if (!response.ok || data.ok === false) {
+    throw new Error(formatWriteBackResponseError(`${action} failed: ${data.error || responsePreview(text)}`, settings, response, text));
+  }
+  return data;
+}
+
 async function writeBackMasterOfficialInfo({ config, baseDir, product, officialInfo, debug }) {
   const settings = getWriteBackSettings(config, baseDir);
   if (!settings) return null;
@@ -678,7 +721,13 @@ async function fetchMasterProducts(config, baseDir, debug) {
     const productsWithUrls = products.filter((product) => hasValue(product.productUrl)).length;
     console.log(`[master] rows=${payload.rows.length} products=${products.length} productsWithUrls=${productsWithUrls} updatedAt=${payload.updatedAt || ''}`);
   }
-  return { products, updatedAt: payload.updatedAt || '', rowCount: payload.rows.length };
+  const headers = [];
+  for (const row of payload.rows) {
+    for (const header of Object.keys(row || {})) {
+      if (!headers.includes(header)) headers.push(header);
+    }
+  }
+  return { products, updatedAt: payload.updatedAt || '', rowCount: payload.rows.length, headers };
 }
 
 function isProbablyImageUrl(url) {
@@ -4907,6 +4956,320 @@ function runPrimaryReferenceBackfillAudit({ master, paths, args }) {
   return { summary, entries };
 }
 
+function planPrimaryReferenceColumnAddition({ master, paths }) {
+  const headers = master?.headers || [];
+  const columnExists = headers.includes(MASTER_COLUMNS.primaryReference);
+  const outputFile = path.join(paths.logsDir, `primary-reference-column-plan-${auditTimestamp()}.json`);
+  const plan = {
+    ok: true,
+    mode: 'primary_reference_column_plan',
+    read_only: true,
+    generated_at: nowIso(),
+    target_sheet: '銘柄マスター',
+    header_name: MASTER_COLUMNS.primaryReference,
+    column_exists: columnExists,
+    would_add_column: !columnExists,
+    current_header_count: headers.length,
+    proposed_column_index: columnExists ? headers.indexOf(MASTER_COLUMNS.primaryReference) + 1 : headers.length + 1,
+    apply_boundary: 'Column addition is a separate explicit operation; this CLI only reports the plan.',
+  };
+  writeJson(outputFile, plan);
+  console.log(JSON.stringify({ ...plan, output_file: outputFile }, null, 2));
+  return plan;
+}
+
+async function runEnsurePrimaryReferenceColumn({ config, master, paths, args, baseDir }) {
+  const dryRunPlan = planPrimaryReferenceColumnAddition({ master, paths });
+  if (!args.writeMaster) return dryRunPlan;
+  const writeConfig = { ...config, writeBack: { ...(config.writeBack || {}), enabled: true } };
+  const result = await postGasAction({
+    config: writeConfig,
+    baseDir,
+    action: 'ensurePrimaryReferenceColumn',
+    payload: { dry_run: false },
+    debug: args.debug,
+  });
+  const outputFile = path.join(paths.logsDir, `primary-reference-column-ensure-${auditTimestamp()}.json`);
+  const report = {
+    ok: true,
+    mode: 'primary_reference_column_ensure',
+    read_only: false,
+    write_master: true,
+    generated_at: nowIso(),
+    dry_run_plan: dryRunPlan,
+    result,
+  };
+  writeJson(outputFile, report);
+  console.log(JSON.stringify({ ok: true, mode: report.mode, output_file: outputFile, result }, null, 2));
+  return report;
+}
+
+function primaryReferenceBackfillPlanItem(entry) {
+  return {
+    row_number: entry.row_number,
+    version_key: entry.version_key,
+    name: entry.name,
+    expected_current_primary_reference: normalizeText(entry.current_primary_reference || ''),
+    new_primary_reference: entry.derived_primary_reference,
+    derivation_source: entry.derivation_source,
+    evidence: {
+      t_reference: entry.t_reference || '',
+      sales_sku_references: entry.sales_sku_references || [],
+      version_key: entry.version_key || '',
+    },
+    safety_checks: {
+      classification: entry.classification,
+      reasons: entry.reasons || [],
+      conflicts: entry.conflicts || [],
+    },
+  };
+}
+
+function buildPrimaryReferenceBackfillPlan({ audit, auditPath, paths, args }) {
+  const safeClassifications = new Set(['safe_from_t_reference', 'safe_from_sku_only']);
+  const excludedClassifications = {};
+  const items = [];
+  const excluded = [];
+  for (const entry of audit.entries || []) {
+    if (!primaryReferenceAuditEntryMatches(entry, args)) continue;
+    const classification = normalizeText(entry.classification);
+    if (safeClassifications.has(classification) && hasValue(entry.derived_primary_reference)) {
+      items.push(primaryReferenceBackfillPlanItem(entry));
+    } else {
+      excludedClassifications[classification || 'unknown'] = (excludedClassifications[classification || 'unknown'] || 0) + 1;
+      excluded.push({
+        row_number: entry.row_number,
+        version_key: entry.version_key,
+        name: entry.name,
+        classification,
+        reasons: entry.reasons || [],
+        conflicts: entry.conflicts || [],
+      });
+    }
+  }
+  const limit = Number.isFinite(args.auditLimit) ? args.auditLimit : null;
+  const limitedItems = limit === null ? items : items.slice(0, limit);
+  const outputFile = path.join(paths.logsDir, `primary-reference-backfill-plan-${auditTimestamp()}.json`);
+  const prefixCounts = {};
+  for (const item of limitedItems) {
+    const prefix = referenceAlphaPrefix(item.new_primary_reference);
+    prefixCounts[prefix] = (prefixCounts[prefix] || 0) + 1;
+  }
+  const plan = {
+    ok: true,
+    mode: 'primary_reference_backfill_plan',
+    read_only: true,
+    source_audit: auditPath,
+    generated_at: nowIso(),
+    total_audit_entries: (audit.entries || []).length,
+    total_plan_items: limitedItems.length,
+    safe_from_t_reference: limitedItems.filter((item) => item.safety_checks.classification === 'safe_from_t_reference').length,
+    safe_from_sku_only: limitedItems.filter((item) => item.safety_checks.classification === 'safe_from_sku_only').length,
+    excluded_count: excluded.length,
+    excluded_classifications: excludedClassifications,
+    prefix_counts: prefixCounts,
+    items: limitedItems,
+    excluded,
+  };
+  writeJson(outputFile, plan);
+  console.log(JSON.stringify({
+    ok: true,
+    mode: plan.mode,
+    output_file: outputFile,
+    total_plan_items: plan.total_plan_items,
+    safe_from_t_reference: plan.safe_from_t_reference,
+    safe_from_sku_only: plan.safe_from_sku_only,
+    excluded_count: plan.excluded_count,
+    excluded_classifications: plan.excluded_classifications,
+    prefix_counts: plan.prefix_counts,
+  }, null, 2));
+  return { outputFile, plan };
+}
+
+function runPrimaryReferenceBackfillPlan({ paths, args, baseDir }) {
+  const auditPath = resolveProjectPath(baseDir, args.planPrimaryReferenceBackfill);
+  const audit = readJson(auditPath, null);
+  if (!audit || !Array.isArray(audit.entries)) {
+    throw new Error('Primary reference backfill audit JSON is required.');
+  }
+  return buildPrimaryReferenceBackfillPlan({ audit, auditPath, paths, args });
+}
+
+function currentPrimaryReferenceEntryByVersionKey(masterProducts = []) {
+  const map = new Map();
+  for (const product of masterProducts || []) {
+    const entry = auditPrimaryReferenceBackfillProduct(product);
+    const key = normalizeText(entry.version_key).toUpperCase();
+    if (key) map.set(key, entry);
+  }
+  return map;
+}
+
+function validatePrimaryReferenceBackfillPlanItem(item, currentEntry, primaryColumnExists) {
+  if (!primaryColumnExists) return { result: 'missing_column', reason: 'Primary Reference column is missing' };
+  if (!currentEntry) return { result: 'stale', reason: 'VersionKey not found in current Master' };
+  if (normalizeText(currentEntry.version_key).toUpperCase() !== normalizeText(item.version_key).toUpperCase()) {
+    return { result: 'stale', reason: 'VersionKey mismatch' };
+  }
+  const expected = normalizeText(item.expected_current_primary_reference || '');
+  const actual = normalizeText(currentEntry.current_primary_reference || '');
+  if (actual && actual !== expected) {
+    return { result: 'conflict', reason: 'Current Primary Reference changed', old_value: actual };
+  }
+  if (actual && actual === item.new_primary_reference) {
+    return { result: 'skipped', reason: 'Primary Reference already set to target value', old_value: actual };
+  }
+  if (!['safe_from_t_reference', 'safe_from_sku_only'].includes(currentEntry.classification)) {
+    return { result: 'needs_review', reason: `Current classification is ${currentEntry.classification || 'unknown'}` };
+  }
+  if (normalizeText(currentEntry.derived_primary_reference).toUpperCase() !== normalizeText(item.new_primary_reference).toUpperCase()) {
+    return { result: 'stale', reason: 'Derived Primary Reference changed' };
+  }
+  if (item.safety_checks?.classification && currentEntry.classification !== item.safety_checks.classification) {
+    return { result: 'stale', reason: 'Safety classification changed' };
+  }
+  return { result: 'would_write', reason: 'validated' };
+}
+
+function summarizePrimaryReferenceBackfillApply(items) {
+  const summary = {
+    total_plan_items: items.length,
+    would_write: 0,
+    written: 0,
+    skipped: 0,
+    stale: 0,
+    conflict: 0,
+    missing_column: 0,
+    invalid: 0,
+    needs_review: 0,
+    errors: 0,
+    prefix_counts: {},
+  };
+  for (const item of items) {
+    if (Object.prototype.hasOwnProperty.call(summary, item.result)) summary[item.result] += 1;
+    if (item.result === 'would_write') {
+      const prefix = referenceAlphaPrefix(item.new_value);
+      summary.prefix_counts[prefix] = (summary.prefix_counts[prefix] || 0) + 1;
+    }
+  }
+  return summary;
+}
+
+function primaryReferenceBackfillGasItem(item) {
+  return {
+    version_key: item.version_key,
+    expected_current_primary_reference: item.expected_current_primary_reference || '',
+    new_primary_reference: item.new_primary_reference,
+    derivation_source: item.derivation_source || '',
+    expected_t_reference: item.evidence?.t_reference || '',
+    expected_sales_sku_references: item.evidence?.sales_sku_references || [],
+  };
+}
+
+function chunkArray(items, size) {
+  const chunks = [];
+  for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
+  return chunks;
+}
+
+async function writePrimaryReferenceBackfillBatches({ config, baseDir, items, args }) {
+  const writeConfig = { ...config, writeBack: { ...(config.writeBack || {}), enabled: true } };
+  const chunks = chunkArray(items, PRIMARY_REFERENCE_BACKFILL_BATCH_SIZE);
+  const batches = [];
+  for (let i = 0; i < chunks.length; i += 1) {
+    const result = await postGasAction({
+      config: writeConfig,
+      baseDir,
+      action: 'backfillPrimaryReferences',
+      payload: {
+        dry_run: false,
+        batch_index: i + 1,
+        batch_count: chunks.length,
+        items: chunks[i].map(primaryReferenceBackfillGasItem),
+      },
+      debug: args.debug,
+    });
+    batches.push({
+      batch_index: i + 1,
+      requested: chunks[i].length,
+      result,
+    });
+  }
+  return batches;
+}
+
+async function runPrimaryReferenceBackfillApply({ config, master, paths, args, baseDir }) {
+  const planPath = resolveProjectPath(baseDir, args.applyPrimaryReferenceBackfill);
+  const plan = readJson(planPath, null);
+  if (!plan || !Array.isArray(plan.items)) throw new Error('Primary reference backfill plan JSON is required.');
+  const primaryColumnExists = (master?.headers || []).includes(MASTER_COLUMNS.primaryReference);
+  const currentByVersionKey = currentPrimaryReferenceEntryByVersionKey(master?.products || []);
+  const results = [];
+  const writablePlanItems = [];
+  for (const item of plan.items) {
+    const current = currentByVersionKey.get(normalizeText(item.version_key).toUpperCase()) || null;
+    const validation = validatePrimaryReferenceBackfillPlanItem(item, current, primaryColumnExists);
+    if (validation.result === 'would_write') writablePlanItems.push(item);
+    results.push({
+      row_number: item.row_number,
+      version_key: item.version_key,
+      old_value: validation.old_value !== undefined ? validation.old_value : normalizeText(current?.current_primary_reference || ''),
+      new_value: item.new_primary_reference,
+      result: validation.result,
+      reason: validation.reason,
+    });
+  }
+  const summary = summarizePrimaryReferenceBackfillApply(results);
+  const outputFile = path.join(paths.logsDir, `primary-reference-backfill-apply-${args.writeMaster ? 'write' : 'dryrun'}-${auditTimestamp()}.json`);
+  let batches = [];
+  if (args.writeMaster && writablePlanItems.length > 0) {
+    batches = await writePrimaryReferenceBackfillBatches({ config, baseDir, items: writablePlanItems, args });
+    for (const batch of batches) {
+      for (const row of batch.result?.results || []) {
+        const resultIndex = results.findIndex((item) => normalizeText(item.version_key).toUpperCase() === normalizeText(row.version_key).toUpperCase());
+        if (resultIndex >= 0) {
+          results[resultIndex] = {
+            ...results[resultIndex],
+            row_number: row.row_number || results[resultIndex].row_number,
+            old_value: row.old_value !== undefined ? row.old_value : results[resultIndex].old_value,
+            new_value: row.new_value || results[resultIndex].new_value,
+            result: row.result || results[resultIndex].result,
+            reason: row.reason || results[resultIndex].reason,
+          };
+        }
+      }
+    }
+  }
+  const finalSummary = summarizePrimaryReferenceBackfillApply(results);
+  const report = {
+    ok: true,
+    mode: args.writeMaster ? 'primary_reference_backfill_apply_write' : 'primary_reference_backfill_apply_dryrun',
+    read_only: !args.writeMaster,
+    write_master: args.writeMaster === true,
+    source_plan: planPath,
+    generated_at: nowIso(),
+    column_exists: primaryColumnExists,
+    batch_size: PRIMARY_REFERENCE_BACKFILL_BATCH_SIZE,
+    batch_count: args.writeMaster ? Math.ceil(writablePlanItems.length / PRIMARY_REFERENCE_BACKFILL_BATCH_SIZE) : 0,
+    ...finalSummary,
+    local_validation_summary: summary,
+    batches,
+    results,
+  };
+  writeJson(outputFile, report);
+  console.log(JSON.stringify({
+    ...finalSummary,
+    ok: true,
+    mode: report.mode,
+    output_file: outputFile,
+    column_exists: primaryColumnExists,
+    write_master: args.writeMaster === true,
+    batch_size: PRIMARY_REFERENCE_BACKFILL_BATCH_SIZE,
+    batch_count: report.batch_count,
+  }, null, 2));
+  return report;
+}
+
 function auditRecordMatchesFilters(record, args) {
   const refs = normalizeAuditListFilter(args.refs || []);
   const versionKeys = normalizeAuditListFilter(args.versionKeys || []);
@@ -5823,16 +6186,25 @@ async function main() {
   const enrichmentReviewPlanApplyRequested = hasValue(args.applyEnrichmentReviewPlan);
   const enrichmentDataIssuesReportRequested = hasValue(args.reportEnrichmentDataIssues);
   const primaryReferenceBackfillAuditRequested = args.auditPrimaryReferenceBackfill === true;
+  const primaryReferenceColumnPlanRequested = args.planPrimaryReferenceColumn === true;
+  const primaryReferenceColumnEnsureRequested = args.ensurePrimaryReferenceColumn === true;
+  const primaryReferenceBackfillPlanRequested = hasValue(args.planPrimaryReferenceBackfill);
+  const primaryReferenceBackfillApplyRequested = hasValue(args.applyPrimaryReferenceBackfill);
   const configlessMode = args.taxonomyDryRun || enrichmentDataIssuesReportRequested || hasValue(args.targetName) || hasValue(args.targetRef) || hasValue(args.targetUrl);
   const config = readJson(configPath, readJson(fallbackConfigPath, configlessMode ? {} : null));
   if (!config) throw new Error(`Config not found: ${configPath}`);
   if (args.writeBack !== null) {
     config.writeBack = { ...(config.writeBack || {}), enabled: args.writeBack };
   }
-  if ((enrichmentReviewPlanRequested || enrichmentReviewPlanApplyRequested || enrichmentDataIssuesReportRequested || primaryReferenceBackfillAuditRequested) && args.writeBack === true) {
+  const primaryReferenceMigrationRequested = primaryReferenceBackfillAuditRequested ||
+    primaryReferenceColumnPlanRequested ||
+    primaryReferenceColumnEnsureRequested ||
+    primaryReferenceBackfillPlanRequested ||
+    primaryReferenceBackfillApplyRequested;
+  if ((enrichmentReviewPlanRequested || enrichmentReviewPlanApplyRequested || enrichmentDataIssuesReportRequested || primaryReferenceMigrationRequested) && args.writeBack === true) {
     throw new Error('Read-only audit/plan/report modes cannot be used with --write-back.');
   }
-  if ((enrichmentReviewPlanRequested || enrichmentReviewPlanApplyRequested || enrichmentDataIssuesReportRequested || primaryReferenceBackfillAuditRequested) && args.writeStructuredReviewCandidates) {
+  if ((enrichmentReviewPlanRequested || enrichmentReviewPlanApplyRequested || enrichmentDataIssuesReportRequested || primaryReferenceMigrationRequested) && args.writeStructuredReviewCandidates) {
     throw new Error('Read-only audit/plan/report modes cannot be used with --write-structured-review-candidates.');
   }
   const targetedDiscoveryRequested = hasValue(args.targetName) || hasValue(args.targetRef) || hasValue(args.targetUrl);
@@ -5862,7 +6234,7 @@ async function main() {
   paths.resultLog = path.join(paths.logsDir, `results-${new Date().toISOString().slice(0, 10)}.jsonl`);
 
   fs.mkdirSync(paths.logsDir, { recursive: true });
-  if (!args.auditIncompleteRecords && !enrichmentReviewPlanRequested && !enrichmentReviewPlanApplyRequested && !enrichmentDataIssuesReportRequested && !primaryReferenceBackfillAuditRequested) {
+  if (!args.auditIncompleteRecords && !enrichmentReviewPlanRequested && !enrichmentReviewPlanApplyRequested && !enrichmentDataIssuesReportRequested && !primaryReferenceMigrationRequested) {
     fs.mkdirSync(paths.profileDir, { recursive: true });
     fs.mkdirSync(paths.imagesDir, { recursive: true });
   }
@@ -5898,6 +6270,25 @@ async function main() {
   if (primaryReferenceBackfillAuditRequested) {
     if (!master) throw new Error('Current Master products are required for primary reference backfill audit.');
     runPrimaryReferenceBackfillAudit({ master, paths, args });
+    return;
+  }
+  if (primaryReferenceColumnPlanRequested) {
+    if (!master) throw new Error('Current Master products are required for primary reference column plan.');
+    planPrimaryReferenceColumnAddition({ master, paths });
+    return;
+  }
+  if (primaryReferenceColumnEnsureRequested) {
+    if (!master) throw new Error('Current Master products are required for primary reference column ensure.');
+    await runEnsurePrimaryReferenceColumn({ config, master, paths, args, baseDir });
+    return;
+  }
+  if (primaryReferenceBackfillPlanRequested) {
+    runPrimaryReferenceBackfillPlan({ paths, args, baseDir });
+    return;
+  }
+  if (primaryReferenceBackfillApplyRequested) {
+    if (!master) throw new Error('Current Master products are required for primary reference backfill apply.');
+    await runPrimaryReferenceBackfillApply({ config, master, paths, args, baseDir });
     return;
   }
   if (!targetedDiscoveryRequested && !args.enrichIncompleteRecords && !args.auditIncompleteRecords && !args.statusJson && !args.dryRun) {
