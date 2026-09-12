@@ -174,6 +174,14 @@ function mfImageCollectorDoPost(e) {
       mfImageCollectorAssertSecret_(payload);
       return mfImageCollectorJson_(mfImageCollectorRepairStructuredFactTargetVersions_(payload));
     }
+    if (payload.action === 'ensurePrimaryReferenceColumn') {
+      mfImageCollectorAssertSecret_(payload);
+      return mfImageCollectorJson_(mfImageCollectorEnsurePrimaryReferenceColumn_(payload));
+    }
+    if (payload.action === 'backfillPrimaryReferences') {
+      mfImageCollectorAssertSecret_(payload);
+      return mfImageCollectorJson_(mfImageCollectorBackfillPrimaryReferences_(payload));
+    }
     if (payload.action === 'completeTargetDiscoveryRequest') {
       mfImageCollectorAssertSecret_(payload);
       return mfImageCollectorJson_(mfImageCollectorCompleteTargetDiscoveryRequest_(payload));
@@ -1556,6 +1564,195 @@ function mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, ver
     if (normalizedReference && versionCol >= 0 && rowVersionKey.indexOf(normalizedReference + '-B') === 0) return i + 1;
   }
   return -1;
+}
+
+function mfImageCollectorPrimaryReferenceHeaderInfo_(sheet) {
+  var lastColumn = sheet.getLastColumn();
+  var rawHeaders = lastColumn > 0
+    ? sheet.getRange(1, 1, 1, lastColumn).getValues()[0]
+    : [];
+  var matches = [];
+  for (var i = 0; i < rawHeaders.length; i += 1) {
+    var raw = String(rawHeaders[i] || '');
+    var trimmed = raw.trim();
+    if (trimmed === 'Primary Reference') {
+      if (raw !== trimmed) {
+        throw new Error('Ambiguous Primary Reference header with surrounding whitespace at column ' + (i + 1));
+      }
+      matches.push(i + 1);
+    }
+  }
+  if (matches.length > 1) throw new Error('Duplicate Primary Reference columns found.');
+  return {
+    column_exists: matches.length === 1,
+    column_index: matches.length === 1 ? matches[0] : lastColumn + 1,
+    header_count: lastColumn
+  };
+}
+
+function mfImageCollectorEnsurePrimaryReferenceColumn_(payload) {
+  var dryRun = payload.dry_run !== false;
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var info = mfImageCollectorPrimaryReferenceHeaderInfo_(sheet);
+  var added = false;
+  if (!info.column_exists && !dryRun) {
+    sheet.insertColumnAfter(info.header_count);
+    sheet.getRange(1, info.header_count + 1).setValue('Primary Reference');
+    added = true;
+    info = mfImageCollectorPrimaryReferenceHeaderInfo_(sheet);
+  }
+  return {
+    ok: true,
+    dry_run: dryRun,
+    column_exists: info.column_exists,
+    added: added,
+    column_index: info.column_index,
+    header_count: info.header_count
+  };
+}
+
+function mfImageCollectorPrimaryReferenceIsAllowed_(reference, item) {
+  var ref = String(reference || '').trim().toUpperCase();
+  if (/^T\d+$/.test(ref)) return true;
+  if (/^TFBF\d+$/.test(ref)) return true;
+  if (/^TFG\d+$/.test(ref)) {
+    var source = String(item.derivation_source || '').trim();
+    var salesRefs = mfImageCollectorDelimitedValues_((item.expected_sales_sku_references || []).join ? item.expected_sales_sku_references.join('、') : item.expected_sales_sku_references)
+      .map(function(value) { return String(value || '').trim().toUpperCase(); });
+    return source === 'sales_sku_reference' && salesRefs.indexOf(ref) >= 0;
+  }
+  return false;
+}
+
+function mfImageCollectorPrimaryReferenceSalesRefsForRow_(values, headers, rowIndex) {
+  var cols = mfImageCollectorSalesSkuReferenceColumns_(headers);
+  var out = [];
+  for (var i = 0; i < cols.length; i += 1) {
+    var tokens = mfImageCollectorDelimitedValues_(values[rowIndex][cols[i]]);
+    for (var j = 0; j < tokens.length; j += 1) {
+      var token = String(tokens[j] || '').trim().toUpperCase();
+      if (token && out.indexOf(token) < 0) out.push(token);
+    }
+  }
+  return out;
+}
+
+function mfImageCollectorPrimaryReferenceBackfillResult_(item, result, reason, rowNumber, oldValue) {
+  return {
+    version_key: String(item.version_key || '').trim(),
+    row_number: rowNumber || item.row_number || '',
+    old_value: typeof oldValue === 'undefined' ? '' : oldValue,
+    new_value: String(item.new_primary_reference || '').trim().toUpperCase(),
+    result: result,
+    reason: reason
+  };
+}
+
+function mfImageCollectorValidatePrimaryReferenceBackfillItem_(item, values, headers, primaryCol) {
+  var versionKey = String(item.version_key || '').trim().toUpperCase();
+  var newPrimary = String(item.new_primary_reference || '').trim().toUpperCase();
+  if (!versionKey) return mfImageCollectorPrimaryReferenceBackfillResult_(item, 'invalid', 'version_key is required');
+  if (!newPrimary) return mfImageCollectorPrimaryReferenceBackfillResult_(item, 'invalid', 'new_primary_reference is required');
+  if (/-N\d{2}$/i.test(versionKey) && /^T\d{7,}$/i.test(newPrimary)) {
+    return mfImageCollectorPrimaryReferenceBackfillResult_(item, 'invalid', 'legacy N01 long reference is not eligible');
+  }
+  if (!mfImageCollectorPrimaryReferenceIsAllowed_(newPrimary, item)) {
+    return mfImageCollectorPrimaryReferenceBackfillResult_(item, 'invalid', 'new_primary_reference is not an allowed primary reference');
+  }
+  var versionCol = headers.indexOf('VersionKey');
+  if (versionCol < 0) return mfImageCollectorPrimaryReferenceBackfillResult_(item, 'invalid', 'VersionKey column is missing');
+  var matches = [];
+  for (var i = 1; i < values.length; i += 1) {
+    if (String(values[i][versionCol] || '').trim().toUpperCase() === versionKey) matches.push(i);
+  }
+  if (matches.length === 0) return mfImageCollectorPrimaryReferenceBackfillResult_(item, 'stale', 'VersionKey not found');
+  if (matches.length > 1) return mfImageCollectorPrimaryReferenceBackfillResult_(item, 'conflict', 'Duplicate VersionKey rows found');
+
+  var rowIndex = matches[0];
+  var rowNumber = rowIndex + 1;
+  var currentPrimary = String(values[rowIndex][primaryCol] || '').trim();
+  var expectedPrimary = String(item.expected_current_primary_reference || '').trim();
+  if (currentPrimary !== expectedPrimary) {
+    return mfImageCollectorPrimaryReferenceBackfillResult_(item, 'conflict', 'Current Primary Reference does not match expected value', rowNumber, currentPrimary);
+  }
+
+  var refCol = headers.indexOf('Tリファレンス番号');
+  var expectedT = String(item.expected_t_reference || '').trim().toUpperCase();
+  if (refCol >= 0) {
+    var currentT = String(values[rowIndex][refCol] || '').trim().toUpperCase();
+    if (currentT !== expectedT) {
+      return mfImageCollectorPrimaryReferenceBackfillResult_(item, 'stale', 'Tリファレンス番号 changed', rowNumber, currentPrimary);
+    }
+  }
+
+  var expectedSales = mfImageCollectorDelimitedValues_((item.expected_sales_sku_references || []).join ? item.expected_sales_sku_references.join('、') : item.expected_sales_sku_references)
+    .map(function(value) { return String(value || '').trim().toUpperCase(); })
+    .sort();
+  var currentSales = mfImageCollectorPrimaryReferenceSalesRefsForRow_(values, headers, rowIndex).sort();
+  if (expectedSales.join('|') !== currentSales.join('|')) {
+    return mfImageCollectorPrimaryReferenceBackfillResult_(item, 'stale', 'sales SKU references changed', rowNumber, currentPrimary);
+  }
+
+  return mfImageCollectorPrimaryReferenceBackfillResult_(item, 'validated', 'validated', rowNumber, currentPrimary);
+}
+
+function mfImageCollectorPrimaryReferenceBackfillSummary_(results) {
+  var summary = {
+    requested: results.length,
+    validated: 0,
+    written: 0,
+    skipped: 0,
+    stale: 0,
+    conflict: 0,
+    invalid: 0,
+    missing_column: 0,
+    errors: 0
+  };
+  for (var i = 0; i < results.length; i += 1) {
+    var key = results[i].result;
+    if (key === 'would_write') key = 'validated';
+    if (summary.hasOwnProperty(key)) summary[key] += 1;
+  }
+  return summary;
+}
+
+function mfImageCollectorBackfillPrimaryReferences_(payload) {
+  var dryRun = payload.dry_run !== false;
+  var items = Array.isArray(payload.items) ? payload.items : [];
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 1) throw new Error('Sheet has no header row.');
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var info = mfImageCollectorPrimaryReferenceHeaderInfo_(sheet);
+  var results = [];
+  if (!info.column_exists) {
+    for (var m = 0; m < items.length; m += 1) {
+      results.push(mfImageCollectorPrimaryReferenceBackfillResult_(items[m], 'missing_column', 'Primary Reference column is missing'));
+    }
+    var missingSummary = mfImageCollectorPrimaryReferenceBackfillSummary_(results);
+    return Object.assign({ ok: true, dry_run: dryRun, results: results }, missingSummary);
+  }
+
+  var primaryCol = info.column_index - 1;
+  for (var i = 0; i < items.length; i += 1) {
+    var validation = mfImageCollectorValidatePrimaryReferenceBackfillItem_(items[i], values, headers, primaryCol);
+    if (validation.result === 'validated') {
+      if (dryRun) {
+        validation.result = 'would_write';
+      } else {
+        sheet.getRange(validation.row_number, primaryCol + 1).setValue(validation.new_value);
+        values[validation.row_number - 1][primaryCol] = validation.new_value;
+        validation.result = 'written';
+      }
+    }
+    results.push(validation);
+  }
+  var summary = mfImageCollectorPrimaryReferenceBackfillSummary_(results);
+  return Object.assign({ ok: true, dry_run: dryRun, results: results }, summary);
 }
 
 function mfImageCollectorRepairStructuredFactTargetVersions_(payload) {
