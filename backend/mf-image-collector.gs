@@ -1165,6 +1165,7 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
   var values = sheet.getDataRange().getValues();
   var headers = values[0].map(function(value) { return String(value).trim(); });
   var versionCol = headers.indexOf('VersionKey');
+  var primaryRefCol = headers.indexOf('Primary Reference');
   var refCol = headers.indexOf('Tリファレンス番号');
   var nameCol = headers.indexOf('現在の公式名');
   var urlCol = headers.indexOf('公式商品ページURL');
@@ -1342,6 +1343,7 @@ function mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey) {
 function mfImageCollectorBuildApprovedNewTeaRow_(headers, review, referenceInfo, versionKey, versionLabel) {
   var reference = referenceInfo.primaryReference;
   var officialCategory = mfImageCollectorNormalizeClassificationValueForMaster_(mfImageCollectorReviewOfficialCategory_(review));
+  if (!officialCategory && mfImageCollectorIsTfbfReference_(reference)) officialCategory = 'ティザン';
   var teaTypeTag = mfImageCollectorTeaTypeTagFromCategory_(officialCategory);
   var officialDescription = mfImageCollectorReviewOfficialDescriptionForMaster_(review);
   var officialUrl = String(review['公式URL'] || '').trim();
@@ -1349,6 +1351,7 @@ function mfImageCollectorBuildApprovedNewTeaRow_(headers, review, referenceInfo,
   var salesEvidence = mfImageCollectorSalesSkuEvidence_(review);
   return headers.map(function(header) {
     if (header === 'VersionKey') return versionKey;
+    if (header === 'Primary Reference') return reference;
     if (header === 'バージョン') return versionLabel;
     if (header === 'Tリファレンス番号') return referenceInfo.tReference || '';
     if (header === '現在の公式名') return review['公式名'] || '';
@@ -1436,7 +1439,7 @@ function mfImageCollectorReviewOfficialDescriptionForMaster_(review) {
 function mfImageCollectorTeaTypeTagFromCategory_(category) {
   var normalized = mfImageCollectorNormalizeClassificationValueForMaster_(category);
   if (!normalized) return '';
-  var direct = ['黒茶', '青茶', '緑茶', '白茶', '黄茶', '後発酵茶', 'ルイボス', 'マテ', 'インフュージョン'];
+  var direct = ['黒茶', '青茶', '緑茶', '白茶', '黄茶', '後発酵茶', 'ルイボス', 'ティザン', 'マテ', 'インフュージョン'];
   for (var i = 0; i < direct.length; i += 1) {
     if (normalized.indexOf(direct[i]) === 0 || normalized.indexOf(direct[i] + '／') === 0 || normalized.indexOf(direct[i] + ',') === 0) {
       return direct[i];
@@ -1534,14 +1537,15 @@ function mfImageCollectorAppendDelimitedCellByHeader_(sheet, headers, row, heade
 
 function mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, versionKey, reference) {
   var versionCol = headers.indexOf('VersionKey');
+  var primaryRefCol = headers.indexOf('Primary Reference');
   var refCol = headers.indexOf('Tリファレンス番号');
   var salesRefCols = mfImageCollectorSalesSkuReferenceColumns_(headers);
   var normalizedVersionKey = String(versionKey || '').trim().toUpperCase();
   var normalizedReference = String(reference || '').trim().toUpperCase();
   for (var i = 1; i < values.length; i += 1) {
-    var rowVersionKey = String(values[i][versionCol] || '').trim().toUpperCase();
+    var rowVersionKey = versionCol >= 0 ? String(values[i][versionCol] || '').trim().toUpperCase() : '';
     if (normalizedVersionKey && versionCol >= 0 && rowVersionKey === normalizedVersionKey) return i + 1;
-    if (normalizedReference && versionCol >= 0 && rowVersionKey.indexOf(normalizedReference + '-B') === 0) return i + 1;
+    if (normalizedReference && primaryRefCol >= 0 && String(values[i][primaryRefCol] || '').trim().toUpperCase() === normalizedReference) return i + 1;
     if (normalizedReference && refCol >= 0 && String(values[i][refCol] || '').trim().toUpperCase() === normalizedReference) return i + 1;
     if (normalizedReference && mfImageCollectorSalesSkuInfo_(normalizedReference)) {
       for (var j = 0; j < salesRefCols.length; j += 1) {
@@ -1549,6 +1553,7 @@ function mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, ver
         if (tokens.map(function(token) { return String(token).trim().toUpperCase(); }).indexOf(normalizedReference) >= 0) return i + 1;
       }
     }
+    if (normalizedReference && versionCol >= 0 && rowVersionKey.indexOf(normalizedReference + '-B') === 0) return i + 1;
   }
   return -1;
 }
@@ -1668,13 +1673,14 @@ function mfImageCollectorResolveStructuredFactMasterRow_(values, headers, review
   for (var i = 1; i < values.length; i += 1) {
     var versionKey = String(values[i][versionCol] || '').trim();
     if (!versionKey) continue;
+    var rowPrimaryRef = primaryRefCol >= 0 ? String(values[i][primaryRefCol] || '').trim().toUpperCase() : '';
     var rowRef = String(values[i][refCol] || '').trim().toUpperCase();
     var versionPrefix = String(versionKey || '').trim().toUpperCase().match(/^([A-Z]+\d[A-Z0-9]*)-[BN]\d{2}$/);
-    if (rowRef !== reference && (!versionPrefix || versionPrefix[1] !== reference)) continue;
+    if (rowPrimaryRef !== reference && rowRef !== reference && (!versionPrefix || versionPrefix[1] !== reference)) continue;
     matches.push({
       row_number: i + 1,
       version_key: versionKey,
-      reference: rowRef,
+      reference: rowPrimaryRef || rowRef,
       name: nameCol >= 0 ? String(values[i][nameCol] || '').trim() : '',
       url: urlCol >= 0 ? String(values[i][urlCol] || '').trim() : ''
     });
@@ -1794,8 +1800,13 @@ function mfImageCollectorAssertAppendVersionKey_(values, headers, reference, ver
 function mfImageCollectorAssertPrimaryReference_(reference) {
   var ref = String(reference || '').trim().toUpperCase();
   if (/^T\d+$/.test(ref)) return;
+  if (mfImageCollectorIsTfbfReference_(ref)) return;
   if (mfImageCollectorSalesSkuInfo_(ref)) return;
   throw new Error('Invalid primary reference for VersionKey: ' + reference);
+}
+
+function mfImageCollectorIsTfbfReference_(reference) {
+  return /^TFBF\d+$/.test(String(reference || '').trim().toUpperCase());
 }
 
 function mfImageCollectorSalesSkuReferenceColumns_(headers) {
@@ -1985,8 +1996,11 @@ function mfImageCollectorUpdateMasterOfficialInfo_(payload) {
 
   var rowIndex = -1;
   for (var i = 1; i < values.length; i += 1) {
-    if (String(values[i][refCol]).trim().toUpperCase() !== reference.toUpperCase()) continue;
-    if (versionKey && versionCol >= 0 && String(values[i][versionCol]).trim().toUpperCase() !== versionKey.toUpperCase()) continue;
+    if (versionKey && versionCol >= 0) {
+      if (String(values[i][versionCol]).trim().toUpperCase() !== versionKey.toUpperCase()) continue;
+    } else if (String(values[i][refCol]).trim().toUpperCase() !== reference.toUpperCase()) {
+      continue;
+    }
     rowIndex = i;
     break;
   }
@@ -2037,6 +2051,7 @@ function mfImageCollectorUpdateMasterNewTeaDefaults_(payload) {
   var productPageUrl = String(payload.product_page_url || '').trim();
   var officialName = String(payload.official_name || '').trim();
   var officialCategory = mfImageCollectorNormalizeClassificationValueForMaster_(payload.official_category);
+  if (!officialCategory && mfImageCollectorIsTfbfReference_(reference)) officialCategory = 'ティザン';
   var teaTypeTag = mfImageCollectorTeaTypeTagFromCategory_(officialCategory);
   var masterAbsenceConfirmed = payload.master_absence_confirmed === true;
   var officialDescription = mfImageCollectorReviewOfficialDescriptionForMaster_({
@@ -2066,8 +2081,11 @@ function mfImageCollectorUpdateMasterNewTeaDefaults_(payload) {
 
   var rowIndex = -1;
   for (var i = 1; i < values.length; i += 1) {
-    if (String(values[i][refCol]).trim().toUpperCase() !== reference) continue;
-    if (versionKey && versionCol >= 0 && String(values[i][versionCol]).trim().toUpperCase() !== versionKey) continue;
+    if (versionKey && versionCol >= 0) {
+      if (String(values[i][versionCol]).trim().toUpperCase() !== versionKey) continue;
+    } else if (String(values[i][refCol]).trim().toUpperCase() !== reference) {
+      continue;
+    }
     rowIndex = i;
     break;
   }
@@ -2609,6 +2627,9 @@ function mfImageCollectorNormalizeTeaTypeTagTokenForMaster_(token) {
   var normalized = raw.replace(/™/g, '').toLowerCase();
   if (raw === '紅茶') return '黒茶';
   if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir') return '黒茶';
+  if (raw === 'チザン') return 'ティザン';
+  if (normalized === 'tisane' || normalized === 'fruit tea' || normalized === 'fruit teas') return 'ティザン';
+  if (normalized === 'maté' || normalized === 'mate') return 'マテ';
   return raw;
 }
 
@@ -2622,7 +2643,9 @@ function mfImageCollectorNormalizeClassificationValueForMaster_(value) {
   if (normalized === 'white tea' || normalized === 'thé blanc') return '白茶';
   if (normalized === 'yellow tea' || normalized === 'thé jaune') return '黄茶';
   if (normalized === 'rooibos') return 'ルイボス';
+  if (normalized === 'tisane' || normalized === 'fruit tea' || normalized === 'fruit teas') return 'ティザン';
   if (normalized === 'maté' || normalized === 'mate') return 'マテ';
+  if (/tisane|fruit tea|infusion fruit[ée]e?/.test(normalized)) return 'ティザン';
   if (normalized === 'infusion' || normalized === 'herbal tea') return 'インフュージョン';
   return raw
     .replace(/紅茶/g, '黒茶')
@@ -2637,7 +2660,9 @@ function mfImageCollectorNormalizeClassificationValueForMaster_(value) {
     .replace(/\bthe bleu\b/gi, '青茶')
     .replace(/\bThé vert\b/gi, '緑茶')
     .replace(/\bThé blanc\b/gi, '白茶')
-    .replace(/\bThé jaune\b/gi, '黄茶');
+    .replace(/\bThé jaune\b/gi, '黄茶')
+    .replace(/\bFruit tea\b/gi, 'ティザン')
+    .replace(/\bTisane\b/gi, 'ティザン');
 }
 
 function mfImageCollectorAromaCategoryOrder_() {
