@@ -17,6 +17,7 @@ const PRODUCT_URL_DISCOVERY_VERSION = 'official-search-fr-en-jp-v1';
 const PRODUCT_URL_NOT_FOUND_MESSAGE = 'No official product page with exact reference was verified.';
 const SALES_SKU_PREFIXES = ['TFG', 'TJC', 'TB', 'TC', 'TE', 'TF', 'TP', 'TA', 'TJ'];
 const MASTER_COLUMNS = {
+  primaryReference: 'Primary Reference',
   reference: 'Tリファレンス番号',
   name: '現在の公式名',
   fallbackName: '銘柄名（黒い本）',
@@ -263,6 +264,14 @@ function isTeaReference(value) {
   return /^T\d{2,6}$/i.test(normalizeText(value));
 }
 
+function isTfbfReference(value) {
+  return /^TFBF\d{2,6}$/i.test(normalizeText(value));
+}
+
+function isPrimaryTeaReference(value) {
+  return isTeaReference(value) || isTfbfReference(value);
+}
+
 function isLegacyMasterTeaReference(value) {
   return /^T\d+$/i.test(normalizeText(value));
 }
@@ -273,7 +282,7 @@ function isSalesSkuReference(value) {
 
 function canonicalProductReference(value) {
   const ref = normalizeText(value).toUpperCase();
-  return isTeaReference(ref) || isSalesSkuReference(ref) ? ref : '';
+  return isPrimaryTeaReference(ref) || isSalesSkuReference(ref) ? ref : '';
 }
 
 function normalizeImageStatus(value) {
@@ -591,11 +600,15 @@ function salesSkuReferencesByPrefix(refs) {
 }
 
 function primaryReferenceFromMasterRow(row) {
+  const primaryReference = canonicalProductReference(row[MASTER_COLUMNS.primaryReference]);
+  if (primaryReference) return primaryReference;
   const tReference = normalizeText(row[MASTER_COLUMNS.reference]).toUpperCase();
   if (isLegacyMasterTeaReference(tReference)) return tReference;
+  const salesReference = salesSkuReferencesFromMasterRow(row)[0] || '';
+  if (salesReference) return salesReference;
   const versionPrefix = normalizeText(row[MASTER_COLUMNS.versionKey]).toUpperCase().match(/^([A-Z]+\d[A-Z0-9]*)-[BN]\d{2}$/)?.[1] || '';
   if (canonicalProductReference(versionPrefix)) return versionPrefix;
-  return salesSkuReferencesFromMasterRow(row)[0] || '';
+  return '';
 }
 
 async function fetchMasterProducts(config, baseDir, debug) {
@@ -633,7 +646,7 @@ async function fetchMasterProducts(config, baseDir, debug) {
         reference,
         tReference,
         primaryReference: reference,
-        primaryReferenceType: isLegacyMasterTeaReference(tReference) ? 'tea' : 'sales_sku',
+        primaryReferenceType: isSalesSkuReference(reference) ? 'sales_sku' : 'tea',
         salesReferences,
         name: normalizeText(row[MASTER_COLUMNS.name]) || normalizeText(row[MASTER_COLUMNS.fallbackName]),
         productUrl,
@@ -696,7 +709,7 @@ function candidateReferenceTokens(candidate) {
     candidate.closestText,
     candidate.sectionText,
   ].join(' ');
-  return [...new Set([...extractTeaReferences(hay), ...extractSalesSkuReferences(hay)])];
+  return [...new Set([...extractPrimaryTeaReferences(hay), ...extractSalesSkuReferences(hay)])];
 }
 
 function candidateHasConflictingReference(candidate, product) {
@@ -756,7 +769,7 @@ function imageInfoFromOfficialUrl(rawUrl) {
     }
     if (!/\/media\/catalog\/product\//i.test(pathname)) return null;
     const file = path.basename(pathname);
-    const match = file.match(/^((?:t\d{2,6})|(?:(?:tfg|tjc|tb|tc|te|tf|tp|ta)\d{2,6})|(?:tj[a-z0-9]{2,8}))(-\d+p)?\.(jpe?g|png|webp|avif)$/i);
+    const match = file.match(/^((?:t\d{2,6})|(?:tfbf\d{2,6})|(?:(?:tfg|tjc|tb|tc|te|tf|tp|ta)\d{2,6})|(?:tj[a-z0-9]{2,8}))(-\d+p)?\.(jpe?g|png|webp|avif)$/i);
     if (!match) return null;
     const reference = match[1].toUpperCase();
     if (!canonicalProductReference(reference)) return null;
@@ -934,6 +947,9 @@ function normalizeOfficialCategoryForMaster(category) {
     ['thé blanc', '白茶'],
     ['white tea', '白茶'],
     ['rooibos', 'ルイボス'],
+    ['tisane', 'ティザン'],
+    ['fruit tea', 'ティザン'],
+    ['fruit teas', 'ティザン'],
     ['infusion', 'インフュージョン'],
     ['herbal tea', 'インフュージョン'],
     ['maté', 'マテ'],
@@ -945,6 +961,7 @@ function normalizeOfficialCategoryForMaster(category) {
   if (/thé vert|green tea/.test(normalized)) return '緑茶';
   if (/thé blanc|white tea/.test(normalized)) return '白茶';
   if (/rooibos/.test(normalized)) return 'ルイボス';
+  if (/tisane|fruit tea|infusion fruit[ée]e?/.test(normalized)) return 'ティザン';
   if (/infusion|herbal/.test(normalized)) return 'インフュージョン';
   if (/mat[ée]/.test(normalized)) return 'マテ';
   return normalizeText(category)
@@ -956,7 +973,13 @@ function normalizeOfficialCategoryForMaster(category) {
     .replace(/\bThé noir\b/gi, '黒茶')
     .replace(/\bThé bleu\b/gi, '青茶')
     .replace(/\bThé vert\b/gi, '緑茶')
-    .replace(/\bThé blanc\b/gi, '白茶');
+    .replace(/\bThé blanc\b/gi, '白茶')
+    .replace(/\bFruit tea\b/gi, 'ティザン')
+    .replace(/\bTisane\b/gi, 'ティザン');
+}
+
+function defaultOfficialCategoryForReference(reference) {
+  return isTfbfReference(reference) ? 'ティザン' : '';
 }
 
 function normalizeTeaTypeTagTokenForMaster(token) {
@@ -964,6 +987,9 @@ function normalizeTeaTypeTagTokenForMaster(token) {
   const normalized = raw.replace(/™/g, '').toLowerCase();
   if (raw === '紅茶') return '黒茶';
   if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir') return '黒茶';
+  if (raw === 'チザン') return 'ティザン';
+  if (normalized === 'tisane' || normalized === 'fruit tea' || normalized === 'fruit teas') return 'ティザン';
+  if (normalized === 'maté' || normalized === 'mate') return 'マテ';
   return raw;
 }
 
@@ -1374,7 +1400,7 @@ function buildStructuredFactSuggestions({ product, facts, vocabulary }) {
 }
 
 function buildOfficialStructuredFacts({ product, facts, language, vocabulary, translationReviewCandidate }) {
-  const category = normalizeOfficialCategoryForMaster(facts?.category || '');
+  const category = normalizeOfficialCategoryForMaster(facts?.category || '') || defaultOfficialCategoryForReference(product.reference);
   const teaTypeTag = normalizeTeaTypeTagsForMaster(category);
   const structuredReviewSuggestions = buildStructuredFactSuggestions({ product, facts, vocabulary });
   return {
@@ -1977,7 +2003,7 @@ function looksLikeProductUrl(url) {
     if (parsed.hostname === 'www.mariagefreres.com' && (parsed.pathname.startsWith('/fr/') || parsed.pathname.startsWith('/en/'))) {
       if (!parsed.pathname.endsWith('.html')) return false;
       if (/checkout|customer|catalogsearch|wishlist|review|contacts/i.test(parsed.pathname)) return false;
-      if (!/(^|-)(?:t\d{2,6}|(?:tfg|tjc|tb|tc|te|tf|tp|ta)\d{2,6}|tj[a-z0-9]{2,8})([-.]|$)/i.test(parsed.pathname)) return false;
+      if (!/(^|-)(?:t\d{2,6}|tfbf\d{2,6}|(?:tfg|tjc|tb|tc|te|tf|tp|ta)\d{2,6}|tj[a-z0-9]{2,8})([-.]|$)/i.test(parsed.pathname)) return false;
       return true;
     }
     if (parsed.hostname === 'www.mariagefreres.co.jp' && /^\/view\/item\/\d+/.test(parsed.pathname)) {
@@ -2140,6 +2166,7 @@ function mergeTargetedUnregisteredReview({ reference, pages, primaryPage, source
   const namesByLanguage = targetedOfficialNamesByLanguage(pages);
   const descriptionsByLanguage = targetedDescriptionsByLanguage(pages);
   const categoriesByLanguage = targetedCategoriesByLanguage(pages);
+  const officialCategory = primaryPage.facts?.category || Object.values(categoriesByLanguage)[0] || defaultOfficialCategoryForReference(reference);
   const allSalesReferences = [...new Set(pages.flatMap((page) => page.sales_references || []))];
   const salesReferences = salesSkuReferencesByPrefix(allSalesReferences);
   const skuOnly = primaryPage.sku_only === true && !primaryPage.t_references?.length;
@@ -2170,7 +2197,7 @@ function mergeTargetedUnregisteredReview({ reference, pages, primaryPage, source
   candidate.categories_by_language = categoriesByLanguage;
   candidate.official_name_differences = Object.entries(namesByLanguage).map(([lang, name]) => `${lang}: ${name}`).join('\n');
   candidate.description_excerpt = preferredDescriptionByLanguage(descriptionsByLanguage);
-  candidate.official_category = primaryPage.facts?.category || Object.values(categoriesByLanguage)[0] || '';
+  candidate.official_category = officialCategory;
   candidate.discovery_sources = pages.map((page) => ({
     source: source.id,
     source_type: source.source,
@@ -3740,6 +3767,17 @@ function extractTeaReferences(text) {
   return [...out];
 }
 
+function extractTfbfReferences(text) {
+  const out = new Set();
+  const pattern = /(^|[^A-Za-z0-9])(TFBF\d{2,6})(?![A-Za-z0-9])/gi;
+  for (const match of String(text || '').matchAll(pattern)) out.add(match[2].toUpperCase());
+  return [...out];
+}
+
+function extractPrimaryTeaReferences(text) {
+  return [...new Set([...extractTeaReferences(text), ...extractTfbfReferences(text)])];
+}
+
 function extractSalesSkuReferences(text) {
   const out = new Set();
 
@@ -3820,7 +3858,10 @@ function isJpRetailSkuLikeTeaReference(reference, facts) {
 }
 
 function extractVerifiedProductTeaReferences(text, facts) {
-  return extractTeaReferences(text).filter((reference) => !isJpRetailSkuLikeTeaReference(reference, facts));
+  return extractPrimaryTeaReferences(text).filter((reference) => {
+    if (isTfbfReference(reference)) return true;
+    return !isJpRetailSkuLikeTeaReference(reference, facts);
+  });
 }
 
 function extractUrlsFromText(text) {
@@ -3983,7 +4024,8 @@ function buildUnregisteredReferenceReview({ reference, facts, url, source, sourc
   const officialUrlsByLanguage = language ? { [language]: url } : {};
   const officialNamesByLanguage = language && officialName ? { [language]: officialName } : {};
   const descriptionSnippetsByLanguage = language && descriptionExcerpt ? { [language]: descriptionExcerpt } : {};
-  const categoriesByLanguage = language && facts?.category ? { [language]: facts.category } : {};
+  const officialCategory = facts?.category || defaultOfficialCategoryForReference(reference);
+  const categoriesByLanguage = language && officialCategory ? { [language]: officialCategory } : {};
   const similarMasterCandidates = findSimilarMasterCandidates(reference, officialName, masterProducts);
   const candidate = {
     detected_at: nowIso(),
@@ -4004,7 +4046,7 @@ function buildUnregisteredReferenceReview({ reference, facts, url, source, sourc
     official_names_by_language: officialNamesByLanguage,
     description_snippets_by_language: descriptionSnippetsByLanguage,
     categories_by_language: categoriesByLanguage,
-    official_category: facts?.category || '',
+    official_category: officialCategory,
     discovery_sources: [{ source: source.id, source_type: source.source, discovery_source: discoverySource, language, url }],
     official_name_differences: Object.entries(officialNamesByLanguage).map(([lang, name]) => `${lang}: ${name}`).join('\n'),
     description_excerpt: descriptionExcerpt,

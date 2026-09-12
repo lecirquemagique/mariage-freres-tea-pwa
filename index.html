@@ -735,7 +735,8 @@ const TEA_TYPE_ORDER=[
   '黄茶',
   '後発酵茶',
   'ルイボス',
-  'チザン'
+  'ティザン',
+  'マテ'
 ];
 
 const C=window.MF_APP_CONFIG||{};
@@ -788,15 +789,18 @@ const uniq=a=>
 
 function salesFormatCodes(row){
   return uniq(
-    SALES_FORMAT_REFERENCE_FIELDS
-      .flatMap(key=>
-        sp(row[key])
-      )
+    [
+      ...SALES_FORMAT_REFERENCE_FIELDS
+        .flatMap(key=>
+          sp(row[key])
+        ),
+      displayReference(row)
+    ]
       .map(x=>
         String(x||'').trim().toUpperCase()
       )
       .map(ref=>{
-        const m=ref.match(/^(TFG|TJC|TB|TC|TE|TF|TP|TJ|TA|T)/);
+        const m=ref.match(/^(TFBF|TFG|TJC|TB|TC|TE|TF|TP|TJ|TA|T)/);
         return m ? m[1] : '';
       })
       .filter(Boolean)
@@ -813,6 +817,11 @@ function salesFormatIconPath(code){
 }
 
 function displayReference(row){
+  const primaryRef=String(row['Primary Reference']||'').trim();
+  if(primaryRef){
+    return primaryRef;
+  }
+
   const teaRef=String(row['Tリファレンス番号']||'').trim();
   if(teaRef){
     return teaRef;
@@ -876,12 +885,23 @@ function normalizeTeaType(value){
   }
 
   if(
+    v.includes('ティザン') ||
     v.includes('チザン') ||
     v.includes('tisane') ||
+    v.includes('fruittea') ||
+    v.includes('フルーツティー') ||
     v.includes('ハーブティー') ||
     v==='ハーブ'
   ){
-    return 'チザン';
+    return 'ティザン';
+  }
+
+  if(
+    v.includes('マテ') ||
+    v.includes('mate') ||
+    v.includes('maté')
+  ){
+    return 'マテ';
   }
 
   return raw;
