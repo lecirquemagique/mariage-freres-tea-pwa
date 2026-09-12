@@ -97,7 +97,9 @@ function parseArgs(argv) {
     auditAll: false,
     auditLimit: null,
     planEnrichmentReviewWriteback: '',
+    applyEnrichmentReviewPlan: '',
     reportEnrichmentDataIssues: '',
+    writeReview: false,
     versionKeys: null,
     enrichRef: '',
     writeStructuredReviewCandidates: false,
@@ -143,8 +145,11 @@ function parseArgs(argv) {
     else if (arg.startsWith('--limit=')) args.auditLimit = Number(arg.slice('--limit='.length));
     else if (arg === '--plan-enrichment-review-writeback') args.planEnrichmentReviewWriteback = argv[++i] || '';
     else if (arg.startsWith('--plan-enrichment-review-writeback=')) args.planEnrichmentReviewWriteback = arg.slice('--plan-enrichment-review-writeback='.length);
+    else if (arg === '--apply-enrichment-review-plan') args.applyEnrichmentReviewPlan = argv[++i] || '';
+    else if (arg.startsWith('--apply-enrichment-review-plan=')) args.applyEnrichmentReviewPlan = arg.slice('--apply-enrichment-review-plan='.length);
     else if (arg === '--report-enrichment-data-issues') args.reportEnrichmentDataIssues = argv[++i] || '';
     else if (arg.startsWith('--report-enrichment-data-issues=')) args.reportEnrichmentDataIssues = arg.slice('--report-enrichment-data-issues='.length);
+    else if (arg === '--write-review') args.writeReview = true;
     else if (arg === '--enrich-ref') {
       args.enrichRef = argv[++i] || '';
       args.enrichIncompleteRecords = true;
@@ -4993,6 +4998,341 @@ function buildEnrichmentDataIssuesReport({ audit, auditPath, paths, args }) {
   return { outputFile, report };
 }
 
+function planWritebackDedupeKey(candidate) {
+  return [
+    normalizeText(candidate.target_version_key).toUpperCase(),
+    normalizeText(candidate.candidate_type || candidate.detection_type),
+    normalizeText(candidate.field || candidate.target_column),
+    normalizeText(candidate.normalized_value || candidate.suggested_value),
+  ].join('|');
+}
+
+const FIXED_AROMA_CATEGORY_VALUES = new Set(AROMA_CATEGORY_ORDER);
+
+function normalizeWritebackAromaCategory(value) {
+  const raw = normalizeText(value);
+  if (!raw) return { value: '', status: 'invalid', reason: 'invalid_aroma_category' };
+  const directMap = new Map([
+    ['木質', 'ウッディ'],
+    ['甘香', '甘香・菓子'],
+  ]);
+  const mapped = directMap.get(raw);
+  if (mapped) return { value: mapped, status: 'normalized', original_value: raw };
+  if (FIXED_AROMA_CATEGORY_VALUES.has(raw)) return { value: raw, status: 'valid' };
+  if (/[、,;／|+＋&＆]/.test(raw) || raw.includes('・')) {
+    return { value: raw, status: 'ambiguous', reason: 'ambiguous_aroma_category' };
+  }
+  return { value: raw, status: 'invalid', reason: 'invalid_aroma_category' };
+}
+
+function planRecordIdentityValid(record, product) {
+  if (!product) return false;
+  if (!hasValue(record.reference)) return false;
+  if (!productHasReference(product, record.reference)) return false;
+  if (record.sku_only === true) {
+    const reference = normalizeText(record.reference).toUpperCase();
+    if (!isSalesSkuReference(reference)) return false;
+    if (normalizeText(product.tReference)) return false;
+  }
+  return true;
+}
+
+function planCandidateBaseSkipReasons({ record, candidate, product, masterIndexes }) {
+  const reasons = [];
+  const targetVersionKey = normalizeText(candidate.target_version_key).toUpperCase();
+  const targetColumn = normalizeText(candidate.field || candidate.target_column);
+  const candidateValue = normalizeText(candidate.normalized_value || candidate.suggested_value);
+  if (record.classification && record.classification !== '補完可能') reasons.push(`classification_${record.classification}`);
+  if (!targetVersionKey) reasons.push('missing_target_version_key');
+  if (targetVersionKey && !masterIndexes.byVersionKey.has(targetVersionKey)) reasons.push('target_version_key_not_in_current_master');
+  if (targetVersionKey && normalizeText(record.version_key).toUpperCase() && targetVersionKey !== normalizeText(record.version_key).toUpperCase()) reasons.push('target_version_key_record_mismatch');
+  if (!planRecordIdentityValid(record, product)) reasons.push('reference_identity_mismatch');
+  if (record.sku_only === true && /^T\d+$/i.test(normalizeText(record.t_reference || ''))) reasons.push('sku_only_generated_t_reference');
+  if (/-N\d{2}$/i.test(targetVersionKey) && /^T\d{7,}$/i.test(normalizeText(record.reference))) reasons.push('legacy_n01_review_required');
+  if (candidate.safety_status !== 'included' && candidate.safety_status !== 'safe') reasons.push('candidate_not_marked_safe');
+  if ((candidate.safety_reasons || []).length) reasons.push(...candidate.safety_reasons.map((reason) => `candidate_${reason}`));
+  if (!hasValue(candidate.field)) reasons.push('missing_field');
+  if (targetColumn === MASTER_COLUMNS.flavorCategory) {
+    const aroma = normalizeWritebackAromaCategory(candidateValue);
+    if (aroma.reason) reasons.push(aroma.reason);
+  }
+  if (candidate.candidate_type === 'official_description_translation') {
+    if (!hasValue(candidate.evidence)) reasons.push('missing_translation_source_text');
+  } else if (!hasValue(candidate.normalized_value || candidate.suggested_value)) {
+    reasons.push('missing_value');
+  }
+  return [...new Set(reasons)];
+}
+
+function structuredReviewCandidateFromPlan({ record, candidate, product }) {
+  const targetVersionKey = normalizeText(candidate.target_version_key);
+  const column = normalizeText(candidate.field);
+  const rawSuggestedValue = normalizeText(candidate.normalized_value || candidate.suggested_value);
+  const suggestedValue = column === MASTER_COLUMNS.flavorCategory
+    ? normalizeWritebackAromaCategory(rawSuggestedValue).value
+    : rawSuggestedValue;
+  const currentValue = normalizeText(product.master?.[column] || '');
+  const evidenceText = normalizeText(candidate.evidence || '');
+  const sourceUrl = normalizeText(candidate.source_url || record.official_url || product.productUrl || '');
+  const sourceLanguage = normalizeText(candidate.evidence_language || sourceLanguageFromUrl(sourceUrl));
+  const sourceType = normalizeText(candidate.source_type || '');
+  const confidence = normalizeText(candidate.confidence || '');
+  const review = {
+    detected_at: nowIso(),
+    reference: record.reference,
+    official_name: record.name || product.name || '',
+    detection_type: 'structured_fact',
+    official_url: sourceUrl,
+    source_language: sourceLanguage,
+    existing_reference: product.reference,
+    existing_version_key: targetVersionKey,
+    existing_name: product.name || '',
+    target_version_key: targetVersionKey,
+    target_column: column,
+    current_value: currentValue,
+    suggested_value: suggestedValue,
+    evidence_text: evidenceText,
+    evidence_language: sourceLanguage,
+    evidence_url: sourceUrl,
+    source_type: sourceType,
+    source_dom: normalizeText(candidate.source_dom || ''),
+    confidence,
+    requires_human_review: true,
+    diff_summary: `Structured fact candidate for ${column}: "${currentValue || '(blank)'}" -> "${suggestedValue}".`,
+    evidence: `target_column=${column}; current_value=${currentValue || '(blank)'}; suggested_value=${suggestedValue}; source_type=${sourceType}; confidence=${confidence}; evidence_language=${sourceLanguage}; evidence_url=${sourceUrl}; evidence=${evidenceText}`,
+    discovery_sources: [{ source: sourceType, source_type: 'structured_fact', discovery_source: 'enrichment_review_plan', language: sourceLanguage, url: sourceUrl }],
+    structured_fact: {
+      column,
+      suggested_value: suggestedValue,
+      evidence_text: evidenceText,
+      evidence_language: sourceLanguage,
+      evidence_url: sourceUrl,
+      source_type: sourceType,
+      source_dom: normalizeText(candidate.source_dom || ''),
+      confidence,
+    },
+    status: '要確認',
+    human_decision: '',
+    comment: '',
+  };
+  review.detection_id = reviewCandidateKey(review);
+  return review;
+}
+
+function translationReviewCandidateFromPlan({ record, candidate, product }) {
+  const targetVersionKey = normalizeText(candidate.target_version_key);
+  const sourceUrl = normalizeText(candidate.source_url || record.official_url || product.productUrl || '');
+  const sourceLanguage = normalizeText(candidate.evidence_language || sourceLanguageFromUrl(sourceUrl));
+  const originalDescription = normalizeText(candidate.evidence || '');
+  const currentDescription = normalizeText(product.master?.officialDescription || product.master?.[MASTER_COLUMNS.officialDescription] || '');
+  const review = {
+    detected_at: nowIso(),
+    reference: record.reference,
+    official_name: record.name || product.name || '',
+    detection_type: 'official_description_translation',
+    official_url: sourceUrl,
+    source_language: sourceLanguage,
+    existing_reference: product.reference,
+    existing_version_key: targetVersionKey,
+    existing_name: product.name || '',
+    target_version_key: targetVersionKey,
+    target_column: MASTER_COLUMNS.officialDescription,
+    current_value: currentDescription,
+    suggested_value: '翻訳レビュー候補',
+    evidence_text: originalDescription,
+    evidence_language: sourceLanguage,
+    evidence_url: sourceUrl,
+    source_type: 'description',
+    source_dom: normalizeText(candidate.source_dom || 'product description'),
+    confidence: normalizeText(candidate.confidence || 'medium'),
+    requires_human_review: true,
+    description_excerpt: originalDescription,
+    diff_summary: 'Official product description was found outside JP and needs human-approved Japanese text before Master writeback.',
+    evidence: `target_column=${MASTER_COLUMNS.officialDescription}; current_value=${currentDescription || '(blank)'}; source_language=${sourceLanguage}; source_url=${sourceUrl}; original_description=${originalDescription}`,
+    discovery_sources: [{ source: 'description', source_type: 'official_description_translation', discovery_source: 'enrichment_review_plan', language: sourceLanguage, url: sourceUrl }],
+    translation_review: {
+      original_description: originalDescription,
+      source_language: sourceLanguage,
+      source_url: sourceUrl,
+      current_master_description: currentDescription,
+      target_version_key: targetVersionKey,
+    },
+    status: '要確認',
+    human_decision: '',
+    comment: '',
+  };
+  review.detection_id = reviewCandidateKey(review);
+  return review;
+}
+
+function reviewCandidateFromPlanCandidate({ record, candidate, product }) {
+  if (candidate.candidate_type === 'structured_fact') return structuredReviewCandidateFromPlan({ record, candidate, product });
+  if (candidate.candidate_type === 'official_description_translation') return translationReviewCandidateFromPlan({ record, candidate, product });
+  return null;
+}
+
+function buildEnrichmentReviewWritebackDryRun({ plan, planPath, master, paths, args }) {
+  const masterIndexes = masterIndexesForAuditPlan(master?.products || []);
+  const refs = normalizeAuditListFilter(args.refs || []);
+  const versionKeys = normalizeAuditListFilter(args.versionKeys || []);
+  const limit = Number.isFinite(args.auditLimit) ? args.auditLimit : null;
+  const selectedRecords = [];
+  const skippedCandidates = [];
+  const reviewCandidates = [];
+  const seen = new Set();
+  const skipReasons = {};
+  const aromaCategorySummary = {
+    total: 0,
+    normalized: 0,
+    invalid: 0,
+    ambiguous: 0,
+    fixed_category_counts: Object.fromEntries(AROMA_CATEGORY_ORDER.map((category) => [category, 0])),
+    outside_fixed_payload_count: 0,
+  };
+
+  const addSkip = (record, candidate, reasons) => {
+    const item = {
+      version_key: record.version_key || '',
+      reference: record.reference || '',
+      name: record.name || '',
+      candidate_type: candidate?.candidate_type || '',
+      field: candidate?.field || '',
+      suggested_value: candidate?.normalized_value || candidate?.suggested_value || '',
+      target_version_key: candidate?.target_version_key || '',
+      reasons: [...new Set(reasons || [])],
+    };
+    skippedCandidates.push(item);
+    for (const reason of item.reasons) skipReasons[reason] = (skipReasons[reason] || 0) + 1;
+  };
+
+  for (const record of plan.records || []) {
+    const recordRef = normalizeText(record.reference).toUpperCase();
+    const recordVersionKey = normalizeText(record.version_key).toUpperCase();
+    if (refs.size && !refs.has(recordRef)) continue;
+    if (versionKeys.size && !versionKeys.has(recordVersionKey)) continue;
+    const recordOut = {
+      version_key: record.version_key || '',
+      reference: record.reference || '',
+      name: record.name || '',
+      sku_only: record.sku_only === true,
+      selected_candidates: [],
+      skipped_candidates: [],
+    };
+    const product = masterIndexes.byVersionKey.get(recordVersionKey);
+    for (const candidate of record.included_candidates || []) {
+      const isAromaCategoryCandidate = normalizeText(candidate.field) === MASTER_COLUMNS.flavorCategory;
+      const aroma = isAromaCategoryCandidate
+        ? normalizeWritebackAromaCategory(candidate.normalized_value || candidate.suggested_value)
+        : null;
+      if (isAromaCategoryCandidate) {
+        aromaCategorySummary.total += 1;
+        if (aroma.status === 'normalized') aromaCategorySummary.normalized += 1;
+        if (aroma.status === 'invalid') aromaCategorySummary.invalid += 1;
+        if (aroma.status === 'ambiguous') aromaCategorySummary.ambiguous += 1;
+      }
+      const baseReasons = planCandidateBaseSkipReasons({ record, candidate, product, masterIndexes });
+      if (candidate.candidate_type === 'official_description_translation') {
+        const currentDescription = normalizeText(product?.master?.officialDescription || product?.master?.[MASTER_COLUMNS.officialDescription] || '');
+        if (currentDescription) baseReasons.push('official_description_already_present');
+      }
+      const dedupeKey = planWritebackDedupeKey(candidate);
+      if (seen.has(dedupeKey)) baseReasons.push('duplicate_candidate');
+      if (limit !== null && reviewCandidates.length >= limit) baseReasons.push('limit_reached');
+      if (baseReasons.length) {
+        const uniqueReasons = [...new Set(baseReasons)];
+        addSkip(record, candidate, uniqueReasons);
+        recordOut.skipped_candidates.push({ candidate_type: candidate.candidate_type, field: candidate.field, value: candidate.normalized_value || candidate.suggested_value, reasons: uniqueReasons });
+        continue;
+      }
+      const reviewCandidate = reviewCandidateFromPlanCandidate({ record, candidate, product });
+      if (!reviewCandidate) {
+        addSkip(record, candidate, ['unsupported_candidate_type']);
+        recordOut.skipped_candidates.push({ candidate_type: candidate.candidate_type, field: candidate.field, value: candidate.normalized_value || candidate.suggested_value, reasons: ['unsupported_candidate_type'] });
+        continue;
+      }
+      if (reviewCandidate.target_column === MASTER_COLUMNS.flavorCategory) {
+        if (FIXED_AROMA_CATEGORY_VALUES.has(reviewCandidate.suggested_value)) {
+          aromaCategorySummary.fixed_category_counts[reviewCandidate.suggested_value] = (aromaCategorySummary.fixed_category_counts[reviewCandidate.suggested_value] || 0) + 1;
+        } else {
+          aromaCategorySummary.outside_fixed_payload_count += 1;
+        }
+      }
+      seen.add(dedupeKey);
+      reviewCandidates.push(reviewCandidate);
+      recordOut.selected_candidates.push({
+        detection_id: reviewCandidate.detection_id,
+        detection_type: reviewCandidate.detection_type,
+        target_version_key: reviewCandidate.target_version_key,
+        target_column: reviewCandidate.target_column,
+        suggested_value: reviewCandidate.suggested_value,
+      });
+    }
+    if (recordOut.selected_candidates.length || recordOut.skipped_candidates.length) selectedRecords.push(recordOut);
+  }
+
+  const outputFile = path.join(paths.logsDir, `enrichment-review-writeback-dryrun-${auditTimestamp()}-${crypto.randomBytes(3).toString('hex')}.json`);
+  const structuredFactCandidates = reviewCandidates.filter((candidate) => candidate.detection_type === 'structured_fact').length;
+  const translationCandidates = reviewCandidates.filter((candidate) => candidate.detection_type === 'official_description_translation').length;
+  const result = {
+    ok: true,
+    mode: 'enrichment_review_writeback_dryrun',
+    read_only: !args.writeReview,
+    source_plan: planPath,
+    generated_at: nowIso(),
+    selected_records: selectedRecords.filter((record) => record.selected_candidates.length > 0).length,
+    selected_candidates: reviewCandidates.length,
+    structured_fact_candidates: structuredFactCandidates,
+    translation_candidates: translationCandidates,
+    aroma_category_candidates: aromaCategorySummary.total,
+    aroma_category_normalized: aromaCategorySummary.normalized,
+    invalid_aroma_category: aromaCategorySummary.invalid,
+    ambiguous_aroma_category: aromaCategorySummary.ambiguous,
+    aroma_category_counts: aromaCategorySummary.fixed_category_counts,
+    aroma_category_outside_fixed_payload_count: aromaCategorySummary.outside_fixed_payload_count,
+    skipped_candidates: skippedCandidates.length,
+    skip_reasons: Object.fromEntries(Object.entries(skipReasons).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))),
+    would_write_review: args.writeReview === true,
+    records: selectedRecords,
+    candidates: reviewCandidates,
+  };
+  writeJson(outputFile, result);
+  return { outputFile, result, reviewCandidates };
+}
+
+async function runEnrichmentReviewPlanApply({ config, master, paths, args, baseDir }) {
+  const planPath = resolveProjectPath(baseDir, args.applyEnrichmentReviewPlan);
+  const plan = readJson(planPath, null);
+  if (!plan || !Array.isArray(plan.records)) throw new Error(`Invalid enrichment review plan JSON: ${planPath}`);
+  const { outputFile, result, reviewCandidates } = buildEnrichmentReviewWritebackDryRun({ plan, planPath, master, paths, args });
+  let writeResults = [];
+  if (args.writeReview === true) {
+    const writeConfig = { ...config, writeBack: { ...(config.writeBack || {}), enabled: true } };
+    writeResults = await writeBackReviewCandidates({ config: writeConfig, baseDir, candidates: reviewCandidates, debug: args.debug });
+  }
+  const summary = {
+    ok: true,
+    mode: result.mode,
+    output_file: outputFile,
+    source_plan: result.source_plan,
+    selected_records: result.selected_records,
+    selected_candidates: result.selected_candidates,
+    structured_fact_candidates: result.structured_fact_candidates,
+    translation_candidates: result.translation_candidates,
+    aroma_category_candidates: result.aroma_category_candidates,
+    aroma_category_normalized: result.aroma_category_normalized,
+    invalid_aroma_category: result.invalid_aroma_category,
+    ambiguous_aroma_category: result.ambiguous_aroma_category,
+    aroma_category_counts: result.aroma_category_counts,
+    aroma_category_outside_fixed_payload_count: result.aroma_category_outside_fixed_payload_count,
+    skipped_candidates: result.skipped_candidates,
+    skip_reasons: result.skip_reasons,
+    would_write_review: result.would_write_review,
+    write_results: writeResults,
+  };
+  console.log(JSON.stringify(summary, null, 2));
+  return summary;
+}
+
 async function runEnrichmentReviewPlan({ master, paths, args, baseDir }) {
   const auditPath = resolveProjectPath(baseDir, args.planEnrichmentReviewWriteback);
   const audit = readJson(auditPath, null);
@@ -5238,6 +5578,7 @@ async function main() {
   const configPath = resolveProjectPath(baseDir, args.config);
   const fallbackConfigPath = path.join(baseDir, 'collector', 'config.example.json');
   const enrichmentReviewPlanRequested = hasValue(args.planEnrichmentReviewWriteback);
+  const enrichmentReviewPlanApplyRequested = hasValue(args.applyEnrichmentReviewPlan);
   const enrichmentDataIssuesReportRequested = hasValue(args.reportEnrichmentDataIssues);
   const configlessMode = args.taxonomyDryRun || enrichmentDataIssuesReportRequested || hasValue(args.targetName) || hasValue(args.targetRef) || hasValue(args.targetUrl);
   const config = readJson(configPath, readJson(fallbackConfigPath, configlessMode ? {} : null));
@@ -5245,10 +5586,10 @@ async function main() {
   if (args.writeBack !== null) {
     config.writeBack = { ...(config.writeBack || {}), enabled: args.writeBack };
   }
-  if ((enrichmentReviewPlanRequested || enrichmentDataIssuesReportRequested) && args.writeBack === true) {
+  if ((enrichmentReviewPlanRequested || enrichmentReviewPlanApplyRequested || enrichmentDataIssuesReportRequested) && args.writeBack === true) {
     throw new Error('Enrichment review plan/report modes are read-only and cannot be used with --write-back.');
   }
-  if ((enrichmentReviewPlanRequested || enrichmentDataIssuesReportRequested) && args.writeStructuredReviewCandidates) {
+  if ((enrichmentReviewPlanRequested || enrichmentReviewPlanApplyRequested || enrichmentDataIssuesReportRequested) && args.writeStructuredReviewCandidates) {
     throw new Error('Enrichment review plan/report modes are read-only and cannot be used with --write-structured-review-candidates.');
   }
   const targetedDiscoveryRequested = hasValue(args.targetName) || hasValue(args.targetRef) || hasValue(args.targetUrl);
@@ -5278,7 +5619,7 @@ async function main() {
   paths.resultLog = path.join(paths.logsDir, `results-${new Date().toISOString().slice(0, 10)}.jsonl`);
 
   fs.mkdirSync(paths.logsDir, { recursive: true });
-  if (!args.auditIncompleteRecords && !enrichmentReviewPlanRequested && !enrichmentDataIssuesReportRequested) {
+  if (!args.auditIncompleteRecords && !enrichmentReviewPlanRequested && !enrichmentReviewPlanApplyRequested && !enrichmentDataIssuesReportRequested) {
     fs.mkdirSync(paths.profileDir, { recursive: true });
     fs.mkdirSync(paths.imagesDir, { recursive: true });
   }
@@ -5300,6 +5641,11 @@ async function main() {
   if (enrichmentReviewPlanRequested) {
     if (!master) throw new Error('Current Master products are required for enrichment review plan generation.');
     await runEnrichmentReviewPlan({ master, paths, args, baseDir });
+    return;
+  }
+  if (enrichmentReviewPlanApplyRequested) {
+    if (!master) throw new Error('Current Master products are required for enrichment review writeback dry-run.');
+    await runEnrichmentReviewPlanApply({ config, master, paths, args, baseDir });
     return;
   }
   if (enrichmentDataIssuesReportRequested) {
