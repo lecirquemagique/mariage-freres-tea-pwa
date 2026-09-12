@@ -61,6 +61,7 @@ var MF_IMAGE_COLLECTOR_REVIEW_DECISIONS = [
   '保留'
 ];
 var MF_IMAGE_COLLECTOR_TAXONOMY_COLUMNS = ['茶種タグ', '現在のカテゴリ', '香味大分類'];
+var MF_IMAGE_COLLECTOR_REVIEW_APPLY_STATUSES = ['要確認', '保留'];
 var MF_IMAGE_COLLECTOR_TAXONOMY_LOG_HEADERS = [
   'batch_id',
   'timestamp',
@@ -549,7 +550,7 @@ function mfImageCollectorClientValue_(value) {
   return String(value);
 }
 
-function mfImageCollectorApplyReviewDecision(rowNumber, decision, targetVersionKey, comment) {
+function mfImageCollectorApplyReviewDecision(rowNumber, decision, targetVersionKey, comment, approvedJapaneseDescription) {
   var sheet = mfImageCollectorGetOrCreateReviewSheet_();
   var row = Number(rowNumber);
   if (!row || row < 2 || row > sheet.getLastRow()) throw new Error('Invalid review row.');
@@ -559,12 +560,19 @@ function mfImageCollectorApplyReviewDecision(rowNumber, decision, targetVersionK
   for (var i = 0; i < headers.length; i += 1) review[headers[i]] = values[i];
 
   if (MF_IMAGE_COLLECTOR_REVIEW_DECISIONS.indexOf(decision) < 0) throw new Error('Unsupported review decision.');
+  var currentStatus = String(review['ステータス'] || '').trim();
+  if (MF_IMAGE_COLLECTOR_REVIEW_APPLY_STATUSES.indexOf(currentStatus) < 0) {
+    throw new Error('Review row has already been finalized or cannot be processed: ' + (currentStatus || '(blank)'));
+  }
   var finalStatus = '反映済み';
   if (decision === '保留') finalStatus = '保留';
   if (decision === '誤検出') finalStatus = '却下';
 
   if (finalStatus === '反映済み') {
-    mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey);
+    mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey, {
+      review_row: row,
+      approved_japanese_description: approvedJapaneseDescription
+    });
   }
 
   mfImageCollectorSetReviewRowValues_(sheet, row, {
@@ -1131,10 +1139,18 @@ function mfImageCollectorGetReviewSummary() {
   };
 }
 
-function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey) {
+function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey, options) {
   if (decision === '誤検出' || decision === '保留') return;
+  options = options || {};
+  if (String(review['検出種別'] || '').trim() === 'official_description_translation') {
+    if (decision !== '既存銘柄を更新') {
+      throw new Error('official_description_translation can only be approved as an existing row update.');
+    }
+    mfImageCollectorApplyOfficialDescriptionTranslation_(review, options);
+    return;
+  }
   if (String(review['検出種別'] || '').trim() === 'structured_fact') {
-    mfImageCollectorApplyStructuredFact_(review);
+    mfImageCollectorApplyStructuredFact_(review, options);
     return;
   }
   if (decision === '販売SKUとして追加') {
@@ -1173,7 +1189,34 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
   }
 }
 
-function mfImageCollectorApplyStructuredFact_(review) {
+function mfImageCollectorApplyOfficialDescriptionTranslation_(review, options) {
+  options = options || {};
+  var targetVersionKey = String(review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim();
+  var approvedDescription = String(options.approved_japanese_description || '').trim();
+  var candidateCurrentValue = String(review['現在値'] || '').trim();
+  if (!targetVersionKey) throw new Error('official_description_translation target_version_key is required.');
+  if (!approvedDescription) throw new Error('Human-approved Japanese description is required.');
+
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var targetRow = mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, targetVersionKey, '');
+  if (targetRow < 2) throw new Error('Target master row was not found for official_description_translation: ' + targetVersionKey);
+  var descriptionCol = headers.indexOf('現在の公式説明');
+  if (descriptionCol < 0) throw new Error('現在の公式説明 column was not found.');
+
+  var range = sheet.getRange(targetRow, descriptionCol + 1);
+  var actualCurrentValue = String(range.getValue() || '').trim();
+  if (actualCurrentValue !== candidateCurrentValue) {
+    throw new Error('Master official description changed after translation candidate was created: expected "' + candidateCurrentValue + '" but found "' + actualCurrentValue + '".');
+  }
+  range.setValue(approvedDescription);
+}
+
+function mfImageCollectorApplyStructuredFact_(review, options) {
+  options = options || {};
   var targetVersionKey = String(review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim();
   var targetColumn = String(review['対象列'] || '').trim();
   var candidateCurrentValue = String(review['現在値'] || '').trim();
@@ -1229,7 +1272,9 @@ function mfImageCollectorStructuredFactMultiValueColumns_() {
 function mfImageCollectorStructuredFactNextValue_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue) {
   var actual = String(actualCurrentValue || '').trim();
   var expected = String(candidateCurrentValue || '').trim();
-  var incoming = mfImageCollectorNormalizeStructuredFactValue_(targetColumn, suggestedValue);
+  var incoming = targetColumn === '香味大分類'
+    ? mfImageCollectorNormalizeApprovedAromaCategoryValue_(suggestedValue)
+    : mfImageCollectorNormalizeStructuredFactValue_(targetColumn, suggestedValue);
   if (mfImageCollectorStructuredFactMultiValueColumns_()[targetColumn]) {
     var values = mfImageCollectorDelimitedValues_(actual);
     var expectedValues = mfImageCollectorDelimitedValues_(expected);
@@ -1260,6 +1305,21 @@ function mfImageCollectorNormalizeStructuredFactValue_(targetColumn, value) {
     return mfImageCollectorNormalizeTeaTypeTagsForMaster_(value);
   }
   return String(value || '').trim();
+}
+
+function mfImageCollectorNormalizeApprovedAromaCategoryValue_(value) {
+  var raw = String(value || '').trim();
+  if (!raw) throw new Error('香味大分類 candidate value is empty.');
+  var safeMap = {
+    '木質': 'ウッディ',
+    '甘香': '甘香・菓子'
+  };
+  var normalized = safeMap[raw] || raw;
+  var allowed = mfImageCollectorAromaCategoryOrder_();
+  if (allowed.indexOf(normalized) < 0) {
+    throw new Error('香味大分類 is not in the approved 14-category whitelist: ' + raw);
+  }
+  return normalized;
 }
 
 function mfImageCollectorDelimitedValues_(value) {
@@ -1789,11 +1849,19 @@ function actionControls(it,idx){
 function structuredActionControls(it,idx){
   return '<div class="section"><h3>判定</h3><div class="muted">対象VersionKey: '+esc(it['対象VersionKey']||it['DB既存VersionKey']||'')+'</div><div class="actions"><select id="d'+idx+'"><option value="保留">保留</option><option value="既存銘柄を更新">承認</option><option value="誤検出">却下</option></select><textarea id="c'+idx+'" placeholder="コメント"></textarea><button onclick="apply('+idx+','+it.row_number+')">反映</button></div></div>';
 }
+function translationActionControls(it,idx){
+  return '<div class="section"><h3>判定</h3><textarea id="t'+idx+'" placeholder="人間が確認・修正した日本語説明"></textarea><div class="actions"><select id="d'+idx+'"><option value="保留">保留</option><option value="既存銘柄を更新">承認</option><option value="誤検出">却下</option></select><textarea id="c'+idx+'" placeholder="コメント"></textarea><button onclick="apply('+idx+','+it.row_number+')">反映</button></div></div>';
+}
 function renderStructured(it,idx){
   var lang=it['根拠言語']||it['確認言語']||it['言語']||'';
   var source=it['source_type']||'';
   var confidence=it['confidence']||'';
   return '<div class="item structured"><div class="head"><span>'+esc(it['公式名'])+'</span><span class="muted">'+esc(it['Tリファレンス番号'])+'</span></div><div class="muted">'+esc(it['検出種別'])+' / '+esc(it['ステータス'])+'</div><div class="section"><h3>'+esc(it['対象列'])+'</h3><div class="change"><span class="pill">現在: '+esc(it['現在値']||'なし')+'</span><span>→</span><span class="pill candidate">候補: '+esc(it['候補値'])+'</span></div></div><div class="section"><h3>根拠</h3><div class="evidence">'+esc(it['根拠原文']||'')+'</div><div class="muted">'+esc(lang)+'公式 / '+esc(source)+' / confidence: '+esc(confidence)+'</div>'+link('公式ページ',it['根拠URL']||it['公式URL'])+'</div>'+structuredActionControls(it,idx)+'</div>';
+}
+function renderTranslation(it,idx){
+  var target=it['対象VersionKey']||it['DB既存VersionKey']||'';
+  var lang=it['根拠言語']||it['確認言語']||it['言語']||'';
+  return '<div class="item structured"><div class="head"><span>'+esc(it['公式名'])+'</span><span class="muted">'+esc(it['Tリファレンス番号'])+'</span></div><div class="muted">'+esc(it['検出種別'])+' / '+esc(it['ステータス'])+'</div><div class="section"><h3>対象</h3><div class="kv">対象VersionKey: '+esc(target)+'</div><div class="kv">現在の公式説明: '+esc(it['現在値']||'なし')+'</div></div><div class="section"><h3>原文</h3><div class="evidence">'+esc(it['根拠原文']||it['公式説明抜粋']||'')+'</div><div class="muted">'+esc(lang)+'公式</div>'+link('根拠URL',it['根拠URL']||it['公式URL'])+'</div>'+translationActionControls(it,idx)+'</div>';
 }
 function renderImageReview(it,idx){
   var info=parseInfo(it);
@@ -1813,12 +1881,14 @@ function load(){
 function render(items){
   document.getElementById('items').innerHTML=(items||[]).map(function(it,idx){
     if(it['検出種別']==='unregistered_reference_image')return renderImageReview(it,idx);
+    if(it['検出種別']==='official_description_translation')return renderTranslation(it,idx);
     return it['検出種別']==='structured_fact'?renderStructured(it,idx):renderGeneric(it,idx);
   }).join('')||'要確認はありません';
 }
 function apply(idx,row){
   var versionInput=document.getElementById('v'+idx);
-  google.script.run.withSuccessHandler(load).withFailureHandler(function(e){alert((e&&e.message)||e);}).mfImageCollectorApplyReviewDecision(row,document.getElementById('d'+idx).value,versionInput?versionInput.value:'',document.getElementById('c'+idx).value);
+  var translationInput=document.getElementById('t'+idx);
+  google.script.run.withSuccessHandler(load).withFailureHandler(function(e){alert((e&&e.message)||e);}).mfImageCollectorApplyReviewDecision(row,document.getElementById('d'+idx).value,versionInput?versionInput.value:'',document.getElementById('c'+idx).value,translationInput?translationInput.value:'');
 }
 load();
 </script></body></html>`;
