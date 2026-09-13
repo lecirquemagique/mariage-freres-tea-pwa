@@ -1359,7 +1359,7 @@ function mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey) {
 function mfImageCollectorBuildApprovedNewTeaRow_(headers, review, referenceInfo, versionKey, versionLabel) {
   var reference = referenceInfo.primaryReference;
   var officialCategory = mfImageCollectorNormalizeClassificationValueForMaster_(mfImageCollectorReviewOfficialCategory_(review));
-  if (!officialCategory && mfImageCollectorIsTfbfReference_(reference)) officialCategory = 'ティザン';
+  if (mfImageCollectorIsTfbfReference_(reference)) officialCategory = 'ティザン';
   var teaTypeTag = mfImageCollectorTeaTypeTagFromCategory_(officialCategory);
   var officialDescription = mfImageCollectorReviewOfficialDescriptionForMaster_(review);
   var officialUrl = String(review['公式URL'] || '').trim();
@@ -2271,7 +2271,7 @@ function mfImageCollectorUpdateMasterNewTeaDefaults_(payload) {
   var productPageUrl = String(payload.product_page_url || '').trim();
   var officialName = String(payload.official_name || '').trim();
   var officialCategory = mfImageCollectorNormalizeClassificationValueForMaster_(payload.official_category);
-  if (!officialCategory && mfImageCollectorIsTfbfReference_(reference)) officialCategory = 'ティザン';
+  if (mfImageCollectorIsTfbfReference_(reference)) officialCategory = 'ティザン';
   var teaTypeTag = mfImageCollectorTeaTypeTagFromCategory_(officialCategory);
   var masterAbsenceConfirmed = payload.master_absence_confirmed === true;
   var officialDescription = mfImageCollectorReviewOfficialDescriptionForMaster_({
