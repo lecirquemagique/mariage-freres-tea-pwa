@@ -14,3 +14,4 @@ opportunistic-discoveries.json
 new-reference-discovery-state.json
 tmp/
 *.local.json
+CODEX_HANDOFF.md
