@@ -1416,6 +1416,7 @@ function mfImageCollectorReviewReferenceInfo_(review) {
   var primarySku = mfImageCollectorSalesSkuInfo_(primary);
   if (primarySku && !salesRefs[primarySku.prefix]) salesRefs[primarySku.prefix] = primarySku.sku;
   var tReference = String(info.t_reference || '').trim().toUpperCase();
+  if (mfImageCollectorIsTfbfReference_(primary) && tReference === primary) tReference = '';
   if (!tReference && /^T\d+$/.test(primary)) tReference = primary;
   if (tReference && !/^T\d+$/.test(tReference)) throw new Error('Invalid T reference in review candidate: ' + tReference);
 

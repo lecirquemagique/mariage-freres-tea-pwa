@@ -756,6 +756,25 @@ const SALES_FORMAT_REFERENCE_FIELDS=[
   'TJCリファレンス'
 ];
 
+const FREE_TEXT_SEARCH_FIELDS=[
+  'VersionKey',
+  'Primary Reference',
+  ...SALES_FORMAT_REFERENCE_FIELDS,
+  '銘柄名（黒い本）',
+  '日本語名（黒い本）',
+  'カタカナ表記',
+  '現在の公式名',
+  '現在のカテゴリ',
+  '茶種タグ',
+  '産地・国',
+  '産地・地域／茶園',
+  '香味大分類',
+  '香味詳細タグ',
+  '時間帯タグ',
+  '現在の公式説明',
+  '黒い本説明'
+];
+
 const $=x=>document.getElementById(x);
 
 const sp=s=>
@@ -1232,7 +1251,9 @@ function matches(r){
   if(
     q &&
     !n(
-      Object.values(r).join(' ')
+      FREE_TEXT_SEARCH_FIELDS
+        .map(field=>r[field])
+        .join(' ')
     ).includes(q)
   ){
     return false;
