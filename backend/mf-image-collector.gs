@@ -811,6 +811,7 @@ function mfImageCollectorNormalizeTargetRequestRef_(value) {
   var ref = String(value || '').normalize('NFKC').trim().toUpperCase().replace(/\s+/g, '');
   if (!ref) return '';
   if (/^T\d+$/.test(ref)) return ref;
+  if (mfImageCollectorIsTfbfReference_(ref)) return ref;
   if (/^(TFG|TJC|TB|TC|TE|TF|TP|TA)\d+$/.test(ref)) return ref;
   if (/^TJ[A-Z0-9]+$/.test(ref)) return ref;
   throw new Error('REFの形式が不正です: ' + ref);
@@ -1287,13 +1288,15 @@ function mfImageCollectorStructuredFactNextValue_(targetColumn, actualCurrentVal
   if (mfImageCollectorStructuredFactMultiValueColumns_()[targetColumn]) {
     var values = mfImageCollectorDelimitedValues_(actual);
     var expectedValues = mfImageCollectorDelimitedValues_(expected);
+    var incomingValues = mfImageCollectorDelimitedValues_(incoming);
     for (var i = 0; i < expectedValues.length; i += 1) {
       if (values.indexOf(expectedValues[i]) < 0) {
         throw new Error('Master value changed after structured_fact candidate was created: ' + targetColumn + ' expected token "' + expectedValues[i] + '" but found "' + actual + '".');
       }
     }
-    if (values.indexOf(incoming) >= 0) return actual;
-    values.push(incoming);
+    for (var j = 0; j < incomingValues.length; j += 1) {
+      if (values.indexOf(incomingValues[j]) < 0) values.push(incomingValues[j]);
+    }
     return values.join('、');
   }
   if (actual === incoming) return actual;
@@ -1320,15 +1323,20 @@ function mfImageCollectorNormalizeApprovedAromaCategoryValue_(value) {
   var raw = String(value || '').trim();
   if (!raw) throw new Error('香味大分類 candidate value is empty.');
   var safeMap = {
-    '木質': 'ウッディ',
-    '甘香': '甘香・菓子'
+    '木質': ['ウッディ'],
+    '甘香': ['甘香・菓子'],
+    '甘香・木質': ['甘香・菓子', 'ウッディ'],
+    '乳香': ['甘香・菓子'],
+    '旨味': []
   };
-  var normalized = safeMap[raw] || raw;
+  var normalized = safeMap.hasOwnProperty(raw) ? safeMap[raw] : [raw];
   var allowed = mfImageCollectorAromaCategoryOrder_();
-  if (allowed.indexOf(normalized) < 0) {
-    throw new Error('香味大分類 is not in the approved 14-category whitelist: ' + raw);
+  for (var i = 0; i < normalized.length; i += 1) {
+    if (allowed.indexOf(normalized[i]) < 0) {
+      throw new Error('香味大分類 is not in the approved 14-category whitelist: ' + raw);
+    }
   }
-  return normalized;
+  return mfImageCollectorOrderedUniqueAromaCategories_(normalized).join('、');
 }
 
 function mfImageCollectorDelimitedValues_(value) {
@@ -1366,6 +1374,7 @@ function mfImageCollectorBuildApprovedNewTeaRow_(headers, review, referenceInfo,
     if (header === '現在の公式説明') return officialDescription;
     if (header === '現在のカテゴリ') return officialCategory;
     if (header === '茶種タグ') return teaTypeTag;
+    if (header === '燻製茶' && mfImageCollectorIsSmokyTeaReference_(reference, salesRefs)) return 'はい';
     if (header === '公式商品ページURL') return officialUrl;
     if (header === '公式商品ページURL状態') return officialUrl ? 'available' : 'pending';
     if (header === '黒い本掲載') return 'いいえ';
@@ -2009,6 +2018,16 @@ function mfImageCollectorIsTfbfReference_(reference) {
   return /^TFBF\d+$/.test(String(reference || '').trim().toUpperCase());
 }
 
+function mfImageCollectorIsSmokyTeaReference_(reference, salesReferences) {
+  var primary = String(reference || '').trim().toUpperCase();
+  if (/^T429[1-5]$/.test(primary)) return true;
+  var refs = salesReferences || {};
+  for (var prefix in refs) {
+    if (/^TP429[1-5]$/.test(String(refs[prefix] || '').trim().toUpperCase())) return true;
+  }
+  return false;
+}
+
 function mfImageCollectorSalesSkuReferenceColumns_(headers) {
   var cols = [];
   var seen = {};
@@ -2300,6 +2319,7 @@ function mfImageCollectorUpdateMasterNewTeaDefaults_(payload) {
   mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '黒い本掲載', masterAbsenceConfirmed ? 'いいえ' : '', changes, dryRun);
   mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '現在のカテゴリ', officialCategory, changes, dryRun);
   mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '茶種タグ', teaTypeTag, changes, dryRun);
+  mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '燻製茶', mfImageCollectorIsSmokyTeaReference_(reference, payload.sales_references) ? 'はい' : '', changes, dryRun);
   mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '現在の公式説明', officialDescription, changes, dryRun);
   mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '茶葉画像状態', 'pending', changes, dryRun);
   mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex, '茶葉サムネイル状態', 'pending', changes, dryRun);
@@ -2826,7 +2846,7 @@ function mfImageCollectorNormalizeTeaTypeTagTokenForMaster_(token) {
   if (!raw) return '';
   var normalized = raw.replace(/™/g, '').toLowerCase();
   if (raw === '紅茶') return '黒茶';
-  if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir') return '黒茶';
+  if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir' || normalized === 'smoky tea' || normalized === 'smoky teas') return '黒茶';
   if (raw === 'チザン') return 'ティザン';
   if (normalized === 'tisane' || normalized === 'fruit tea' || normalized === 'fruit teas') return 'ティザン';
   if (normalized === 'maté' || normalized === 'mate') return 'マテ';
@@ -2837,7 +2857,7 @@ function mfImageCollectorNormalizeClassificationValueForMaster_(value) {
   var raw = String(value || '').trim();
   var normalized = raw.replace(/™/g, '').toLowerCase();
   if (!normalized) return '';
-  if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir') return '黒茶';
+  if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir' || normalized === 'smoky tea' || normalized === 'smoky teas') return '黒茶';
   if (normalized === 'blue tea' || normalized === 'thé bleu' || normalized === 'the bleu') return '青茶';
   if (normalized === 'green tea' || normalized === 'thé vert') return '緑茶';
   if (normalized === 'white tea' || normalized === 'thé blanc') return '白茶';
@@ -2924,8 +2944,12 @@ function mfImageCollectorNormalizeAromaCategoryToken_(token) {
     'ハーブ・清涼系': ['ハーブ'],
     'ハーブ': ['ハーブ'],
     'ミント': ['ハーブ', 'ミント'],
+    '甘香': ['甘香・菓子'],
+    '甘香・木質': ['甘香・菓子', 'ウッディ'],
     '甘香・菓子系': ['甘香・菓子'],
     '甘香・菓子': ['甘香・菓子'],
+    '乳香': ['甘香・菓子'],
+    '旨味': [],
     'カカオ系': ['カカオ'],
     'カカオ': ['カカオ'],
     'キャラメル系': ['甘香・菓子', 'キャラメル'],
@@ -2935,6 +2959,7 @@ function mfImageCollectorNormalizeAromaCategoryToken_(token) {
     'モルト': ['モルト'],
     'グリーン': ['植物・青葉'],
     '植物・青葉': ['植物・青葉'],
+    '木質': ['ウッディ'],
     'ウッディ': ['ウッディ'],
     '樹脂・木質系': ['ウッディ'],
     'アーシー': ['ウッディ']
