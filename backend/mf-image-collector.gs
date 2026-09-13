@@ -1603,6 +1603,9 @@ function mfImageCollectorEnsurePrimaryReferenceColumn_(payload) {
     added = true;
     info = mfImageCollectorPrimaryReferenceHeaderInfo_(sheet);
   }
+  if (!dryRun && info.column_exists && sheet.getMaxRows() > 1) {
+    sheet.getRange(2, info.column_index, sheet.getMaxRows() - 1, 1).clearDataValidations();
+  }
   return {
     ok: true,
     dry_run: dryRun,
