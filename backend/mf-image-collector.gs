@@ -390,6 +390,14 @@ function mfImageCollectorApplySelectedReviewRow() {
   var approvedDescription = String(review['承認済み日本語説明'] || '').trim();
   mfImageCollectorAssertReviewDecisionAllowed_(review, decision, targetVersionKey, approvedDescription);
 
+  var resolvedStructuredFact = null;
+  if (String(review['検出種別'] || '').trim() === 'structured_fact' &&
+      decision === '既存銘柄を更新' &&
+      !targetVersionKey &&
+      !String(review['DB既存VersionKey'] || '').trim()) {
+    resolvedStructuredFact = mfImageCollectorResolveStructuredFactTargetFromMaster_(review);
+  }
+
   var salesIdentity = mfImageCollectorReviewSalesSkuIdentity_(review);
   var salesSku = salesIdentity.sku_info;
   var parent = salesSku ? mfImageCollectorSalesSkuParentForReview_(review, targetVersionKey) : null;
@@ -399,7 +407,9 @@ function mfImageCollectorApplySelectedReviewRow() {
     '公式名: ' + (String(review['公式名'] || '').trim() || '（空欄）'),
     '検出種別: ' + (String(review['検出種別'] || '').trim() || '（空欄）'),
     '人間判定: ' + decision,
-    '対象VersionKey: ' + (targetVersionKey || '（空欄）'),
+    '対象VersionKey: ' + (resolvedStructuredFact
+      ? resolvedStructuredFact.version_key + '（自動解決）'
+      : (targetVersionKey || '（空欄）')),
     'コメント: ' + (comment || '（なし）')
   ];
   if (salesSku) {
@@ -789,20 +799,30 @@ function mfImageCollectorApplyReviewDecision(rowNumber, decision, targetVersionK
   if (decision === '保留') finalStatus = '保留';
   if (decision === '誤検出') finalStatus = '却下';
 
+  var applyResult = null;
   if (finalStatus === '反映済み') {
-    mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey, {
+    applyResult = mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey, {
       review_row: row,
-      approved_japanese_description: approvedJapaneseDescription
+      approved_japanese_description: approvedJapaneseDescription,
+      target_version_key: targetVersionKey
     });
   }
 
-  mfImageCollectorSetReviewRowValues_(sheet, row, {
+  var reviewUpdates = {
     'ステータス': finalStatus,
     '人間判定': decision,
-    '対象VersionKey': targetVersionKey || review['対象VersionKey'] || '',
+    '対象VersionKey': applyResult && applyResult.target_version_key
+      ? applyResult.target_version_key
+      : (targetVersionKey || review['対象VersionKey'] || ''),
     'コメント': comment || review['コメント'] || '',
     '処理日時': new Date()
-  });
+  };
+  if (applyResult && applyResult.auto_resolved) {
+    reviewUpdates['DB既存VersionKey'] = applyResult.target_version_key;
+    reviewUpdates['DB既存T'] = applyResult.reference || '';
+    reviewUpdates['DB既存名'] = applyResult.name || '';
+  }
+  mfImageCollectorSetReviewRowValues_(sheet, row, reviewUpdates);
   return { ok: true, row_number: row, status: finalStatus, decision: decision };
 }
 
@@ -1404,8 +1424,7 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
     return;
   }
   if (String(review['検出種別'] || '').trim() === 'structured_fact') {
-    mfImageCollectorApplyStructuredFact_(review, options);
-    return;
+    return mfImageCollectorApplyStructuredFact_(review, options);
   }
   if (decision === '販売SKUとして追加') {
     mfImageCollectorApplySalesSku_(review, targetVersionKey);
@@ -1472,11 +1491,10 @@ function mfImageCollectorApplyOfficialDescriptionTranslation_(review, options) {
 
 function mfImageCollectorApplyStructuredFact_(review, options) {
   options = options || {};
-  var targetVersionKey = String(review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim();
+  var targetVersionKey = String(options.target_version_key || review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim();
   var targetColumn = String(review['対象列'] || '').trim();
   var candidateCurrentValue = String(review['現在値'] || '').trim();
   var suggestedValue = String(review['候補値'] || '').trim();
-  if (!targetVersionKey) throw new Error('structured_fact target_version_key is required.');
   if (!targetColumn) throw new Error('structured_fact target_column is required.');
   if (!suggestedValue) throw new Error('structured_fact suggested_value is required.');
   if (!mfImageCollectorStructuredFactAllowedColumns_()[targetColumn]) {
@@ -1488,7 +1506,15 @@ function mfImageCollectorApplyStructuredFact_(review, options) {
   if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
   var values = sheet.getDataRange().getValues();
   var headers = values[0].map(function(value) { return String(value).trim(); });
-  var targetRow = mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, targetVersionKey, '');
+  var resolved = null;
+  if (!targetVersionKey) {
+    resolved = mfImageCollectorResolveStructuredFactMasterRow_(values, headers, review);
+    mfImageCollectorAssertStructuredFactResolution_(resolved);
+    targetVersionKey = resolved.version_key;
+  }
+  var targetRow = resolved
+    ? resolved.row_number
+    : mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, targetVersionKey, '');
   if (targetRow < 2) throw new Error('Target master row was not found for structured_fact: ' + targetVersionKey);
   var targetCol = headers.indexOf(targetColumn);
   if (targetCol < 0) throw new Error('Target master column was not found for structured_fact: ' + targetColumn);
@@ -1496,8 +1522,13 @@ function mfImageCollectorApplyStructuredFact_(review, options) {
   var range = sheet.getRange(targetRow, targetCol + 1);
   var actualCurrentValue = String(range.getValue() || '').trim();
   var nextValue = mfImageCollectorStructuredFactNextValue_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue);
-  if (nextValue === actualCurrentValue) return;
-  range.setValue(nextValue);
+  if (nextValue !== actualCurrentValue) range.setValue(nextValue);
+  return {
+    target_version_key: targetVersionKey,
+    auto_resolved: !!resolved,
+    reference: resolved ? resolved.reference : '',
+    name: resolved ? resolved.name : ''
+  };
 }
 
 function mfImageCollectorStructuredFactAllowedColumns_() {
@@ -2115,6 +2146,23 @@ function mfImageCollectorRepairStructuredFactSuggestedValue_(review) {
     original_value: original,
     changed: normalized !== original
   };
+}
+
+function mfImageCollectorResolveStructuredFactTargetFromMaster_(review) {
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var resolved = mfImageCollectorResolveStructuredFactMasterRow_(values, headers, review);
+  mfImageCollectorAssertStructuredFactResolution_(resolved);
+  return resolved;
+}
+
+function mfImageCollectorAssertStructuredFactResolution_(resolved) {
+  if (resolved && resolved.ok) return;
+  var reason = resolved && resolved.reason ? resolved.reason : 'unknown resolution error';
+  throw new Error('structured_fact の対象VersionKeyを安全に自動解決できません: ' + reason);
 }
 
 function mfImageCollectorResolveStructuredFactMasterRow_(values, headers, review) {
