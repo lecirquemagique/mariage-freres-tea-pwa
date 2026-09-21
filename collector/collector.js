@@ -1239,9 +1239,53 @@ function splitMasterListValue(value) {
 }
 
 function masterHasSuggestedValue(product, column, suggestedValue) {
-  const current = product?.master?.[column] || '';
-  if (!current || !suggestedValue) return false;
-  return splitMasterListValue(current).includes(suggestedValue);
+  return structuredFactSuggestionAlreadyApplied(product, { column, suggested_value: suggestedValue });
+}
+
+function canonicalAromaDetailTerm(value) {
+  return normalizeText(value)
+    .normalize('NFKC')
+    .replace(/\s+/g, '')
+    .replace(/ヴァニラ/g, 'バニラ');
+}
+
+function aromaDetailAlreadyRepresented(existingValue, candidateValue) {
+  const existing = canonicalAromaDetailTerm(existingValue);
+  const candidate = canonicalAromaDetailTerm(candidateValue);
+  if (!existing || !candidate) return false;
+  if (existing === candidate) return true;
+  if (candidate === '花') return /^(?:白い花|白花|花の香り|フローラルな花)$/.test(existing);
+  if (candidate.length < 3) return false;
+  const escapedCandidate = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const modifier = '(?:軽い|淡い|ほのかな|柔らかな|やわらかな|甘い|濃厚な|繊細な|上品な|豊かな|爽やかな)';
+  const suffix = '(?:の香り|香り)?';
+  return new RegExp(`^${modifier}${escapedCandidate}${suffix}$`).test(existing);
+}
+
+function structuredFactSuggestionAlreadyApplied(product, suggestion) {
+  const column = normalizeText(suggestion?.column);
+  const currentValues = splitMasterListValue(product?.master?.[column] || '');
+  const incomingValues = splitMasterListValue(suggestion?.suggested_value || '');
+  if (!currentValues.length || !incomingValues.length) return false;
+  return incomingValues.every((incoming) => currentValues.some((existing) => {
+    if (canonicalAromaDetailTerm(existing) === canonicalAromaDetailTerm(incoming)) return true;
+    return column === MASTER_COLUMNS.flavorTags && aromaDetailAlreadyRepresented(existing, incoming);
+  }));
+}
+
+function partitionStructuredFactSuggestions(product, suggestions = []) {
+  return suggestions.reduce((partition, suggestion) => {
+    if (masterHasSuggestedValue(product, suggestion.column, suggestion.suggested_value)) {
+      partition.skippedSuggestions.push({
+        column: suggestion.column,
+        suggested_value: suggestion.suggested_value,
+        reason: 'already_applied',
+      });
+    } else {
+      partition.reviewSuggestions.push(suggestion);
+    }
+    return partition;
+  }, { reviewSuggestions: [], skippedSuggestions: [] });
 }
 
 function addStructuredSuggestion(suggestions, product, suggestion) {
@@ -1253,7 +1297,6 @@ function addStructuredSuggestion(suggestions, product, suggestion) {
     normalizedSuggestion.suggested_value = normalizedCategories[0];
   }
   if (!normalizedSuggestion.suggested_value) return;
-  if (masterHasSuggestedValue(product, normalizedSuggestion.column, normalizedSuggestion.suggested_value)) return;
   const key = `${normalizedSuggestion.column}|${normalizedSuggestion.suggested_value}`;
   if (suggestions.some((item) => `${item.column}|${item.suggested_value}` === key)) return;
   suggestions.push({
@@ -1560,10 +1603,12 @@ function resolveStructuredFactMasterProduct({ reference, masterProducts = [], fa
 function structuredFactReviewCandidatesForProduct({ product, facts, vocabulary }) {
   const language = sourceLanguageFromUrl(facts?.url) || sourceLanguageFromUrl(product.productUrl);
   const officialStructuredFacts = buildOfficialStructuredFacts({ product, facts, language, vocabulary });
-  const reviewCandidates = officialStructuredFacts.structured_review_suggestions.map((suggestion) =>
+  const partition = partitionStructuredFactSuggestions(product, officialStructuredFacts.structured_review_suggestions);
+  const reviewCandidates = partition.reviewSuggestions
+    .map((suggestion) =>
     structuredFactReviewCandidate({ product, facts, suggestion })
   ).filter(Boolean);
-  return { officialStructuredFacts, reviewCandidates };
+  return { officialStructuredFacts, reviewCandidates, skippedSuggestions: partition.skippedSuggestions };
 }
 
 function mergeUniqueTextLines(...values) {
@@ -2524,7 +2569,7 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
     });
     const structured = structuredProduct
       ? structuredFactReviewCandidatesForProduct({ product: structuredProduct, facts: primaryPage.facts, vocabulary })
-      : { officialStructuredFacts: null, reviewCandidates: [] };
+      : { officialStructuredFacts: null, reviewCandidates: [], skippedSuggestions: [] };
     const structuredCandidates = existingMaster
       ? structured.reviewCandidates.filter((candidate) => hasValue(candidate.target_version_key))
       : [];
@@ -2606,6 +2651,7 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
       sales_sku_already_registered: salesSkuTarget && existingMaster,
       sales_parent_resolution: salesParentResolution,
       structured_suggestions: structured.officialStructuredFacts?.structured_review_suggestions || [],
+      structured_suggestions_skipped: structured.skippedSuggestions || [],
       review_candidates_would_create: reviewCandidates.map((candidate) => ({
         detection_id: candidate.detection_id,
         detection_type: candidate.detection_type,
