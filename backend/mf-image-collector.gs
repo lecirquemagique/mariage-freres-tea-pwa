@@ -2121,6 +2121,7 @@ function mfImageCollectorResolveStructuredFactMasterRow_(values, headers, review
   var reference = String(review['Tリファレンス番号'] || '').trim().toUpperCase();
   if (!reference) return { ok: false, reason: 'reference missing' };
   var versionCol = headers.indexOf('VersionKey');
+  var primaryRefCol = headers.indexOf('Primary Reference');
   var refCol = headers.indexOf('Tリファレンス番号');
   var nameCol = headers.indexOf('現在の公式名');
   var urlCol = headers.indexOf('公式商品ページURL');
