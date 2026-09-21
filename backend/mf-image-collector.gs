@@ -475,6 +475,85 @@ function mfImageCollectorDiagnoseCategoryNormalizationApproval() {
   return diagnosis;
 }
 
+function mfImageCollectorRepairMisalignedNormalizationReviews() {
+  var sheet = mfImageCollectorGetReviewSheetByName_();
+  var reviewData = mfImageCollectorReadReviewSheetData_(sheet);
+  var plan = mfImageCollectorMisalignedNormalizationRepairPlan_(reviewData.rows, reviewData.headers);
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.alert(
+    '正規化レビュー行ずれ修復',
+    'カテゴリ正規化: ' + plan.category_rows + '件\nヴァニラ表記統一: ' + plan.tag_rows + '件\n\n変更候補レビューのみを修復します。実行しますか？',
+    ui.ButtonSet.YES_NO
+  );
+  if (response !== ui.Button.YES) return { ok: false, cancelled: true, repaired: 0 };
+  for (var i = 0; i < plan.repairs.length; i += 1) {
+    mfImageCollectorSetReviewRowValues_(sheet, plan.repairs[i].row_number, plan.repairs[i].updates);
+  }
+  return { ok: true, repaired: plan.repairs.length, category_rows: plan.category_rows, tag_rows: plan.tag_rows };
+}
+
+function mfImageCollectorMisalignedNormalizationRepairPlan_(values, headers) {
+  var requiredHeaders = [
+    '検出種別', '確認内容', '対象列', 'Collectorが取得した根拠',
+    '承認済み日本語説明', '根拠原文', '根拠言語', '根拠URL', 'source_type', 'confidence'
+  ];
+  var columns = {};
+  for (var h = 0; h < requiredHeaders.length; h += 1) {
+    columns[requiredHeaders[h]] = headers.indexOf(requiredHeaders[h]);
+    if (columns[requiredHeaders[h]] < 0) throw new Error('Review sheet is missing ' + requiredHeaders[h] + ' column.');
+  }
+  var result = { repairs: [], category_rows: 0, tag_rows: 0 };
+  for (var i = 0; i < values.length; i += 1) {
+    var row = values[i];
+    if (String(row[columns['検出種別']] || '').trim() !== 'structured_fact') continue;
+    if (String(row[columns['source_type']] || '').trim()) continue;
+    if (String(row[columns['根拠原文']] || '').trim()) continue;
+    if (String(row[columns['根拠URL']] || '').trim()) continue;
+    var misplacedEvidence = String(row[columns['根拠言語']] || '').trim();
+    var misplacedSourceType = String(row[columns['confidence']] || '').trim();
+    var misplacedConfidence = String(row[columns['承認済み日本語説明']] || '').trim();
+    var collectorEvidence = String(row[columns['Collectorが取得した根拠']] || '').trim();
+    var confirmation = String(row[columns['確認内容']] || '').trim();
+    var targetColumn = String(row[columns['対象列']] || '').trim();
+    var repairType = '';
+    if (
+      confirmation === '現在のカテゴリの正規化' &&
+      targetColumn === '現在のカテゴリ' &&
+      misplacedSourceType === 'category_normalization' &&
+      misplacedConfidence === 'high' &&
+      misplacedEvidence.indexOf('カテゴリ正規化ルール:') === 0 &&
+      collectorEvidence.indexOf('カテゴリ正規化ルール:') >= 0
+    ) {
+      repairType = 'category';
+    } else if (
+      confirmation === 'ヴァニラ表記の統一' &&
+      mfImageCollectorIsVanillaTagColumn_(targetColumn) &&
+      misplacedSourceType === 'tag_spelling_normalization' &&
+      misplacedConfidence === 'high' &&
+      misplacedEvidence.indexOf('タグ表記ルール:') === 0 &&
+      collectorEvidence.indexOf('タグ表記ルール:') >= 0
+    ) {
+      repairType = 'tag';
+    }
+    if (!repairType) continue;
+    result.repairs.push({
+      row_number: i + 2,
+      type: repairType,
+      updates: {
+        '承認済み日本語説明': '',
+        '根拠原文': misplacedEvidence,
+        '根拠言語': '',
+        '根拠URL': '',
+        'source_type': misplacedSourceType,
+        'confidence': misplacedConfidence
+      }
+    });
+    if (repairType === 'category') result.category_rows += 1;
+    else result.tag_rows += 1;
+  }
+  return result;
+}
+
 function mfImageCollectorAuditVanillaTags() {
   var result = mfImageCollectorAuditVanillaTags_();
   SpreadsheetApp.getUi().alert(
@@ -1156,7 +1235,7 @@ function mfImageCollectorRecordReviewCandidate_(payload) {
     return { ok: true, action: 'skipped_existing_final', detection_id: detectionId, sheet_row: existingRow };
   }
 
-  sheet.appendRow(MF_IMAGE_COLLECTOR_REVIEW_HEADERS.map(function(header) { return rowValues[header] || ''; }));
+  mfImageCollectorAppendReviewRow_(sheet, rowValues);
   mfImageCollectorApplyReviewValidation_(sheet);
   return { ok: true, action: 'created', detection_id: detectionId, sheet_row: sheet.getLastRow() };
 }
@@ -1679,6 +1758,17 @@ function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
   };
   row['確認内容'] = mfImageCollectorReviewConfirmationLabel_(row);
   return row;
+}
+
+function mfImageCollectorReviewRowArrayForHeaders_(rowValues, headers) {
+  return headers.map(function(header) {
+    return Object.prototype.hasOwnProperty.call(rowValues, header) ? rowValues[header] : '';
+  });
+}
+
+function mfImageCollectorAppendReviewRow_(sheet, rowValues) {
+  var headers = mfImageCollectorSheetHeaders_(sheet);
+  sheet.appendRow(mfImageCollectorReviewRowArrayForHeaders_(rowValues, headers));
 }
 
 function mfImageCollectorStableJson_(value) {
@@ -3870,8 +3960,9 @@ function mfImageCollectorAuditCurrentCategories_() {
     });
     var detectionId = mfImageCollectorReviewDedupeKey_(candidate);
     var rowValues = mfImageCollectorReviewCandidateToRow_(candidate, detectionId);
-    reviewSheet.appendRow(MF_IMAGE_COLLECTOR_REVIEW_HEADERS.map(function(header) { return rowValues[header] || ''; }));
-    reviewValues.push(MF_IMAGE_COLLECTOR_REVIEW_HEADERS.map(function(header) { return rowValues[header] || ''; }));
+    var appendedRow = mfImageCollectorReviewRowArrayForHeaders_(rowValues, reviewHeaders);
+    reviewSheet.appendRow(appendedRow);
+    reviewValues.push(appendedRow);
     result.created += 1;
   }
   if (result.created) mfImageCollectorApplyReviewValidation_(reviewSheet);
@@ -4088,8 +4179,9 @@ function mfImageCollectorAuditVanillaTags_() {
       });
       var detectionId = mfImageCollectorReviewDedupeKey_(candidate);
       var rowValues = mfImageCollectorReviewCandidateToRow_(candidate, detectionId);
-      reviewSheet.appendRow(MF_IMAGE_COLLECTOR_REVIEW_HEADERS.map(function(header) { return rowValues[header] || ''; }));
-      reviewValues.push(MF_IMAGE_COLLECTOR_REVIEW_HEADERS.map(function(header) { return rowValues[header] || ''; }));
+      var appendedRow = mfImageCollectorReviewRowArrayForHeaders_(rowValues, reviewHeaders);
+      reviewSheet.appendRow(appendedRow);
+      reviewValues.push(appendedRow);
       result.created += 1;
     }
   }
