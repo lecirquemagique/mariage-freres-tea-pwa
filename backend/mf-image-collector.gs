@@ -1151,7 +1151,8 @@ function mfImageCollectorGetOrCreateReviewSheet_() {
       if (decisionIndex < 0) throw new Error('Review sheet is missing 人間判定 column.');
       sheet.insertColumnBefore(decisionIndex + 1);
       sheet.getRange(1, decisionIndex + 1).setValue('確認内容');
-      headers.splice(decisionIndex, 0, '確認内容');
+      SpreadsheetApp.flush();
+      headers = mfImageCollectorSheetHeaders_(sheet);
     }
     for (var i = 0; i < MF_IMAGE_COLLECTOR_REVIEW_HEADERS.length; i += 1) {
       if (headers.indexOf(MF_IMAGE_COLLECTOR_REVIEW_HEADERS[i]) < 0) {
@@ -1162,9 +1163,6 @@ function mfImageCollectorGetOrCreateReviewSheet_() {
       }
     }
   }
-  var currentHeaders = mfImageCollectorSheetHeaders_(sheet);
-  var confirmationColumn = currentHeaders.indexOf('確認内容') + 1;
-  if (confirmationColumn > 0) mfImageCollectorClearReviewConfirmationValidation_(sheet, confirmationColumn);
   mfImageCollectorEnsureReviewFilter_(sheet);
   return sheet;
 }
@@ -1199,12 +1197,18 @@ function mfImageCollectorReviewConfirmationLabel_(review) {
 }
 
 function mfImageCollectorPrepareReviewSheetDisplay_(sheet) {
-  mfImageCollectorApplyReviewValidation_(sheet);
   var headers = mfImageCollectorSheetHeaders_(sheet);
   var confirmationCol = headers.indexOf('確認内容');
+  var decisionCol = headers.indexOf('人間判定');
   var detectionCol = headers.indexOf('検出種別');
-  if (confirmationCol < 0 || detectionCol < 0) throw new Error('Review display columns are missing.');
+  if (confirmationCol < 0 || decisionCol < 0 || detectionCol < 0) throw new Error('Review display columns are missing.');
   mfImageCollectorClearReviewConfirmationValidation_(sheet, confirmationCol + 1);
+  mfImageCollectorApplyReviewValidation_(sheet);
+  SpreadsheetApp.flush();
+  headers = mfImageCollectorSheetHeaders_(sheet);
+  confirmationCol = headers.indexOf('確認内容');
+  detectionCol = headers.indexOf('検出種別');
+  if (confirmationCol < 0 || detectionCol < 0) throw new Error('Review display columns are missing after validation refresh.');
   var rowCount = Math.max(sheet.getLastRow() - 1, 0);
   if (rowCount > 0) {
     var values = sheet.getRange(2, 1, rowCount, sheet.getLastColumn()).getValues();
@@ -1427,10 +1431,8 @@ function mfImageCollectorSetTargetQueueRowValues_(sheet, rowNumber, updates) {
 function mfImageCollectorApplyReviewValidation_(sheet) {
   var headers = mfImageCollectorSheetHeaders_(sheet);
   var statusCol = headers.indexOf('ステータス') + 1;
-  var confirmationCol = headers.indexOf('確認内容') + 1;
   var decisionCol = headers.indexOf('人間判定') + 1;
   var maxRows = Math.max(sheet.getMaxRows() - 1, 1);
-  if (confirmationCol > 0) mfImageCollectorClearReviewConfirmationValidation_(sheet, confirmationCol);
   if (statusCol > 0) {
     sheet.getRange(2, statusCol, maxRows, 1).setDataValidation(
       SpreadsheetApp.newDataValidation().requireValueInList(MF_IMAGE_COLLECTOR_REVIEW_STATUSES, true).setAllowInvalid(false).build()
