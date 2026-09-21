@@ -352,6 +352,7 @@ function mfImageCollectorOnOpen(e) {
     .addItem('銘柄指定調査キューを開く', 'mfImageCollectorOpenTargetRequestQueue')
     .addItem('現在カテゴリを監査', 'mfImageCollectorAuditCurrentCategories')
     .addItem('現在カテゴリ承認を診断', 'mfImageCollectorDiagnoseCategoryNormalizationApproval')
+    .addItem('レビュー列ずれを修復', 'mfImageCollectorRepairMisalignedNormalizationReviews')
     .addItem('現在カテゴリ正規化を一括承認', 'mfImageCollectorApproveCurrentCategoryNormalizations')
     .addItem('ヴァニラタグを監査', 'mfImageCollectorAuditVanillaTags')
     .addItem('分類整理 dry-run', 'mfImageCollectorShowTaxonomyDryRun')
@@ -481,15 +482,37 @@ function mfImageCollectorRepairMisalignedNormalizationReviews() {
   var plan = mfImageCollectorMisalignedNormalizationRepairPlan_(reviewData.rows, reviewData.headers);
   var ui = SpreadsheetApp.getUi();
   var response = ui.alert(
-    '正規化レビュー行ずれ修復',
-    'カテゴリ正規化: ' + plan.category_rows + '件\nヴァニラ表記統一: ' + plan.tag_rows + '件\n\n変更候補レビューのみを修復します。実行しますか？',
+    'レビュー列ずれを修復',
+    '変更候補レビュー内の、既知の列ずれ行だけを修復します。\nMasterは変更しません。\n\nカテゴリ正規化: ' + plan.category_rows + '件\nヴァニラ表記統一: ' + plan.tag_rows + '件\n\n実行しますか？',
     ui.ButtonSet.YES_NO
   );
   if (response !== ui.Button.YES) return { ok: false, cancelled: true, repaired: 0 };
+  var result = {
+    ok: true,
+    repaired: 0,
+    category_rows: 0,
+    tag_rows: 0,
+    skipped: reviewData.rows.length - plan.repairs.length,
+    errors: 0
+  };
   for (var i = 0; i < plan.repairs.length; i += 1) {
-    mfImageCollectorSetReviewRowValues_(sheet, plan.repairs[i].row_number, plan.repairs[i].updates);
+    try {
+      mfImageCollectorSetReviewRowValues_(sheet, plan.repairs[i].row_number, plan.repairs[i].updates);
+      result.repaired += 1;
+      if (plan.repairs[i].type === 'category') result.category_rows += 1;
+      else result.tag_rows += 1;
+    } catch (error) {
+      result.errors += 1;
+      Logger.log('Review alignment repair failed at row ' + plan.repairs[i].row_number + ': ' + error);
+    }
   }
-  return { ok: true, repaired: plan.repairs.length, category_rows: plan.category_rows, tag_rows: plan.tag_rows };
+  result.ok = result.errors === 0;
+  ui.alert(
+    'レビュー列ずれ修復結果',
+    'category修復件数: ' + result.category_rows + '\ntag spelling修復件数: ' + result.tag_rows + '\nskip件数: ' + result.skipped + '\nerror件数: ' + result.errors,
+    ui.ButtonSet.OK
+  );
+  return result;
 }
 
 function mfImageCollectorMisalignedNormalizationRepairPlan_(values, headers) {
