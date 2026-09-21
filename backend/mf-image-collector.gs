@@ -339,25 +339,25 @@ function mfImageCollectorMakeFilesDisplayable(fileIds) {
 }
 
 function mfImageCollectorOnOpen(e) {
-  SpreadsheetApp.getUi()
-    .createMenu('MARIAGE FRÈRES 管理')
-    .addItem('変更レビュー', 'mfImageCollectorOpenReviewSheet')
+  var ui = SpreadsheetApp.getUi();
+  var reviewMenu = ui.createMenu('レビュー')
+    .addItem('レビューを開く', 'mfImageCollectorOpenReviewSheet')
+    .addItem('レビュー更新', 'mfImageCollectorRefreshReviewSheet')
     .addItem('選択行を反映', 'mfImageCollectorApplySelectedReviewRow')
     .addItem('選択行を一括反映', 'mfImageCollectorApplySelectedReviewRows')
-    .addItem('要確認件数を表示', 'mfImageCollectorShowReviewSummary')
-    .addItem('レビュー更新', 'mfImageCollectorRefreshReviewSheet')
-    .addItem('旧HTMLレビュー', 'mfImageCollectorShowReviewDialog')
-    .addSeparator()
-    .addItem('銘柄指定で追加候補を作成', 'mfImageCollectorShowTargetRequestDialog')
-    .addItem('銘柄指定調査キューを開く', 'mfImageCollectorOpenTargetRequestQueue')
-    .addItem('現在カテゴリを監査', 'mfImageCollectorAuditCurrentCategories')
-    .addItem('現在カテゴリ承認を診断', 'mfImageCollectorDiagnoseCategoryNormalizationApproval')
-    .addItem('レビュー列ずれを修復', 'mfImageCollectorRepairMisalignedNormalizationReviews')
-    .addItem('現在カテゴリ正規化を一括承認', 'mfImageCollectorApproveCurrentCategoryNormalizations')
-    .addItem('ヴァニラタグを監査', 'mfImageCollectorAuditVanillaTags')
-    .addItem('分類整理 dry-run', 'mfImageCollectorShowTaxonomyDryRun')
-    .addItem('分類整理を反映', 'mfImageCollectorShowTaxonomyApplyConfirm')
-    .addItem('分類整理を元に戻す', 'mfImageCollectorShowTaxonomyRollbackConfirm')
+    .addItem('要確認件数を表示', 'mfImageCollectorShowReviewSummary');
+  var discoveryMenu = ui.createMenu('調査')
+    .addItem('銘柄指定調査キュー', 'mfImageCollectorShowTargetRequestDialog')
+    .addItem('調査キューを開く', 'mfImageCollectorOpenTargetRequestQueue');
+  var maintenanceMenu = ui.createMenu('メンテナンス')
+    .addItem('現在カテゴリ監査', 'mfImageCollectorAuditCurrentCategories')
+    .addItem('ヴァニラ表記監査', 'mfImageCollectorAuditVanillaTags');
+
+  // Keep one user-facing top-level menu. Temporary diagnostics and repairs stay editor-only.
+  ui.createMenu('MARIAGE FRÈRES')
+    .addSubMenu(reviewMenu)
+    .addSubMenu(discoveryMenu)
+    .addSubMenu(maintenanceMenu)
     .addToUi();
 }
 
