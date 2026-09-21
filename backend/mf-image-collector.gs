@@ -119,6 +119,9 @@ function mfImageCollectorDoGet(e) {
       mfImageCollectorAssertSecret_(params);
       return mfImageCollectorJsonOrJsonp_(mfImageCollectorGetTargetDiscoveryRequest_(params), params.callback);
     }
+    if (action === 'bookmarkTarget') {
+      return mfImageCollectorBookmarkTargetOutput_(params.url || '');
+    }
     return mfImageCollectorJsonOrJsonp_({ ok: false, error: 'Unsupported action.' }, params.callback);
   } catch (error) {
     var callback = e && e.parameter ? e.parameter.callback : '';
@@ -829,6 +832,85 @@ function mfImageCollectorShowReviewDialog() {
     .setWidth(820)
     .setHeight(720);
   SpreadsheetApp.getUi().showModalDialog(html, 'MARIAGE FRÈRES 変更レビュー');
+}
+
+function mfImageCollectorBookmarkTargetOutput_(value) {
+  var targetUrl = '';
+  try {
+    targetUrl = mfImageCollectorNormalizeTargetRequestInput_({ target_url: value }).target_url;
+    if (!targetUrl) throw new Error('公式商品URLが指定されていません。');
+  } catch (error) {
+    var invalidMessage = value
+      ? 'MARIAGE FRÈRES公式商品ページではありません。'
+      : '公式商品URLが指定されていません。';
+    return HtmlService.createHtmlOutput(mfImageCollectorBookmarkTargetHtml_('', invalidMessage))
+      .setTitle('MARIAGE FRÈRES');
+  }
+  return HtmlService.createHtmlOutput(mfImageCollectorBookmarkTargetHtml_(targetUrl, ''))
+    .setTitle('MARIAGE FRÈRES');
+}
+
+function mfImageCollectorBookmarkTargetHtml_(targetUrl, errorMessage) {
+  var escapedUrl = mfImageCollectorEscapeHtml_(targetUrl);
+  var escapedError = mfImageCollectorEscapeHtml_(errorMessage);
+  var safeUrlJson = mfImageCollectorSafeJsonForHtml_(targetUrl);
+  var body = errorMessage
+    ? '<div class="error">' + escapedError + '</div>'
+    : [
+      '<p>この商品ページを調査キューへ追加します。</p>',
+      '<label for="target-url">URL</label>',
+      '<div id="target-url" class="url">' + escapedUrl + '</div>',
+      '<button id="submit" type="button" onclick="submitTarget()">調査キューへ追加</button>',
+      '<div id="message" role="status"></div>',
+      '<script>',
+      'var targetUrl=' + safeUrlJson + ';',
+      'function submitTarget(){',
+      '  var button=document.getElementById("submit");',
+      '  var message=document.getElementById("message");',
+      '  button.disabled=true;',
+      '  message.textContent="登録中...";',
+      '  google.script.run',
+      '    .withSuccessHandler(function(result){',
+      '      if(!result||result.ok===false){message.textContent="登録できませんでした: "+((result&&result.error)||"不明なエラー");button.disabled=false;return;}',
+      '      message.textContent=result.duplicate?"✓ すでに調査待ちです。":"✓ 調査キューに追加しました。";',
+      '    })',
+      '    .withFailureHandler(function(error){',
+      '      message.textContent="登録できませんでした: "+(error&&error.message?error.message:error);',
+      '      button.disabled=false;',
+      '    })',
+      '    .mfImageCollectorCreateTargetDiscoveryRequest({target_url:targetUrl});',
+      '}',
+      '</script>'
+    ].join('\n');
+  return [
+    '<!doctype html><html><head><base target="_top"><meta charset="utf-8"><style>',
+    'body{font-family:Arial,"Noto Sans JP",sans-serif;margin:0;padding:20px;color:#202124;line-height:1.5}',
+    'h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:0 0 18px;font-weight:500}',
+    'label{display:block;font-weight:700;margin:14px 0 6px}.url{overflow-wrap:anywhere;background:#f5f5f5;border:1px solid #ddd;padding:10px}',
+    'button{margin-top:18px;border:1px solid #4b3a2a;background:#4b3a2a;color:#fff;padding:9px 14px;cursor:pointer}',
+    'button:disabled{opacity:.6;cursor:default}#message{margin-top:14px;white-space:pre-wrap}.error{color:#b3261e;font-weight:700}',
+    '</style></head><body><h1>MARIAGE FRÈRES</h1><h2>調査キューへ追加</h2>',
+    body,
+    '</body></html>'
+  ].join('');
+}
+
+function mfImageCollectorEscapeHtml_(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function mfImageCollectorSafeJsonForHtml_(value) {
+  return JSON.stringify(String(value || ''))
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 function mfImageCollectorTargetRequestHtml_() {
