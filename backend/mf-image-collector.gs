@@ -1152,6 +1152,7 @@ function mfImageCollectorGetOrCreateReviewSheet_() {
       if (decisionIndex < 0) throw new Error('Review sheet is missing 人間判定 column.');
       sheet.insertColumnBefore(decisionIndex + 1);
       sheet.getRange(1, decisionIndex + 1).setValue('確認内容');
+      mfImageCollectorClearReviewConfirmationValidation_(sheet, decisionIndex + 1);
       headers.splice(decisionIndex, 0, '確認内容');
     }
     for (var i = 0; i < MF_IMAGE_COLLECTOR_REVIEW_HEADERS.length; i += 1) {
@@ -1202,6 +1203,7 @@ function mfImageCollectorPrepareReviewSheetDisplay_(sheet) {
   var confirmationCol = headers.indexOf('確認内容');
   var detectionCol = headers.indexOf('検出種別');
   if (confirmationCol < 0 || detectionCol < 0) throw new Error('Review display columns are missing.');
+  mfImageCollectorClearReviewConfirmationValidation_(sheet, confirmationCol + 1);
   var rowCount = Math.max(sheet.getLastRow() - 1, 0);
   if (rowCount > 0) {
     var values = sheet.getRange(2, 1, rowCount, sheet.getLastColumn()).getValues();
@@ -1212,6 +1214,11 @@ function mfImageCollectorPrepareReviewSheetDisplay_(sheet) {
     }
   }
   if (!sheet.isColumnHiddenByUser(detectionCol + 1)) sheet.hideColumns(detectionCol + 1);
+}
+
+function mfImageCollectorClearReviewConfirmationValidation_(sheet, confirmationColumn) {
+  var dataRowCount = Math.max(sheet.getMaxRows() - 1, 0);
+  if (dataRowCount > 0) sheet.getRange(2, confirmationColumn, dataRowCount, 1).clearDataValidations();
 }
 
 function mfImageCollectorGetOrCreateTargetQueueSheet_() {
