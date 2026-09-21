@@ -1818,7 +1818,10 @@ function mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurre
     var expectedValues = mfImageCollectorDelimitedValues_(expected);
     var incomingValues = mfImageCollectorDelimitedValues_(incoming);
     var alreadyApplied = incomingValues.length > 0 && incomingValues.every(function(value) {
-      return values.indexOf(value) >= 0;
+      if (values.indexOf(value) >= 0) return true;
+      return targetColumn === '香味詳細タグ' && values.some(function(existingValue) {
+        return mfImageCollectorAromaDetailAlreadyRepresented_(existingValue, value);
+      });
     });
     if (alreadyApplied) return { already_applied: true, next_value: actual };
     var currentChanged = values.length !== expectedValues.length;
@@ -1840,6 +1843,29 @@ function mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurre
     throw new Error('Master value changed after structured_fact candidate was created: ' + targetColumn + ' expected "' + expected + '" but found "' + actual + '".');
   }
   return { already_applied: false, next_value: incoming };
+}
+
+function mfImageCollectorCanonicalAromaDetailTerm_(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .replace(/\s+/g, '')
+    .replace(/ヴァニラ/g, 'バニラ')
+    .trim();
+}
+
+function mfImageCollectorAromaDetailAlreadyRepresented_(existingValue, candidateValue) {
+  var existing = mfImageCollectorCanonicalAromaDetailTerm_(existingValue);
+  var candidate = mfImageCollectorCanonicalAromaDetailTerm_(candidateValue);
+  if (!existing || !candidate) return false;
+  if (existing === candidate) return true;
+  if (candidate === '花') {
+    return /^(?:白い花|白花|花の香り|フローラルな花)$/.test(existing);
+  }
+  if (candidate.length < 3) return false;
+  var escapedCandidate = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  var modifier = '(?:軽い|淡い|ほのかな|柔らかな|やわらかな|甘い|濃厚な|繊細な|上品な|豊かな|爽やかな)';
+  var suffix = '(?:の香り|香り)?';
+  return new RegExp('^' + modifier + escapedCandidate + suffix + '$').test(existing);
 }
 
 function mfImageCollectorNormalizeStructuredFactValue_(targetColumn, value) {
