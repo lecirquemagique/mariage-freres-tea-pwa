@@ -1824,10 +1824,9 @@ function mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurre
       });
     });
     if (alreadyApplied) return { already_applied: true, next_value: actual };
-    var currentChanged = values.length !== expectedValues.length;
-    for (var i = 0; !currentChanged && i < expectedValues.length; i += 1) {
-      currentChanged = values.indexOf(expectedValues[i]) < 0;
-    }
+    var currentChanged = expectedValues.some(function(expectedValue) {
+      return values.indexOf(expectedValue) < 0;
+    });
     if (currentChanged) {
       throw new Error('Master value changed after structured_fact candidate was created: ' + targetColumn + ' expected "' + expected + '" but found "' + actual + '".');
     }
