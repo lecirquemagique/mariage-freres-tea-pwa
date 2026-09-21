@@ -421,7 +421,7 @@ function mfImageCollectorApproveCurrentCategoryNormalizations() {
 function mfImageCollectorDiagnoseCategoryNormalizationApproval() {
   var sheet = mfImageCollectorGetReviewSheetByName_();
   var reviewData = mfImageCollectorReadReviewSheetData_(sheet);
-  var diagnosis = mfImageCollectorCategoryNormalizationDiagnosis_(reviewData.rows, reviewData.headers);
+  var diagnosis = mfImageCollectorCategoryNormalizationDiagnosis_(reviewData.rows, reviewData.headers, reviewData.display_rows, reviewData.raw_headers);
   diagnosis.sheet_name = sheet.getName();
   diagnosis.last_row = sheet.getLastRow();
   diagnosis.last_column = sheet.getLastColumn();
@@ -437,8 +437,27 @@ function mfImageCollectorDiagnoseCategoryNormalizationApproval() {
     'B + category_normalization: ' + diagnosis.counts.source_type,
     'C + 現在のカテゴリ: ' + diagnosis.counts.target_column,
     'D + 要確認/保留: ' + diagnosis.counts.status,
-    'E + 未判定/保留: ' + diagnosis.counts.decision
+    'E + 未判定/保留: ' + diagnosis.counts.decision,
+    '',
+    'source_type列: index=' + diagnosis.source_type_column.index + ', sheetColumn=' + diagnosis.source_type_column.sheet_column,
+    'header raw: ' + JSON.stringify(diagnosis.source_type_column.header_raw),
+    'header normalized: ' + JSON.stringify(diagnosis.source_type_column.header_normalized),
+    'structured_factのsource_type distinct: ' + JSON.stringify(diagnosis.source_type_distinct)
   ];
+  if (diagnosis.row_247) {
+    message.push(
+      '',
+      'Row 247 source_type',
+      'raw: ' + JSON.stringify(diagnosis.row_247.raw),
+      'display: ' + JSON.stringify(diagnosis.row_247.display),
+      'typeof: ' + diagnosis.row_247.type,
+      'length: ' + diagnosis.row_247.length,
+      'NFKC: ' + JSON.stringify(diagnosis.row_247.nfkc),
+      'trim: ' + JSON.stringify(diagnosis.row_247.trimmed),
+      'normalized: ' + JSON.stringify(diagnosis.row_247.normalized),
+      'equals category_normalization: ' + diagnosis.row_247.equals_category_normalization
+    );
+  }
   if (first) {
     message.push(
       '',
@@ -1235,9 +1254,11 @@ function mfImageCollectorGetReviewSheetByName_() {
 function mfImageCollectorReadReviewSheetData_(sheet) {
   var range = sheet.getDataRange();
   var allValues = range.getValues();
-  if (!allValues.length) return { headers: [], rows: [] };
-  var headers = allValues[0].map(function(value) { return String(value).trim(); });
-  return { headers: headers, rows: allValues.slice(1) };
+  var allDisplayValues = range.getDisplayValues();
+  if (!allValues.length) return { headers: [], raw_headers: [], rows: [], display_rows: [] };
+  var rawHeaders = allValues[0].slice();
+  var headers = rawHeaders.map(function(value) { return String(value).trim(); });
+  return { headers: headers, raw_headers: rawHeaders, rows: allValues.slice(1), display_rows: allDisplayValues.slice(1) };
 }
 
 function mfImageCollectorGetOrCreateReviewSheet_() {
@@ -3912,7 +3933,7 @@ function mfImageCollectorCategoryNormalizationDecisionPlan_(values, headers) {
   return result;
 }
 
-function mfImageCollectorCategoryNormalizationDiagnosis_(values, headers) {
+function mfImageCollectorCategoryNormalizationDiagnosis_(values, headers, displayValues, rawHeaders) {
   var typeCol = mfImageCollectorResolveReviewColumnIndex_(values, headers, '検出種別');
   var sourceCol = mfImageCollectorResolveReviewColumnIndex_(values, headers, 'source_type');
   var targetCol = mfImageCollectorResolveReviewColumnIndex_(values, headers, '対象列');
@@ -3926,12 +3947,37 @@ function mfImageCollectorCategoryNormalizationDiagnosis_(values, headers) {
     counts: { detection_type: 0, source_type: 0, target_column: 0, status: 0, decision: 0 },
     columns: { detection_type: typeCol, source_type: sourceCol, target_column: targetCol, status: statusCol, decision: decisionCol, version_key: versionCol },
     eligible_rows: [],
-    first_candidate: null
+    first_candidate: null,
+    source_type_column: {
+      index: sourceCol,
+      sheet_column: sourceCol + 1,
+      header_raw: rawHeaders && sourceCol < rawHeaders.length ? rawHeaders[sourceCol] : headers[sourceCol],
+      header_normalized: mfImageCollectorNormalizeReviewLookupText_(headers[sourceCol])
+    },
+    source_type_distinct: {},
+    row_247: null
   };
   for (var i = 0; i < values.length; i += 1) {
     if (mfImageCollectorNormalizeReviewLookupText_(values[i][typeCol]) !== 'structured_fact') continue;
     result.counts.detection_type += 1;
-    if (mfImageCollectorNormalizeReviewLookupText_(values[i][sourceCol]) !== 'category_normalization') continue;
+    var sourceType = mfImageCollectorNormalizeReviewEnumValue_(values[i][sourceCol]);
+    var distinctKey = sourceType || '(blank)';
+    result.source_type_distinct[distinctKey] = (result.source_type_distinct[distinctKey] || 0) + 1;
+    if (i === 245) {
+      var rawSourceType = values[i][sourceCol];
+      var sourceString = String(rawSourceType === null || typeof rawSourceType === 'undefined' ? '' : rawSourceType);
+      result.row_247 = {
+        raw: rawSourceType,
+        display: displayValues && displayValues[i] ? displayValues[i][sourceCol] : '',
+        type: typeof rawSourceType,
+        length: sourceString.length,
+        nfkc: sourceString.normalize('NFKC'),
+        trimmed: sourceString.trim(),
+        normalized: sourceType,
+        equals_category_normalization: sourceType === 'category_normalization'
+      };
+    }
+    if (sourceType !== 'category_normalization') continue;
     result.counts.source_type += 1;
     if (mfImageCollectorNormalizeReviewLookupText_(values[i][targetCol]) !== '現在のカテゴリ') continue;
     result.counts.target_column += 1;
@@ -3955,6 +4001,13 @@ function mfImageCollectorCategoryNormalizationDiagnosis_(values, headers) {
     }
   }
   return result;
+}
+
+function mfImageCollectorNormalizeReviewEnumValue_(value) {
+  return String(value === null || typeof value === 'undefined' ? '' : value)
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
+    .trim();
 }
 
 function mfImageCollectorNormalizeReviewLookupText_(value) {
