@@ -26,6 +26,7 @@ var MF_IMAGE_COLLECTOR_REVIEW_HEADERS = [
   '差分概要',
   'Collectorが取得した根拠',
   'ステータス',
+  '確認内容',
   '人間判定',
   '対象VersionKey',
   'コメント',
@@ -63,6 +64,7 @@ var MF_IMAGE_COLLECTOR_REVIEW_DECISIONS = [
 ];
 var MF_IMAGE_COLLECTOR_TAXONOMY_COLUMNS = ['茶種タグ', '現在のカテゴリ', '香味大分類'];
 var MF_IMAGE_COLLECTOR_REVIEW_APPLY_STATUSES = ['要確認', '保留'];
+var MF_IMAGE_COLLECTOR_REVIEW_FINAL_STATUSES = ['承認', '却下', '反映済み'];
 var MF_IMAGE_COLLECTOR_TAXONOMY_LOG_HEADERS = [
   'batch_id',
   'timestamp',
@@ -356,6 +358,7 @@ function mfImageCollectorOnOpen(e) {
 
 function mfImageCollectorOpenReviewSheet() {
   var sheet = mfImageCollectorGetOrCreateReviewSheet_();
+  mfImageCollectorPrepareReviewSheetDisplay_(sheet);
   mfImageCollectorApplyReviewValidation_(sheet);
   mfImageCollectorEnsureReviewFilter_(sheet);
   sheet.activate();
@@ -406,7 +409,8 @@ function mfImageCollectorApplySelectedReviewRow() {
     '行: ' + rowNumber,
     'REF / Primary Reference候補: ' + (mfImageCollectorReviewPrimaryReference_(review) || '（空欄）'),
     '公式名: ' + (String(review['公式名'] || '').trim() || '（空欄）'),
-    '検出種別: ' + (String(review['検出種別'] || '').trim() || '（空欄）'),
+    '確認内容: ' + mfImageCollectorReviewConfirmationLabel_(review),
+    '検出種別（技術情報）: ' + (String(review['検出種別'] || '').trim() || '（空欄）'),
     '人間判定: ' + decision,
     '対象VersionKey: ' + (resolvedStructuredFact
       ? resolvedStructuredFact.version_key + '（自動解決）'
@@ -462,24 +466,36 @@ function mfImageCollectorApplySelectedReviewRows() {
   }
 
   var counts = preflight.counts;
+  var processItems = preflight.items.filter(function(item) { return item.process; });
+  if (!processItems.length) {
+    ui.alert(
+      '選択行を一括反映',
+      '選択範囲: ' + preflight.selected_count + '行\n' +
+      '確定済みスキップ: ' + counts.skip_finalized + '件\n\n' +
+      '処理対象はありません。',
+      ui.ButtonSet.OK
+    );
+    return { ok: true, no_work: true, preflight: preflight };
+  }
   var lines = [
-    '対象: ' + preflight.items.length + '件',
+    '選択範囲: ' + preflight.selected_count + '行',
+    '実処理対象: ' + processItems.length + '件',
+    '確定済みスキップ: ' + counts.skip_finalized + '件',
     '',
     '反映予定:',
-    '- Master更新: ' + counts.master_update + '件',
-    '- 新規銘柄追加: ' + counts.new_tea + '件',
-    '- 販売SKU追加: ' + counts.sales_sku + '件',
+    '- 反映: ' + counts.apply + '件',
+    '- 反映済み確認（Master書込なし）: ' + counts.already_applied + '件',
     '- 保留: ' + counts.hold + '件',
     '- 誤検出/却下: ' + counts.reject + '件',
     '',
-    'この' + preflight.items.length + '件を反映しますか？'
+    'この' + processItems.length + '件を反映しますか？'
   ];
   var response = ui.alert('選択行を一括反映', lines.join('\n'), ui.ButtonSet.YES_NO);
   if (response !== ui.Button.YES) return { ok: false, cancelled: true };
 
   var results = [];
-  for (var i = 0; i < preflight.items.length; i += 1) {
-    var item = preflight.items[i];
+  for (var i = 0; i < processItems.length; i += 1) {
+    var item = processItems[i];
     try {
       results.push(mfImageCollectorApplyReviewDecision(
         item.row_number,
@@ -489,7 +505,7 @@ function mfImageCollectorApplySelectedReviewRows() {
         item.approved_japanese_description
       ));
     } catch (error) {
-      var remaining = preflight.items.length - i - 1;
+      var remaining = processItems.length - i - 1;
       throw new Error(
         '一括反映を行 ' + item.row_number + ' で停止しました。\n' +
         '成功済み: ' + results.length + '件\n' +
@@ -503,6 +519,7 @@ function mfImageCollectorApplySelectedReviewRows() {
   ui.alert(
     '一括反映完了',
     '成功: ' + results.length + '件\n' +
+    '既に反映済み（Master書込なし）: ' + summary.already_applied + '件\n' +
     '保留: ' + summary.hold + '件\n' +
     '却下: ' + summary.reject + '件\n' +
     '失敗: 0件',
@@ -516,7 +533,7 @@ function mfImageCollectorPreflightReviewRows_(sheet, startRow, rowCount) {
   var values = sheet.getRange(startRow, 1, rowCount, sheet.getLastColumn()).getValues();
   var items = [];
   var errors = [];
-  var counts = { master_update: 0, new_tea: 0, sales_sku: 0, hold: 0, reject: 0 };
+  var counts = { apply: 0, hold: 0, reject: 0, skip_finalized: 0, already_applied: 0, error: 0 };
   for (var i = 0; i < values.length; i += 1) {
     var rowNumber = startRow + i;
     try {
@@ -525,15 +542,27 @@ function mfImageCollectorPreflightReviewRows_(sheet, startRow, rowCount) {
       counts[item.category] += 1;
     } catch (error) {
       errors.push('行 ' + rowNumber + ': ' + error.message);
+      counts.error += 1;
     }
   }
-  return { items: items, errors: errors, counts: counts };
+  return { selected_count: rowCount, items: items, errors: errors, counts: counts };
 }
 
 function mfImageCollectorPreflightReviewRow_(rowNumber, review) {
   var status = String(review['ステータス'] || '').trim();
   if (MF_IMAGE_COLLECTOR_REVIEW_APPLY_STATUSES.indexOf(status) < 0) {
-    throw new Error('確定済み、または処理できないステータスです: ' + (status || '(空欄)'));
+    if (MF_IMAGE_COLLECTOR_REVIEW_FINAL_STATUSES.indexOf(status) < 0) {
+      throw new Error('処理できないステータスです: ' + (status || '(空欄)'));
+    }
+    return {
+      row_number: rowNumber,
+      decision: String(review['人間判定'] || '').trim(),
+      target_version_key: String(review['対象VersionKey'] || '').trim(),
+      approved_japanese_description: '',
+      comment: String(review['コメント'] || '').trim(),
+      category: 'skip_finalized',
+      process: false
+    };
   }
   var decision = String(review['人間判定'] || '').trim();
   var targetVersionKey = String(review['対象VersionKey'] || '').trim();
@@ -551,23 +580,23 @@ function mfImageCollectorPreflightReviewRow_(rowNumber, review) {
     target_version_key: result && result.target_version_key ? result.target_version_key : targetVersionKey,
     approved_japanese_description: approvedDescription,
     comment: comment,
-    category: mfImageCollectorBatchReviewCategory_(review, decision)
+    category: result && result.already_applied ? 'already_applied' : mfImageCollectorBatchReviewCategory_(review, decision),
+    process: true
   };
 }
 
 function mfImageCollectorBatchReviewCategory_(review, decision) {
   if (decision === '保留') return 'hold';
   if (decision === '誤検出') return 'reject';
-  if (decision === '販売SKUとして追加') return 'sales_sku';
-  if (decision === '新規銘柄として追加' || decision === '既存銘柄の新バージョンとして追加') return 'new_tea';
-  return 'master_update';
+  return 'apply';
 }
 
 function mfImageCollectorSummarizeBatchReviewResults_(results) {
-  var summary = { hold: 0, reject: 0 };
+  var summary = { hold: 0, reject: 0, already_applied: 0 };
   for (var i = 0; i < results.length; i += 1) {
     if (results[i].status === '保留') summary.hold += 1;
     if (results[i].status === '却下') summary.reject += 1;
+    if (results[i].already_applied) summary.already_applied += 1;
   }
   return summary;
 }
@@ -751,6 +780,7 @@ function mfImageCollectorShowTaxonomyRollbackConfirm() {
 
 function mfImageCollectorRefreshReviewSheet() {
   var sheet = mfImageCollectorGetOrCreateReviewSheet_();
+  mfImageCollectorPrepareReviewSheetDisplay_(sheet);
   mfImageCollectorEnsureReviewFilter_(sheet);
   mfImageCollectorShowReviewSummary();
 }
@@ -947,13 +977,25 @@ function mfImageCollectorApplyReviewDecision(rowNumber, decision, targetVersionK
     'コメント': comment || review['コメント'] || '',
     '処理日時': new Date()
   };
+  if (applyResult && applyResult.already_applied) {
+    var alreadyAppliedNote = 'Masterに候補値が既に存在したため書込なし';
+    reviewUpdates['コメント'] = comment
+      ? comment + ' / ' + alreadyAppliedNote
+      : alreadyAppliedNote;
+  }
   if (applyResult && applyResult.auto_resolved) {
     reviewUpdates['DB既存VersionKey'] = applyResult.target_version_key;
     reviewUpdates['DB既存T'] = applyResult.reference || '';
     reviewUpdates['DB既存名'] = applyResult.name || '';
   }
   mfImageCollectorSetReviewRowValues_(sheet, row, reviewUpdates);
-  return { ok: true, row_number: row, status: finalStatus, decision: decision };
+  return {
+    ok: true,
+    row_number: row,
+    status: finalStatus,
+    decision: decision,
+    already_applied: !!(applyResult && applyResult.already_applied)
+  };
 }
 
 function mfImageCollectorRecordReviewCandidate_(payload) {
@@ -1105,6 +1147,13 @@ function mfImageCollectorGetOrCreateReviewSheet_() {
     var headers = sheet.getLastColumn() > 0
       ? sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(value) { return String(value).trim(); })
       : [];
+    if (headers.indexOf('確認内容') < 0) {
+      var decisionIndex = headers.indexOf('人間判定');
+      if (decisionIndex < 0) throw new Error('Review sheet is missing 人間判定 column.');
+      sheet.insertColumnBefore(decisionIndex + 1);
+      sheet.getRange(1, decisionIndex + 1).setValue('確認内容');
+      headers.splice(decisionIndex, 0, '確認内容');
+    }
     for (var i = 0; i < MF_IMAGE_COLLECTOR_REVIEW_HEADERS.length; i += 1) {
       if (headers.indexOf(MF_IMAGE_COLLECTOR_REVIEW_HEADERS[i]) < 0) {
         var lastColumn = Math.max(sheet.getLastColumn(), 1);
@@ -1117,6 +1166,52 @@ function mfImageCollectorGetOrCreateReviewSheet_() {
   mfImageCollectorApplyReviewValidation_(sheet);
   mfImageCollectorEnsureReviewFilter_(sheet);
   return sheet;
+}
+
+function mfImageCollectorReviewConfirmationLabel_(review) {
+  var existing = String(review['確認内容'] || '').trim();
+  if (existing) return existing;
+  var detectionType = String(review['検出種別'] || '').trim();
+  var targetColumn = String(review['対象列'] || '').trim();
+  if (detectionType === 'structured_fact') {
+    var structuredLabels = {
+      '香味詳細タグ': '香味詳細タグの追加',
+      '香味大分類': '香味分類の追加・変更',
+      '産地・国': '産地・国の追加・変更',
+      '産地・地域／茶園': '産地・茶園情報の追加・変更',
+      '時間帯タグ': '時間帯タグの追加・変更',
+      'ミルクティー推奨': 'ミルクティー推奨の確認',
+      'アイスティー推奨': 'アイスティー推奨の確認',
+      'テインフリー': 'テインフリー情報の確認',
+      '燻製茶': '燻製茶情報の確認'
+    };
+    return structuredLabels[targetColumn] || (targetColumn ? targetColumn + 'の確認' : '情報差分の確認');
+  }
+  var labels = {
+    official_description_translation: '公式説明の日本語確認',
+    sales_sku_detected: '販売形式の追加',
+    unregistered_reference: '新規銘柄候補',
+    unregistered_reference_image: '新規銘柄候補（画像から検出）',
+    official_name_changed: '公式名の変更確認'
+  };
+  return labels[detectionType] || '情報差分の確認';
+}
+
+function mfImageCollectorPrepareReviewSheetDisplay_(sheet) {
+  var headers = mfImageCollectorSheetHeaders_(sheet);
+  var confirmationCol = headers.indexOf('確認内容');
+  var detectionCol = headers.indexOf('検出種別');
+  if (confirmationCol < 0 || detectionCol < 0) throw new Error('Review display columns are missing.');
+  var rowCount = Math.max(sheet.getLastRow() - 1, 0);
+  if (rowCount > 0) {
+    var values = sheet.getRange(2, 1, rowCount, sheet.getLastColumn()).getValues();
+    for (var i = 0; i < values.length; i += 1) {
+      if (String(values[i][confirmationCol] || '').trim()) continue;
+      var review = mfImageCollectorReviewObject_(headers, values[i]);
+      sheet.getRange(i + 2, confirmationCol + 1).setValue(mfImageCollectorReviewConfirmationLabel_(review));
+    }
+  }
+  if (!sheet.isColumnHiddenByUser(detectionCol + 1)) sheet.hideColumns(detectionCol + 1);
 }
 
 function mfImageCollectorGetOrCreateTargetQueueSheet_() {
@@ -1395,7 +1490,7 @@ function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
     similar_master_candidates: candidate.similar_master_candidates || [],
     structured_fact: candidate.structured_fact || null
   };
-  return {
+  var row = {
     '検出ID': detectionId,
     '検出日時': candidate.detected_at ? new Date(candidate.detected_at) : new Date(),
     'Tリファレンス番号': String(candidate.reference || '').trim(),
@@ -1409,6 +1504,7 @@ function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
     '差分概要': String(candidate.diff_summary || '').trim(),
     'Collectorが取得した根拠': String(candidate.evidence || '').trim(),
     'ステータス': String(candidate.status || '要確認').trim(),
+    '確認内容': '',
     '人間判定': String(candidate.human_decision || '').trim(),
     '対象VersionKey': String(candidate.target_version_key || '').trim(),
     'コメント': String(candidate.comment || '').trim(),
@@ -1433,6 +1529,8 @@ function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
     'source_type': String(candidate.source_type || '').trim(),
     'confidence': String(candidate.confidence || '').trim()
   };
+  row['確認内容'] = mfImageCollectorReviewConfirmationLabel_(row);
+  return row;
 }
 
 function mfImageCollectorStableJson_(value) {
@@ -1653,13 +1751,16 @@ function mfImageCollectorApplyStructuredFact_(review, options) {
 
   var range = sheet.getRange(targetRow, targetCol + 1);
   var actualCurrentValue = String(range.getValue() || '').trim();
-  var nextValue = mfImageCollectorStructuredFactNextValue_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue);
-  if (nextValue !== actualCurrentValue && !options.dry_run) range.setValue(nextValue);
+  var evaluation = mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue);
+  if (!evaluation.already_applied && evaluation.next_value !== actualCurrentValue && !options.dry_run) {
+    range.setValue(evaluation.next_value);
+  }
   return {
     target_version_key: targetVersionKey,
     auto_resolved: !!resolved,
     reference: resolved ? resolved.reference : '',
-    name: resolved ? resolved.name : ''
+    name: resolved ? resolved.name : '',
+    already_applied: evaluation.already_applied
   };
 }
 
@@ -1688,6 +1789,10 @@ function mfImageCollectorStructuredFactMultiValueColumns_() {
 }
 
 function mfImageCollectorStructuredFactNextValue_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue) {
+  return mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue).next_value;
+}
+
+function mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue) {
   var actual = String(actualCurrentValue || '').trim();
   var expected = String(candidateCurrentValue || '').trim();
   var incoming = targetColumn === '香味大分類'
@@ -1697,6 +1802,10 @@ function mfImageCollectorStructuredFactNextValue_(targetColumn, actualCurrentVal
     var values = mfImageCollectorDelimitedValues_(actual);
     var expectedValues = mfImageCollectorDelimitedValues_(expected);
     var incomingValues = mfImageCollectorDelimitedValues_(incoming);
+    var alreadyApplied = incomingValues.length > 0 && incomingValues.every(function(value) {
+      return values.indexOf(value) >= 0;
+    });
+    if (alreadyApplied) return { already_applied: true, next_value: actual };
     var currentChanged = values.length !== expectedValues.length;
     for (var i = 0; !currentChanged && i < expectedValues.length; i += 1) {
       currentChanged = values.indexOf(expectedValues[i]) < 0;
@@ -1707,13 +1816,15 @@ function mfImageCollectorStructuredFactNextValue_(targetColumn, actualCurrentVal
     for (var j = 0; j < incomingValues.length; j += 1) {
       if (values.indexOf(incomingValues[j]) < 0) values.push(incomingValues[j]);
     }
-    return values.join('、');
+    return { already_applied: false, next_value: values.join('、') };
   }
-  if (actual === incoming) return actual;
-  if (actual !== expected) {
+  var normalizedActual = mfImageCollectorNormalizeStructuredFactValue_(targetColumn, actual);
+  var normalizedExpected = mfImageCollectorNormalizeStructuredFactValue_(targetColumn, expected);
+  if (normalizedActual === incoming) return { already_applied: true, next_value: actual };
+  if (normalizedActual !== normalizedExpected) {
     throw new Error('Master value changed after structured_fact candidate was created: ' + targetColumn + ' expected "' + expected + '" but found "' + actual + '".');
   }
-  return incoming;
+  return { already_applied: false, next_value: incoming };
 }
 
 function mfImageCollectorNormalizeStructuredFactValue_(targetColumn, value) {
