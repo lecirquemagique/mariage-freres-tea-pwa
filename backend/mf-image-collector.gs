@@ -844,7 +844,7 @@ function mfImageCollectorTargetRequestHtml_() {
     '#message{margin-top:12px;white-space:pre-wrap}',
     '</style></head><body>',
     '<div class="note">この操作では銘柄マスターへ直接追加しません。次回collector実行時に公式サイトを調査し、確認できた場合は変更候補レビューへ送ります。</div>',
-    '<label for="target_name">銘柄名 <span style="color:#b3261e">*</span></label>',
+    '<label for="target_name">銘柄名</label>',
     '<input id="target_name" autocomplete="off" placeholder="例: KUKICHA">',
     '<label for="target_ref">REF</label>',
     '<input id="target_ref" autocomplete="off" placeholder="例: T662 / TFG9965 / TJ9JA">',
@@ -861,7 +861,7 @@ function mfImageCollectorTargetRequestHtml_() {
     "  var button=document.getElementById('submit');",
     "  var message=document.getElementById('message');",
     "  var payload={target_name:value('target_name'),target_ref:value('target_ref'),target_url:value('target_url')};",
-    "  if(!payload.target_name){message.textContent='銘柄名を入力してください。';return;}",
+    "  if(!payload.target_name&&!payload.target_ref&&!payload.target_url){message.textContent='公式商品URL、REF、銘柄名のいずれかを入力してください。';return;}",
     '  button.disabled=true;',
     "  message.textContent='登録中...';",
     '  google.script.run',
@@ -893,7 +893,9 @@ function mfImageCollectorOpenTargetRequestQueue() {
 
 function mfImageCollectorCreateTargetDiscoveryRequest(form) {
   var input = mfImageCollectorNormalizeTargetRequestInput_(form || {});
-  if (!input.target_name) throw new Error('銘柄名は必須です。');
+  if (!input.target_name && !input.target_ref && !input.target_url) {
+    throw new Error('公式商品URL、REF、銘柄名のいずれかは必須です。');
+  }
 
   var sheet = mfImageCollectorGetOrCreateTargetQueueSheet_();
   var headers = mfImageCollectorSheetHeaders_(sheet);
@@ -1529,8 +1531,8 @@ function mfImageCollectorNormalizeTargetRequestUrl_(value) {
   var host = String(match[1] || '').toLowerCase();
   var path = String(match[2] || '');
   var allowed = (
-    (host === 'www.mariagefreres.com' && /^\/(en|fr)\//.test(path) && /\.html$/i.test(path)) ||
-    (host === 'www.mariagefreres.co.jp' && /^\/view\/item\//.test(path))
+    ((host === 'www.mariagefreres.com' || host === 'mariagefreres.com') && /^\/(en|fr)\//.test(path) && /\.html$/i.test(path)) ||
+    ((host === 'www.mariagefreres.co.jp' || host === 'mariagefreres.co.jp') && /^\/view\/item\//.test(path))
   );
   if (!allowed) throw new Error('公式商品URLは mariagefreres.com または mariagefreres.co.jp の商品ページだけ指定できます。');
   return url;
@@ -1546,6 +1548,7 @@ function mfImageCollectorNormalizeTargetRequestInput_(input) {
 
 function mfImageCollectorTargetRequestIdentity_(input) {
   if (input.target_ref) return 'ref:' + input.target_ref;
+  if (input.target_url) return 'url:' + String(input.target_url).trim().toLowerCase();
   return 'name:' + mfImageCollectorNormalizeTargetRequestName_(input.target_name);
 }
 
