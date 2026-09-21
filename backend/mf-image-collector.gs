@@ -1202,7 +1202,8 @@ function mfImageCollectorPrepareReviewSheetDisplay_(sheet) {
   var decisionCol = headers.indexOf('人間判定');
   var detectionCol = headers.indexOf('検出種別');
   if (confirmationCol < 0 || decisionCol < 0 || detectionCol < 0) throw new Error('Review display columns are missing.');
-  mfImageCollectorClearReviewConfirmationValidation_(sheet, confirmationCol + 1);
+  mfImageCollectorClearReviewConfirmationValidation_(sheet, confirmationCol + 1, decisionCol + 1);
+  SpreadsheetApp.flush();
   mfImageCollectorApplyReviewValidation_(sheet);
   SpreadsheetApp.flush();
   headers = mfImageCollectorSheetHeaders_(sheet);
@@ -1221,9 +1222,11 @@ function mfImageCollectorPrepareReviewSheetDisplay_(sheet) {
   if (!sheet.isColumnHiddenByUser(detectionCol + 1)) sheet.hideColumns(detectionCol + 1);
 }
 
-function mfImageCollectorClearReviewConfirmationValidation_(sheet, confirmationColumn) {
+function mfImageCollectorClearReviewConfirmationValidation_(sheet, confirmationColumn, decisionColumn) {
   var dataRowCount = Math.max(sheet.getMaxRows() - 1, 0);
-  if (dataRowCount > 0) sheet.getRange(2, confirmationColumn, dataRowCount, 1).clearDataValidations();
+  var firstColumn = Math.min(confirmationColumn, decisionColumn);
+  var columnCount = Math.abs(decisionColumn - confirmationColumn) + 1;
+  if (dataRowCount > 0) sheet.getRange(2, firstColumn, dataRowCount, columnCount).clearDataValidations();
 }
 
 function mfImageCollectorGetOrCreateTargetQueueSheet_() {
