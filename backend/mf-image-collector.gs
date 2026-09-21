@@ -404,7 +404,7 @@ function mfImageCollectorApproveCurrentCategoryNormalizations() {
     ui.ButtonSet.YES_NO
   );
   if (response !== ui.Button.YES) return { ok: false, cancelled: true, target_count: plan.target_count, updated: 0, skipped: plan.skipped };
-  var decisionCol = headers.indexOf('人間判定');
+  var decisionCol = plan.decision_col;
   if (decisionCol < 0) throw new Error('Review sheet is missing 人間判定 column.');
   for (var i = 0; i < plan.eligible_rows.length; i += 1) {
     sheet.getRange(plan.eligible_rows[i] + 2, decisionCol + 1).setValue('既存銘柄を更新');
@@ -3846,23 +3846,23 @@ function mfImageCollectorHasOpenCategoryNormalizationReview_(values, headers, ve
 }
 
 function mfImageCollectorCategoryNormalizationDecisionPlan_(values, headers) {
-  var typeCol = headers.indexOf('検出種別');
-  var sourceCol = headers.indexOf('source_type');
-  var targetCol = headers.indexOf('対象列');
-  var statusCol = headers.indexOf('ステータス');
-  var decisionCol = headers.indexOf('人間判定');
+  var typeCol = mfImageCollectorResolveReviewColumnIndex_(values, headers, '検出種別');
+  var sourceCol = mfImageCollectorResolveReviewColumnIndex_(values, headers, 'source_type');
+  var targetCol = mfImageCollectorResolveReviewColumnIndex_(values, headers, '対象列');
+  var statusCol = mfImageCollectorResolveReviewColumnIndex_(values, headers, 'ステータス');
+  var decisionCol = mfImageCollectorResolveReviewColumnIndex_(values, headers, '人間判定');
   if (typeCol < 0 || sourceCol < 0 || targetCol < 0 || statusCol < 0 || decisionCol < 0) {
     throw new Error('Review columns required for category normalization approval are missing.');
   }
-  var result = { target_count: 0, eligible_rows: [], skipped: 0 };
+  var result = { target_count: 0, eligible_rows: [], skipped: 0, decision_col: decisionCol };
   for (var i = 0; i < values.length; i += 1) {
-    if (String(values[i][typeCol] || '').trim() !== 'structured_fact') continue;
-    if (String(values[i][sourceCol] || '').trim() !== 'category_normalization') continue;
-    if (String(values[i][targetCol] || '').trim() !== '現在のカテゴリ') continue;
-    var status = String(values[i][statusCol] || '').trim();
-    if (MF_IMAGE_COLLECTOR_REVIEW_APPLY_STATUSES.indexOf(status) < 0) continue;
+    if (mfImageCollectorNormalizeReviewLookupText_(values[i][typeCol]) !== 'structured_fact') continue;
+    if (mfImageCollectorNormalizeReviewLookupText_(values[i][sourceCol]) !== 'category_normalization') continue;
+    if (mfImageCollectorNormalizeReviewLookupText_(values[i][targetCol]) !== '現在のカテゴリ') continue;
+    var status = mfImageCollectorNormalizeReviewLookupText_(values[i][statusCol]);
+    if (status !== '要確認' && status !== '保留') continue;
     result.target_count += 1;
-    var decision = String(values[i][decisionCol] || '').trim();
+    var decision = mfImageCollectorNormalizeReviewLookupText_(values[i][decisionCol]);
     if (decision && decision !== '保留') {
       result.skipped += 1;
       continue;
@@ -3870,6 +3870,35 @@ function mfImageCollectorCategoryNormalizationDecisionPlan_(values, headers) {
     result.eligible_rows.push(i);
   }
   return result;
+}
+
+function mfImageCollectorNormalizeReviewLookupText_(value) {
+  return String(value === null || typeof value === 'undefined' ? '' : value)
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
+    .trim();
+}
+
+function mfImageCollectorResolveReviewColumnIndex_(values, headers, expectedHeader) {
+  var normalizedExpected = mfImageCollectorNormalizeReviewLookupText_(expectedHeader);
+  var matches = [];
+  for (var i = 0; i < headers.length; i += 1) {
+    if (mfImageCollectorNormalizeReviewLookupText_(headers[i]) === normalizedExpected) matches.push(i);
+  }
+  if (!matches.length) return -1;
+  var bestIndex = matches[0];
+  var bestScore = -1;
+  for (var m = 0; m < matches.length; m += 1) {
+    var score = 0;
+    for (var r = 0; r < values.length; r += 1) {
+      if (mfImageCollectorNormalizeReviewLookupText_(values[r][matches[m]])) score += 1;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = matches[m];
+    }
+  }
+  return bestIndex;
 }
 
 function mfImageCollectorAuditVanillaTags_() {
