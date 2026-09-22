@@ -2143,7 +2143,11 @@ function mfImageCollectorStructuredFactAllowedColumns_() {
     'ミルクティー推奨': true,
     'アイスティー推奨': true,
     'テインフリー': true,
-    '時間帯タグ': true
+    '時間帯タグ': true,
+    '茶種タグ': true,
+    '水出し用ブレンド': true,
+    '水出し用リファレンス': true,
+    '水出し用根拠／出典': true
   };
 }
 
@@ -2166,7 +2170,7 @@ function mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurre
   var expected = String(candidateCurrentValue || '').trim();
   var incoming = targetColumn === '香味大分類'
     ? mfImageCollectorNormalizeApprovedAromaCategoryValue_(suggestedValue)
-    : mfImageCollectorNormalizeStructuredFactValue_(targetColumn, suggestedValue);
+    : mfImageCollectorNormalizeApprovedStructuredFactCandidate_(targetColumn, suggestedValue);
   if (mfImageCollectorStructuredFactMultiValueColumns_()[targetColumn]) {
     var values = mfImageCollectorDelimitedValues_(actual);
     var expectedValues = mfImageCollectorDelimitedValues_(expected);
@@ -2253,7 +2257,37 @@ function mfImageCollectorNormalizeStructuredFactValue_(targetColumn, value) {
   if (targetColumn === '香味詳細タグ') {
     return mfImageCollectorNormalizeVanillaTagValue_(value);
   }
+  if (targetColumn === '水出し用リファレンス') {
+    return String(value || '').trim().toUpperCase();
+  }
   return String(value || '').trim();
+}
+
+function mfImageCollectorNormalizeApprovedStructuredFactCandidate_(targetColumn, value) {
+  var normalized = mfImageCollectorNormalizeStructuredFactValue_(targetColumn, value);
+  if (targetColumn === '茶種タグ') {
+    var allowedTeaTypes = ['黒茶', '青茶', '緑茶', '白茶', '黄茶', '後発酵茶', 'プーアル茶', '抹茶', 'ルイボス', 'ティザン', 'マテ', 'インフュージョン'];
+    var teaTypes = mfImageCollectorDelimitedValues_(normalized);
+    if (!teaTypes.length || teaTypes.some(function(teaType) { return allowedTeaTypes.indexOf(teaType) < 0; })) {
+      throw new Error('茶種タグ candidate is not in the canonical taxonomy: ' + String(value || ''));
+    }
+    return teaTypes.join('、');
+  }
+  if (targetColumn === '水出し用ブレンド') {
+    if (normalized !== 'はい') throw new Error('水出し用ブレンド candidate must be はい.');
+    return normalized;
+  }
+  if (targetColumn === '水出し用リファレンス') {
+    mfImageCollectorAssertPrimaryReference_(normalized);
+    return normalized;
+  }
+  if (targetColumn === '水出し用根拠／出典') {
+    if (!normalized || (!/^https?:\/\//i.test(normalized) && normalized.indexOf('TFG reference rule:') < 0 && !/公式URL:\s*https?:\/\//i.test(normalized))) {
+      throw new Error('水出し用根拠／出典 candidate must contain a TFG rule or official URL.');
+    }
+    return normalized;
+  }
+  return normalized;
 }
 
 function mfImageCollectorNormalizeApprovedAromaCategoryValue_(value) {
