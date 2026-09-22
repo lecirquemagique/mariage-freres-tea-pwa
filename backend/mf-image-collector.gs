@@ -1824,6 +1824,11 @@ function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
     independent_primary: candidate.independent_primary === true,
     hybrid_reference: candidate.hybrid_reference === true,
     reference_prefix: candidate.reference_prefix || '',
+    tea_type_tag: candidate.tea_type_tag || '',
+    tea_type_evidence: candidate.tea_type_evidence || '',
+    cold_brew_blend: candidate.cold_brew_blend || '',
+    cold_brew_reference: candidate.cold_brew_reference || '',
+    cold_brew_evidence: candidate.cold_brew_evidence || '',
     discovered_image_url: candidate.discovered_image_url || '',
     discovered_image_type: candidate.discovered_image_type || '',
     discovered_image_source_url: candidate.discovered_image_source_url || '',
@@ -2291,11 +2296,23 @@ function mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey) {
 
 function mfImageCollectorBuildApprovedNewTeaRow_(headers, review, referenceInfo, versionKey, versionLabel) {
   var reference = referenceInfo.primaryReference;
+  var info = mfImageCollectorReviewOfficialInfo_(review);
   var officialCategory = mfImageCollectorNormalizeClassificationValueForMaster_(mfImageCollectorReviewOfficialCategory_(review));
   if (mfImageCollectorIsTfbfReference_(reference)) officialCategory = 'ティザン';
-  var teaTypeTag = mfImageCollectorTeaTypeTagFromCategory_(officialCategory);
-  var officialDescription = mfImageCollectorReviewOfficialDescriptionForMaster_(review);
+  var teaTypeTag = mfImageCollectorTeaTypeTagFromCategory_(info.tea_type_tag) || mfImageCollectorTeaTypeTagFromCategory_(officialCategory);
+  if (mfImageCollectorIsTfbfReference_(reference)) teaTypeTag = 'ティザン';
   var officialUrl = String(review['公式URL'] || '').trim();
+  var independentHybridPrimary = referenceInfo.primaryReferenceType === 'independent_hybrid_primary';
+  var coldBrewEvidence = String(info.cold_brew_evidence || '').trim();
+  var primarySkuInfo = mfImageCollectorSalesSkuInfo_(reference);
+  var isTfgPrimary = independentHybridPrimary && primarySkuInfo && primarySkuInfo.prefix === 'TFG';
+  if (isTfgPrimary && !coldBrewEvidence) {
+    coldBrewEvidence = 'TFG reference rule: ' + reference + (officialUrl ? ' / 公式URL: ' + officialUrl : '');
+  }
+  var coldBrewBlend = independentHybridPrimary && (isTfgPrimary || (String(info.cold_brew_blend || '').trim() === 'はい' && !!coldBrewEvidence));
+  var coldBrewReference = coldBrewBlend ? reference : '';
+  if (!coldBrewBlend) coldBrewEvidence = '';
+  var officialDescription = mfImageCollectorReviewOfficialDescriptionForMaster_(review);
   var salesRefs = referenceInfo.salesReferences || {};
   var salesEvidence = mfImageCollectorSalesSkuEvidence_(review);
   return headers.map(function(header) {
@@ -2307,6 +2324,9 @@ function mfImageCollectorBuildApprovedNewTeaRow_(headers, review, referenceInfo,
     if (header === '現在の公式説明') return officialDescription;
     if (header === '現在のカテゴリ') return officialCategory;
     if (header === '茶種タグ') return teaTypeTag;
+    if (header === '水出し用ブレンド' && coldBrewBlend) return 'はい';
+    if (header === '水出し用リファレンス' && coldBrewBlend) return coldBrewReference;
+    if (header === '水出し用根拠／出典' && coldBrewBlend) return coldBrewEvidence;
     if (header === '燻製茶' && mfImageCollectorIsSmokyTeaReference_(reference, salesRefs)) return 'はい';
     if (header === '公式商品ページURL') return officialUrl;
     if (header === '公式商品ページURL状態') return officialUrl ? 'available' : 'pending';
@@ -2419,13 +2439,13 @@ function mfImageCollectorReviewOfficialDescriptionForMaster_(review) {
 function mfImageCollectorTeaTypeTagFromCategory_(category) {
   var normalized = mfImageCollectorNormalizeClassificationValueForMaster_(category);
   if (!normalized) return '';
-  var direct = ['黒茶', '青茶', '緑茶', '白茶', '黄茶', '後発酵茶', 'ルイボス', 'ティザン', 'マテ', 'インフュージョン'];
+  var direct = ['黒茶', '青茶', '緑茶', '白茶', '黄茶', '後発酵茶', 'プーアル茶', '抹茶', 'ルイボス', 'ティザン', 'マテ', 'インフュージョン'];
   for (var i = 0; i < direct.length; i += 1) {
     if (normalized.indexOf(direct[i]) === 0 || normalized.indexOf(direct[i] + '／') === 0 || normalized.indexOf(direct[i] + ',') === 0) {
       return direct[i];
     }
   }
-  return mfImageCollectorNormalizeTeaTypeTagsForMaster_(normalized);
+  return '';
 }
 
 function mfImageCollectorApplySalesSku_(review, targetVersionKey, options) {
@@ -2456,6 +2476,9 @@ function mfImageCollectorApplySalesSku_(review, targetVersionKey, options) {
   });
 
   var evidence = mfImageCollectorSalesSkuEvidence_(review);
+  if (skuInfo.prefix === 'TFG') {
+    evidence = 'TFG reference rule: ' + sku + (evidence ? ' / ' + evidence : '');
+  }
   if (!options.dry_run) {
     if (mapping.flag) mfImageCollectorSetCellByHeader_(sheet, headers, targetRow, mapping.flag, 'はい');
     if (mapping.reference) mfImageCollectorAppendDelimitedCellByHeader_(sheet, headers, targetRow, mapping.reference, sku);
@@ -4401,6 +4424,7 @@ function mfImageCollectorNormalizeTeaTypeTagTokenForMaster_(token) {
   var raw = String(token || '').trim();
   if (!raw) return '';
   var normalized = raw.replace(/™/g, '').toLowerCase();
+  if (/^(?:iced tea|th[ée] glac[ée]e?|cold brew|french summer tea)$/.test(normalized)) return '';
   if (raw === '紅茶') return '黒茶';
   if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir' || normalized === 'smoky tea' || normalized === 'smoky teas') return '黒茶';
   if (raw === 'チザン') return 'ティザン';

@@ -49,7 +49,9 @@ const MASTER_COLUMNS = {
   timeTags: '時間帯タグ',
   icedTeaRecommended: 'アイスティー推奨',
   caffeineFree: 'テインフリー',
+  coldBrewBlend: '水出し用ブレンド',
   tfgReference: '水出し用リファレンス',
+  coldBrewEvidence: '水出し用根拠／出典',
   tbReference: 'TBリファレンス',
   tcReference: 'TCリファレンス',
   teReference: 'TEリファレンス',
@@ -1046,6 +1048,7 @@ function defaultOfficialCategoryForReference(reference) {
 function normalizeTeaTypeTagTokenForMaster(token) {
   const raw = normalizeText(token);
   const normalized = raw.replace(/™/g, '').toLowerCase();
+  if (/^(?:iced tea|th[ée] glac[ée]e?|cold brew|french summer tea)$/.test(normalized)) return '';
   if (raw === '紅茶') return '黒茶';
   if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir') return '黒茶';
   if (raw === 'チザン') return 'ティザン';
@@ -2308,6 +2311,8 @@ function mergeTargetedUnregisteredReview({ reference, pages, primaryPage, source
   const officialCategory = primaryPage.facts?.category || Object.values(categoriesByLanguage)[0] || defaultOfficialCategoryForReference(reference);
   const allSalesReferences = [...new Set(pages.flatMap((page) => page.sales_references || []))];
   const salesReferences = independentHybridPrimary ? {} : salesSkuReferencesByPrefix(allSalesReferences);
+  const teaType = targetedOfficialTeaType(pages);
+  const coldBrew = targetedColdBrewAttributes(reference, pages);
   const skuOnly = primaryPage.sku_only === true && !primaryPage.t_references?.length;
   const tReference = isTfbfReference(reference) || independentHybridPrimary
     ? ''
@@ -2333,6 +2338,11 @@ function mergeTargetedUnregisteredReview({ reference, pages, primaryPage, source
   candidate.independent_primary = independentHybridPrimary;
   candidate.hybrid_reference = independentHybridPrimary;
   candidate.reference_prefix = independentHybridPrimary ? (salesSkuParts(reference)?.prefix || '') : '';
+  candidate.tea_type_tag = teaType.value;
+  candidate.tea_type_evidence = teaType.evidence;
+  candidate.cold_brew_blend = independentHybridPrimary && coldBrew.matched ? 'はい' : '';
+  candidate.cold_brew_reference = independentHybridPrimary && coldBrew.matched ? reference : '';
+  candidate.cold_brew_evidence = independentHybridPrimary && coldBrew.matched ? coldBrew.evidence : '';
   candidate.source_language = Object.keys(urlsByLanguage).join('+') || primaryPage.language;
   candidate.fr_official_url = urlsByLanguage.FR || '';
   candidate.en_official_url = urlsByLanguage.EN || '';
@@ -2609,6 +2619,11 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
       const nameReview = structuredProduct ? officialNameReviewCandidate(structuredProduct, primaryPage.official_name, primaryPage.url) : null;
       if (nameReview) reviewCandidates.push(nameReview);
       reviewCandidates.push(...structuredCandidates);
+      reviewCandidates.push(...independentHybridAttributeReviewCandidates({
+        product: structuredProduct || primaryMasterMatches[0],
+        pages: resolved.pages,
+        reference: resolved.reference,
+      }));
     } else if (salesSkuTarget && existingMaster) {
       // The sales SKU is already present in a Master sales-reference column.
     } else if (salesSkuTarget) {
@@ -3768,6 +3783,94 @@ function independentHybridPrimaryEligibility(reference, page, parentResolution) 
     };
   }
   return { eligible: true, reason: 'official_product_verified' };
+}
+
+function targetedOfficialTextEntries(pages) {
+  const entries = [];
+  for (const page of pages || []) {
+    const facts = page?.facts || {};
+    const values = [
+      facts.category,
+      facts.breadcrumb,
+      facts.productDescription,
+      facts.productSummary,
+      facts.productFlavorSummary,
+      facts.ingredientsText,
+      facts.preparationText,
+      page?.official_name,
+    ];
+    for (const value of values) {
+      const text = normalizeText(value);
+      if (text) entries.push({ text, url: page?.url || facts.url || '', language: page?.language || sourceLanguageFromUrl(page?.url || facts.url) });
+    }
+  }
+  return entries;
+}
+
+function targetedOfficialTeaType(pages) {
+  const rules = [
+    { value: '抹茶', pattern: /\bmatcha\b|抹茶/i },
+    { value: 'プーアル茶', pattern: /\bpu[- ]?erh\b|\bpu'erh\b|プーアル/i },
+    { value: '緑茶', pattern: /\bgreen tea\b|\bth[ée] vert\b|緑茶/i },
+    { value: '黒茶', pattern: /\bblack tea\b|\bth[ée] noir\b|黒茶|紅茶/i },
+    { value: '白茶', pattern: /\bwhite tea\b|\bth[ée] blanc\b|白茶/i },
+    { value: '青茶', pattern: /\bblue tea\b|\bth[ée] bleu\b|\boolong\b|青茶|烏龍/i },
+    { value: 'ルイボス', pattern: /\brooibos\b|ルイボス/i },
+    { value: 'ティザン', pattern: /\btisane\b|\bherbal (?:tea|infusion)\b|\binfusion (?:de plantes|aux plantes|herbal)\b|ティザン/i },
+  ];
+  for (const rule of rules) {
+    for (const entry of targetedOfficialTextEntries(pages)) {
+      const evidence = evidenceSnippet(entry.text, rule.pattern);
+      if (evidence) return { value: rule.value, evidence: `${entry.url} | ${evidence}`, language: entry.language || '' };
+    }
+  }
+  return { value: '', evidence: '', language: '' };
+}
+
+function targetedColdBrewEvidence(pages) {
+  const pattern = /\bcold brew\b|\biced tea\b|\bth[ée] glac[ée]e?\b|\binfusion glac[ée]e?\b|\bprepare\b.{0,60}\b(?:litres?|liters?)\b.{0,60}\biced tea\b/i;
+  for (const entry of targetedOfficialTextEntries(pages)) {
+    const evidence = evidenceSnippet(entry.text, pattern);
+    if (evidence) return { matched: true, evidence: `${entry.url} | ${evidence}`, language: entry.language || '' };
+  }
+  return { matched: false, evidence: '', language: '' };
+}
+
+function targetedColdBrewAttributes(reference, pages) {
+  const normalizedReference = normalizeTargetReference(reference);
+  const detected = targetedColdBrewEvidence(pages);
+  if (salesSkuParts(normalizedReference)?.prefix !== 'TFG') return detected;
+  const officialUrl = normalizeText(pages?.[0]?.url || pages?.[0]?.facts?.url || '');
+  const ruleEvidence = [`TFG reference rule: ${normalizedReference}`, officialUrl ? `official_url=${officialUrl}` : '']
+    .filter(Boolean)
+    .join('; ');
+  return {
+    matched: true,
+    evidence: detected.evidence ? `${ruleEvidence}; official_text=${detected.evidence}` : ruleEvidence,
+    language: detected.language || pages?.[0]?.language || '',
+    reason: 'tfg_reference_rule',
+  };
+}
+
+function independentHybridAttributeReviewCandidates({ product, pages, reference }) {
+  if (!product?.master?.versionKey) return [];
+  const teaType = targetedOfficialTeaType(pages);
+  const coldBrew = targetedColdBrewAttributes(reference, pages);
+  const suggestions = [];
+  if (teaType.value) {
+    suggestions.push({ column: MASTER_COLUMNS.teaTypeTag, suggested_value: teaType.value, evidence_text: teaType.evidence, evidence_language: teaType.language, evidence_url: pages?.[0]?.url || '', source_type: 'official_tea_type', confidence: 'high' });
+  }
+  if (coldBrew.matched) {
+    suggestions.push(
+      { column: MASTER_COLUMNS.coldBrewBlend, suggested_value: 'はい', evidence_text: coldBrew.evidence, evidence_language: coldBrew.language, evidence_url: pages?.[0]?.url || '', source_type: coldBrew.reason || 'official_cold_brew', confidence: 'high' },
+      { column: MASTER_COLUMNS.tfgReference, suggested_value: reference, evidence_text: coldBrew.evidence, evidence_language: coldBrew.language, evidence_url: pages?.[0]?.url || '', source_type: coldBrew.reason || 'official_cold_brew', confidence: 'high' },
+      { column: MASTER_COLUMNS.coldBrewEvidence, suggested_value: coldBrew.evidence, evidence_text: coldBrew.evidence, evidence_language: coldBrew.language, evidence_url: pages?.[0]?.url || '', source_type: coldBrew.reason || 'official_cold_brew', confidence: 'high' },
+    );
+  }
+  const pendingSuggestions = partitionStructuredFactSuggestions(product, suggestions).reviewSuggestions;
+  return pendingSuggestions
+    .map((suggestion) => structuredFactReviewCandidate({ product, facts: pages?.[0]?.facts || {}, suggestion }))
+    .filter(Boolean);
 }
 
 async function processTargetDiscoveryQueueRequest({ context, config, master, baseDir, args, request }) {
