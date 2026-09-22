@@ -621,7 +621,7 @@ function mfImageCollectorApplySelectedReviewRow() {
   }
 
   var salesIdentity = mfImageCollectorReviewSalesSkuIdentity_(review);
-  var salesSku = salesIdentity.sku_info;
+  var salesSku = salesIdentity.is_sales_sku ? salesIdentity.sku_info : null;
   var parent = salesSku ? mfImageCollectorSalesSkuParentForReview_(review, targetVersionKey) : null;
   var lines = [
     '行: ' + rowNumber,
@@ -2072,8 +2072,8 @@ function mfImageCollectorApplyOfficialDescriptionTranslation_(review, options) {
   if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
   var values = sheet.getDataRange().getValues();
   var headers = values[0].map(function(value) { return String(value).trim(); });
-  var targetRow = mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, targetVersionKey, '');
-  if (targetRow < 2) throw new Error('Target master row was not found for official_description_translation: ' + targetVersionKey);
+  var explicitTarget = mfImageCollectorResolveExplicitTargetMasterRow_(values, headers, targetVersionKey);
+  var targetRow = explicitTarget.row_number;
   var descriptionCol = headers.indexOf('現在の公式説明');
   if (descriptionCol < 0) throw new Error('現在の公式説明 column was not found.');
 
@@ -2111,8 +2111,7 @@ function mfImageCollectorApplyStructuredFact_(review, options) {
   }
   var targetRow = resolved
     ? resolved.row_number
-    : mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, targetVersionKey, '');
-  if (targetRow < 2) throw new Error('Target master row was not found for structured_fact: ' + targetVersionKey);
+    : mfImageCollectorResolveExplicitTargetMasterRow_(values, headers, targetVersionKey).row_number;
   var targetCol = headers.indexOf(targetColumn);
   if (targetCol < 0) throw new Error('Target master column was not found for structured_fact: ' + targetColumn);
 
@@ -3002,6 +3001,35 @@ function mfImageCollectorResolveStructuredFactTargetFromMaster_(review) {
   var resolved = mfImageCollectorResolveStructuredFactMasterRow_(values, headers, review);
   mfImageCollectorAssertStructuredFactResolution_(resolved);
   return resolved;
+}
+
+function mfImageCollectorResolveExplicitTargetMasterRow_(values, headers, versionKey) {
+  var normalizedVersionKey = String(versionKey || '').trim().toUpperCase();
+  if (!normalizedVersionKey) throw new Error('Explicit target VersionKey is required.');
+  var versionCol = headers.indexOf('VersionKey');
+  var primaryRefCol = headers.indexOf('Primary Reference');
+  var tRefCol = headers.indexOf('Tリファレンス番号');
+  var nameCol = headers.indexOf('現在の公式名');
+  if (versionCol < 0) throw new Error('VersionKey column is missing.');
+  var matches = [];
+  for (var i = 1; i < values.length; i += 1) {
+    if (String(values[i][versionCol] || '').trim().toUpperCase() !== normalizedVersionKey) continue;
+    var primaryReference = primaryRefCol >= 0 ? String(values[i][primaryRefCol] || '').trim().toUpperCase() : '';
+    var tReference = tRefCol >= 0 ? String(values[i][tRefCol] || '').trim().toUpperCase() : '';
+    var keyMatch = normalizedVersionKey.match(/^([A-Z]+\d[A-Z0-9]*)-[BN]\d{2}$/);
+    var reference = primaryReference || tReference || (keyMatch ? keyMatch[1] : '');
+    if (!reference) throw new Error('Primary Reference cannot be resolved for explicit target VersionKey: ' + normalizedVersionKey);
+    matches.push({
+      row_number: i + 1,
+      version_key: normalizedVersionKey,
+      primary_reference: reference,
+      t_reference: tReference,
+      name: nameCol >= 0 ? String(values[i][nameCol] || '').trim() : ''
+    });
+  }
+  if (matches.length === 0) throw new Error('Explicit target VersionKey was not found in Master: ' + normalizedVersionKey);
+  if (matches.length > 1) throw new Error('Explicit target VersionKey is duplicated in Master: ' + normalizedVersionKey);
+  return matches[0];
 }
 
 function mfImageCollectorAssertStructuredFactResolution_(resolved) {
