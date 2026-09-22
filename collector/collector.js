@@ -2375,6 +2375,15 @@ async function inspectTargetedProductPage(page, url, input, config, debug, sourc
     facts.bodyText,
   ].join('\n');
   const tReferences = [...new Set(extractVerifiedProductTeaReferences(productIdentityText, facts))];
+  const explicitParentIdentityText = [
+    facts.title,
+    facts.h1,
+    facts.productSummary,
+    facts.productDescription,
+    facts.ingredientsText,
+    facts.structuredProductData,
+  ].join('\n');
+  const explicitParentTeaReferences = [...new Set(extractVerifiedProductTeaReferences(explicitParentIdentityText, facts))];
   const salesReferences = [...new Set(extractSalesSkuReferences(productIdentityText))];
   const urlReference = referenceCandidateFromOfficialProductUrl(finalUrl) || referenceCandidateFromOfficialProductUrl(url);
   const verifiedReferences = [...new Set([...tReferences, ...salesReferences])];
@@ -2404,6 +2413,7 @@ async function inspectTargetedProductPage(page, url, input, config, debug, sourc
     official_name: officialName,
     refs: primaryReferences,
     t_references: tReferences,
+    explicit_parent_t_references: explicitParentTeaReferences,
     sales_references: salesReferences,
     reference_type: tReferences.length ? 'tea' : 'sales_sku',
     sku_only: tReferences.length === 0 && salesReferences.length > 0,
@@ -2422,6 +2432,7 @@ function summarizeTargetedPage(page) {
     official_name: page.official_name,
     references: page.refs,
     t_references: page.t_references || [],
+    explicit_parent_t_references: page.explicit_parent_t_references || [],
     sales_references: page.sales_references || [],
     reference_type: page.reference_type || '',
     sku_only: page.sku_only === true,
@@ -3621,11 +3632,12 @@ function targetQueueCompletionFromResult(result, error = null) {
       };
     }
     if (!result.sales_parent_resolution?.resolved) {
+      const parentReason = result.sales_parent_resolution?.reason || 'parent_not_resolved';
       return {
-        status: 'ambiguous',
+        status: parentReason === 'parent_ambiguous' ? 'ambiguous' : 'not_found',
         resultReference: result.resolved_reference || '',
         resultName: result.official_name || '',
-        message: `error:${result.sales_parent_resolution?.reason || 'parent_not_resolved'}`,
+        message: `error:${parentReason}`,
       };
     }
     if (failures.length || result.write_back?.attempted !== true) {
@@ -4109,8 +4121,170 @@ function targetedResolutionFailureReason(rejected, hasResolvableGroups) {
   return 'no_verified_product';
 }
 
+function normalizeTfgParentName(value) {
+  return normalizeText(value)
+    .replace(/[®™]/g, '')
+    .normalize('NFKC')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[®™]/g, '')
+    .replace(/[’'`´]/g, '')
+    .replace(/[‐‑‒–—―\-_/.,:;!?()[\]{}]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+}
+
+function stripTfgNameDecoration(value) {
+  const original = normalizeTfgParentName(value);
+  if (!original) return { name: '', changed: false };
+  const decoration = '(?:ICED TEA|ICED|COLD BREW|COLD INFUSION|THE GLACE|INFUSION A FROID)';
+  let name = original
+    .replace(new RegExp(`^${decoration}\\s+`), '')
+    .replace(new RegExp(`\\s+${decoration}$`), '')
+    .trim();
+  return { name, changed: Boolean(name && name !== original) };
+}
+
+function targetedPageParentNames(page) {
+  const facts = page?.facts || {};
+  const values = [
+    ...(Array.isArray(page?.parent_names) ? page.parent_names : []),
+    ...(Array.isArray(facts.parentTeaNames) ? facts.parentTeaNames : []),
+    facts.parentTeaName,
+    facts.baseTeaName,
+    facts.base_tea_name,
+  ];
+  return [...new Set(values.map(normalizeText).filter(Boolean))];
+}
+
+function uniqueMasterProductsByVersion(products) {
+  const unique = new Map();
+  for (const product of products || []) {
+    const versionKey = normalizeText(product?.master?.versionKey);
+    if (versionKey) unique.set(versionKey, product);
+  }
+  return [...unique.values()];
+}
+
+function targetedParentCandidate(product, matchMethod, page, evidenceText, safe = true, unsafeReason = '') {
+  return {
+    version_key: normalizeText(product?.master?.versionKey),
+    t_reference: normalizeTargetReference(product?.tReference || product?.reference),
+    official_name: product?.name || '',
+    match_method: matchMethod,
+    evidence_url: page?.url || page?.facts?.url || '',
+    evidence_text: compactSnippet(evidenceText || '', 500),
+    safe,
+    unsafe_reason: unsafeReason,
+  };
+}
+
+function targetedParentResolution(sku, products, matchMethod, page, evidenceText) {
+  const unique = uniqueMasterProductsByVersion(products);
+  const candidates = unique.map((product) => targetedParentCandidate(product, matchMethod, page, evidenceText));
+  if (unique.length > 1) {
+    return {
+      sku,
+      resolved: false,
+      resolved_parent: null,
+      resolution_method: '',
+      evidence: candidates.map((candidate) => ({ url: candidate.evidence_url, text: candidate.evidence_text })),
+      candidates,
+      reason: 'parent_ambiguous',
+    };
+  }
+  if (unique.length === 0) return null;
+  const product = unique[0];
+  const resolvedParent = candidates[0];
+  return {
+    sku,
+    resolved: true,
+    reference: resolvedParent.t_reference,
+    versionKey: resolvedParent.version_key,
+    name: resolvedParent.official_name,
+    inMaster: true,
+    resolved_parent: resolvedParent,
+    resolution_method: matchMethod,
+    evidence: [{ url: resolvedParent.evidence_url, text: resolvedParent.evidence_text }],
+    candidates,
+    reason: '',
+  };
+}
+
+function resolveTargetedTfgParent({ sku, page, masterProducts }) {
+  const normalizedSku = normalizeTargetReference(sku);
+  const masterTeaProducts = (masterProducts || []).filter((product) => {
+    const reference = normalizeTargetReference(product?.tReference || product?.reference);
+    return isTeaReference(reference) && normalizeText(product?.master?.versionKey);
+  });
+
+  const registered = masterTeaProducts.filter((product) =>
+    (product?.salesReferences || []).some((reference) => normalizeTargetReference(reference) === normalizedSku)
+  );
+  const registeredResult = targetedParentResolution(normalizedSku, registered, 'master_sales_reference', page, `${normalizedSku} is registered in Master 水出し用リファレンス`);
+  if (registeredResult) return registeredResult;
+
+  const explicitRefs = [...new Set((page?.explicit_parent_t_references || [])
+    .map(normalizeTargetReference)
+    .filter(isTeaReference))];
+  const explicitProducts = masterTeaProducts.filter((product) =>
+    explicitRefs.includes(normalizeTargetReference(product?.tReference || product?.reference))
+  );
+  const explicitResult = targetedParentResolution(normalizedSku, explicitProducts, 'official_explicit_t_reference', page, `Official page references: ${explicitRefs.join(', ')}`);
+  if (explicitResult) return explicitResult;
+
+  const parentNames = targetedPageParentNames(page);
+  if (parentNames.length) {
+    const normalizedParentNames = new Set(parentNames.map(normalizeTfgParentName).filter(Boolean));
+    const namedProducts = masterTeaProducts.filter((product) => normalizedParentNames.has(normalizeTfgParentName(product?.name || '')));
+    const nameResult = targetedParentResolution(normalizedSku, namedProducts, 'official_parent_name', page, `Official parent name: ${parentNames.join(' | ')}`);
+    if (nameResult) return nameResult;
+  }
+
+  const officialName = normalizeText(page?.official_name || '');
+  const undecorated = stripTfgNameDecoration(officialName);
+  if (undecorated.changed) {
+    const decoratedProducts = masterTeaProducts.filter((product) => normalizeTfgParentName(product?.name || '') === undecorated.name);
+    const decorationResult = targetedParentResolution(normalizedSku, decoratedProducts, 'tfg_decorated_name', page, `TFG name decoration removed: ${officialName} -> ${undecorated.name}`);
+    if (decorationResult) return decorationResult;
+  }
+
+  const parts = salesSkuParts(normalizedSku);
+  const suffixReference = parts?.numericSuffix ? `T${parts.suffix}` : '';
+  const suffixProducts = suffixReference
+    ? masterTeaProducts.filter((product) => normalizeTargetReference(product?.tReference || product?.reference) === suffixReference)
+    : [];
+  const safeSuffixProducts = suffixProducts.filter((product) =>
+    normalizeTfgParentName(product?.name || '') === normalizeTfgParentName(officialName)
+  );
+  const suffixResult = targetedParentResolution(normalizedSku, safeSuffixProducts, 'suffix_and_canonical_name', page, `Suffix candidate ${suffixReference}; canonical official name matched`);
+  if (suffixResult) return suffixResult;
+
+  const unsafeCandidates = suffixProducts.map((product) => targetedParentCandidate(
+    product,
+    'suffix_only',
+    page,
+    `Suffix candidate ${suffixReference}; official names did not match`,
+    false,
+    'suffix_without_safe_name_or_official_evidence'
+  ));
+  return {
+    sku: normalizedSku,
+    resolved: false,
+    resolved_parent: null,
+    resolution_method: '',
+    evidence: [],
+    candidates: unsafeCandidates,
+    reason: 'parent_not_resolved',
+  };
+}
+
 function resolveTargetedSalesSkuParent({ sku, page, masterProducts }) {
   if (!isSalesSkuReference(sku) || isTfbfReference(sku)) return { resolved: false, reason: 'not_sales_sku' };
+  if (salesSkuParts(sku)?.prefix === 'TFG') {
+    return resolveTargetedTfgParent({ sku, page, masterProducts });
+  }
   const officialName = normalizeNameForCompare(page?.official_name || '');
   if (!officialName) return { resolved: false, reason: 'official_name_missing' };
   const verifiedTeaRefs = [...new Set((page?.t_references || []).map((ref) => normalizeTargetReference(ref)).filter(isTeaReference))];
@@ -4282,6 +4456,11 @@ async function collectDiscoveryPageFacts(page, pageUrl) {
     const metaDescription = clean(document.querySelector('meta[name="description"]')?.content || '');
     const description = isCommonDescription(metaDescription) ? '' : metaDescription;
     const canonical = document.querySelector('link[rel="canonical"]')?.href || '';
+    const structuredProductData = [...document.querySelectorAll('script[type="application/ld+json"]')]
+      .map((script) => clean(script.textContent || ''))
+      .filter(Boolean)
+      .join('\n')
+      .slice(0, 20000);
     const links = [...document.querySelectorAll('a[href]')].map((anchor) => ({
       href: anchor.href,
       text: clean(anchor.innerText || anchor.textContent),
@@ -4304,6 +4483,7 @@ async function collectDiscoveryPageFacts(page, pageUrl) {
       ingredientsSelector,
       preparationText,
       canonical,
+      structuredProductData,
       links,
       snippet: (productDescription || description || '').slice(0, 800),
       url: location.href,
