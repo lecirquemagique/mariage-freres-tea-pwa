@@ -1131,6 +1131,7 @@ function mfImageCollectorReviewPrimaryReference_(review) {
 
 function mfImageCollectorReviewSalesSkuIdentity_(review) {
   var info = mfImageCollectorReviewOfficialInfo_(review);
+  var detectionType = String(review['検出種別'] || '').trim();
   var displayReference = String(review['Tリファレンス番号'] || '').trim().toUpperCase();
   var jsonReference = String(info.primary_reference || '').trim().toUpperCase();
   var displaySku = mfImageCollectorSalesSkuInfo_(displayReference);
@@ -1138,7 +1139,7 @@ function mfImageCollectorReviewSalesSkuIdentity_(review) {
   var conflict = !!(displaySku && jsonSku && displaySku.sku !== jsonSku.sku);
   var independentHybridPrimary = mfImageCollectorIsIndependentHybridPrimaryReview_(review, info, displaySku || jsonSku);
   return {
-    is_sales_sku: !!(displaySku || jsonSku) && !independentHybridPrimary,
+    is_sales_sku: detectionType === 'sales_sku_detected' && !!(displaySku || jsonSku) && !independentHybridPrimary,
     is_independent_hybrid_primary: independentHybridPrimary,
     sku_info: displaySku || jsonSku || null,
     display_reference: displayReference,
@@ -1164,8 +1165,15 @@ function mfImageCollectorReviewDecisionOptions_(review) {
     return ['既存銘柄を更新', '誤検出', '保留'];
   }
 
-  if (mfImageCollectorReviewSalesSkuIdentity_(review).is_sales_sku) {
+  var referenceIdentity = mfImageCollectorReviewSalesSkuIdentity_(review);
+  if (referenceIdentity.is_independent_hybrid_primary) {
+    return ['新規銘柄として追加', '誤検出', '保留'];
+  }
+  if (referenceIdentity.is_sales_sku) {
     return ['販売SKUとして追加', '誤検出', '保留'];
+  }
+  if ((detectionType === 'unregistered_reference' || detectionType === 'unregistered_reference_image') && referenceIdentity.sku_info) {
+    return ['誤検出', '保留'];
   }
 
   return [
@@ -2484,10 +2492,12 @@ function mfImageCollectorIsIndependentHybridPrimaryReview_(review, info, skuInfo
   var detectionType = String(review['検出種別'] || '').trim();
   if (detectionType !== 'unregistered_reference' && detectionType !== 'unregistered_reference_image') return false;
   if (!skuInfo || !mfImageCollectorIsHybridReference_(skuInfo.sku)) return false;
-  if (info.independent_primary !== true || info.hybrid_reference !== true) return false;
+  var independentByFlags = info.independent_primary === true && info.hybrid_reference === true;
+  var independentByType = String(info.primary_reference_type || '').trim() === 'independent_hybrid_primary';
+  if (!independentByFlags && !independentByType) return false;
   var primary = String(info.primary_reference || review['Tリファレンス番号'] || '').trim().toUpperCase();
   var tReference = String(info.t_reference || '').trim().toUpperCase();
-  return primary === skuInfo.sku && !tReference;
+  return primary === skuInfo.sku && !tReference && info.sku_only !== true;
 }
 
 function mfImageCollectorSalesSkuColumns_(prefix) {
@@ -3188,8 +3198,11 @@ function decisionOptions(it){
   var jsonRef=String(info.primary_reference||'').toUpperCase();
   var isSales=function(ref){return /^(TFG|TJC|TB|TC|TE|TF|TP|TA)\\d+$/.test(ref)||/^TJ[A-Z0-9]+$/.test(ref);};
   var isHybrid=function(ref){return /^(TFG|TJC|TA|TB|TC|TE|TF|TP)\\d+$/.test(ref)||/^TJ[A-Z0-9]+$/.test(ref);};
-  var independent=(it['検出種別']==='unregistered_reference'||it['検出種別']==='unregistered_reference_image')&&info.independent_primary===true&&info.hybrid_reference===true&&isHybrid(jsonRef||displayRef)&&!String(info.t_reference||'');
-  if((isSales(displayRef)||isSales(jsonRef))&&!independent)return ['販売SKUとして追加','誤検出','保留'];
+  var unregistered=it['検出種別']==='unregistered_reference'||it['検出種別']==='unregistered_reference_image';
+  var independent=unregistered&&((info.independent_primary===true&&info.hybrid_reference===true)||info.primary_reference_type==='independent_hybrid_primary')&&isHybrid(jsonRef||displayRef)&&!String(info.t_reference||'')&&info.sku_only!==true;
+  if(independent)return ['新規銘柄として追加','誤検出','保留'];
+  if(it['検出種別']==='sales_sku_detected'&&(isSales(displayRef)||isSales(jsonRef)))return ['販売SKUとして追加','誤検出','保留'];
+  if(unregistered&&(isSales(displayRef)||isSales(jsonRef)))return ['誤検出','保留'];
   return ['新規銘柄として追加','既存銘柄を更新','既存銘柄の新バージョンとして追加','既存銘柄と同一','終売情報として更新','誤検出','保留'];
 }
 function actionControls(it,idx){
