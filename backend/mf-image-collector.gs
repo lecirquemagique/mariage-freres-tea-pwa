@@ -2341,7 +2341,10 @@ function mfImageCollectorBuildApprovedNewTeaRow_(headers, review, referenceInfo,
   var info = mfImageCollectorReviewOfficialInfo_(review);
   var officialCategory = mfImageCollectorNormalizeClassificationValueForMaster_(mfImageCollectorReviewOfficialCategory_(review));
   if (mfImageCollectorIsTfbfReference_(reference)) officialCategory = 'ティザン';
-  var teaTypeTag = mfImageCollectorTeaTypeTagFromCategory_(info.tea_type_tag) || mfImageCollectorTeaTypeTagFromCategory_(officialCategory);
+  var normalizedInfoTeaType = mfImageCollectorNormalizeCurrentCategory_(mfImageCollectorNormalizeTeaTypeTagsForMaster_(info.tea_type_tag));
+  var teaTypeTag = normalizedInfoTeaType.known
+    ? normalizedInfoTeaType.value
+    : mfImageCollectorTeaTypeTagFromCategory_(info.tea_type_tag) || mfImageCollectorTeaTypeTagFromCategory_(officialCategory);
   if (mfImageCollectorIsTfbfReference_(reference)) teaTypeTag = 'ティザン';
   var canonicalCategory = mfImageCollectorNormalizeCurrentCategory_(officialCategory);
   if (canonicalCategory.known) officialCategory = canonicalCategory.value;
@@ -4064,7 +4067,7 @@ function mfImageCollectorAccumulateTaxonomyStats_(summary, currentAroma, detailT
 
 /*
  * 現在のカテゴリは、現在公式で確認できる茶の基本カテゴリを日本語canonical表記で保持する。
- * 産地・香味・時間帯・等級・収穫時期等は含めず、複数茶種を実際に含む場合のみ／区切りで併記する。
+ * 産地・香味・時間帯・等級・収穫時期等は含めず、複数茶種を実際に含む場合のみ「、」区切りで併記する。
  */
 function mfImageCollectorCanonicalCurrentCategories_() {
   return ['黒茶', '緑茶', '青茶', '白茶', '黄茶', 'ルイボス', 'ダージリン', '抹茶', 'プーアル茶', 'ティザン'];
@@ -4152,10 +4155,6 @@ function mfImageCollectorCurrentCategoryNormalizationMap_() {
   };
 }
 
-function mfImageCollectorCanonicalCurrentCategories_() {
-  return ['黒茶', '緑茶', '青茶', '白茶', '黄茶', 'ルイボス', 'ダージリン', '抹茶', 'プーアル茶', 'ティザン'];
-}
-
 function mfImageCollectorIsBeverageCategory_(value) {
   var normalized = String(value || '').normalize('NFKC').replace(/™/g, '').trim().toLowerCase();
   return /^(?:iced tea|th[ée] glac[ée]e?|cold brew|french summer tea)$/.test(normalized);
@@ -4185,6 +4184,10 @@ function mfImageCollectorCanonicalCategoryFromOfficialText_(value) {
 function mfImageCollectorNormalizeCurrentCategory_(value) {
   var raw = String(value || '').replace(/\s+/g, ' ').trim();
   if (!raw) return { known: false, blank: true, current: '', value: '', changed: false };
+  var composite = mfImageCollectorNormalizeCompositeCurrentCategory_(raw);
+  if (composite) {
+    return { known: true, blank: false, current: raw, value: composite, changed: raw !== composite };
+  }
   var lookupKey = mfImageCollectorCurrentCategoryLookupKey_(raw);
   var map = mfImageCollectorCurrentCategoryNormalizationMap_();
   var matchedKey = '';
@@ -4203,23 +4206,43 @@ function mfImageCollectorNormalizeCurrentCategory_(value) {
   return { known: true, blank: false, current: raw, value: mapped, changed: raw !== mapped };
 }
 
+function mfImageCollectorNormalizeCompositeCurrentCategory_(value) {
+  var raw = String(value || '').normalize('NFKC').trim();
+  if (!/[\/／,，・、]/.test(raw)) return '';
+  var parts = raw.split(/[\/／,，・、]/);
+  var allowed = mfImageCollectorCanonicalCurrentCategories_();
+  var normalized = [];
+  for (var i = 0; i < parts.length; i += 1) {
+    var part = String(parts[i] || '').trim();
+    if (!part || allowed.indexOf(part) < 0 || normalized.indexOf(part) >= 0) return '';
+    normalized.push(part);
+  }
+  return normalized.length > 1 ? normalized.join('、') : '';
+}
+
 function mfImageCollectorResolveCurrentCategoryAudit_(currentValue, teaTypeTag, officialDescription) {
   var normalized = mfImageCollectorNormalizeCurrentCategory_(currentValue);
   if (normalized.known || normalized.blank) return normalized;
   if (!mfImageCollectorIsBeverageCategory_(currentValue)) return normalized;
   var evidenceCategory = mfImageCollectorCanonicalCategoryFromOfficialText_(officialDescription);
   var normalizedTeaType = mfImageCollectorNormalizeCurrentCategory_(teaTypeTag);
-  if (!evidenceCategory || !normalizedTeaType.known || normalizedTeaType.value !== evidenceCategory) {
-    return { known: false, blank: false, current: normalized.current, value: '', changed: false, reason: 'beverage category requires matching official tea-type evidence' };
+  if (evidenceCategory && normalizedTeaType.known && normalizedTeaType.value !== evidenceCategory) {
+    return { known: false, blank: false, current: normalized.current, value: '', changed: false, reason: 'official tea-type evidence conflicts with tea type tag' };
+  }
+  var resolvedCategory = evidenceCategory || (normalizedTeaType.known ? normalizedTeaType.value : '');
+  if (!resolvedCategory) {
+    return { known: false, blank: false, current: normalized.current, value: '', changed: false, reason: 'beverage category has no canonical tea-type evidence' };
   }
   return {
     known: true,
     blank: false,
     current: normalized.current,
-    value: evidenceCategory,
-    changed: normalized.current !== evidenceCategory,
-    reason: 'official description and tea type agree',
-    evidence: '公式説明の茶種=' + evidenceCategory + ' / 茶種タグ=' + normalizedTeaType.value
+    value: resolvedCategory,
+    changed: normalized.current !== resolvedCategory,
+    reason: evidenceCategory ? 'official description provides canonical tea type' : 'canonical tea type tag provides tea type',
+    evidence: evidenceCategory
+      ? '公式説明の茶種=' + evidenceCategory + (normalizedTeaType.known ? ' / 茶種タグ=' + normalizedTeaType.value : '')
+      : '茶種タグ=' + normalizedTeaType.value
   };
 }
 
