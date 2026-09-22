@@ -95,6 +95,7 @@ var MF_IMAGE_COLLECTOR_TARGET_QUEUE_HEADERS = [
   'message'
 ];
 var MF_IMAGE_COLLECTOR_TARGET_QUEUE_STATUSES = ['pending', 'processing', 'completed', 'not_found', 'ambiguous', 'error'];
+var MF_IMAGE_COLLECTOR_HYBRID_REFERENCE_PREFIXES = ['TFG', 'TJC', 'TA', 'TB', 'TC', 'TE', 'TF', 'TP', 'TJ'];
 
 function doPost(e) {
   return mfImageCollectorDoPost(e);
@@ -1135,8 +1136,10 @@ function mfImageCollectorReviewSalesSkuIdentity_(review) {
   var displaySku = mfImageCollectorSalesSkuInfo_(displayReference);
   var jsonSku = mfImageCollectorSalesSkuInfo_(jsonReference);
   var conflict = !!(displaySku && jsonSku && displaySku.sku !== jsonSku.sku);
+  var independentHybridPrimary = mfImageCollectorIsIndependentHybridPrimaryReview_(review, info, displaySku || jsonSku);
   return {
-    is_sales_sku: !!(displaySku || jsonSku),
+    is_sales_sku: !!(displaySku || jsonSku) && !independentHybridPrimary,
+    is_independent_hybrid_primary: independentHybridPrimary,
     sku_info: displaySku || jsonSku || null,
     display_reference: displayReference,
     json_reference: jsonReference,
@@ -1600,8 +1603,7 @@ function mfImageCollectorNormalizeTargetRequestRef_(value) {
   if (!ref) return '';
   if (/^T\d+$/.test(ref)) return ref;
   if (mfImageCollectorIsTfbfReference_(ref)) return ref;
-  if (/^(TFG|TJC|TB|TC|TE|TF|TP|TA)\d+$/.test(ref)) return ref;
-  if (/^TJ[A-Z0-9]+$/.test(ref)) return ref;
+  if (mfImageCollectorSalesSkuInfo_(ref)) return ref;
   throw new Error('REFの形式が不正です: ' + ref);
 }
 
@@ -1811,6 +1813,9 @@ function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
     sales_references: candidate.sales_references || {},
     sales_prefix: candidate.sales_prefix || '',
     sku_only: candidate.sku_only === true,
+    independent_primary: candidate.independent_primary === true,
+    hybrid_reference: candidate.hybrid_reference === true,
+    reference_prefix: candidate.reference_prefix || '',
     discovered_image_url: candidate.discovered_image_url || '',
     discovered_image_type: candidate.discovered_image_type || '',
     discovered_image_source_url: candidate.discovered_image_source_url || '',
@@ -2361,18 +2366,20 @@ function mfImageCollectorReviewReferenceInfo_(review) {
   });
 
   var primarySku = mfImageCollectorSalesSkuInfo_(primary);
-  if (primarySku && !salesRefs[primarySku.prefix]) salesRefs[primarySku.prefix] = primarySku.sku;
+  var independentHybridPrimary = mfImageCollectorIsIndependentHybridPrimaryReview_(review, info, primarySku);
+  if (primarySku && !independentHybridPrimary && !salesRefs[primarySku.prefix]) salesRefs[primarySku.prefix] = primarySku.sku;
   var tReference = String(info.t_reference || '').trim().toUpperCase();
+  if (independentHybridPrimary) tReference = '';
   if (mfImageCollectorIsTfbfReference_(primary) && tReference === primary) tReference = '';
   if (!tReference && /^T\d+$/.test(primary)) tReference = primary;
   if (tReference && !/^T\d+$/.test(tReference)) throw new Error('Invalid T reference in review candidate: ' + tReference);
 
   return {
     primaryReference: primary,
-    primaryReferenceType: primarySku ? 'sales_sku' : 'tea',
+    primaryReferenceType: independentHybridPrimary ? 'independent_hybrid_primary' : (primarySku ? 'sales_sku' : 'tea'),
     tReference: tReference,
     salesReferences: salesRefs,
-    skuOnly: primarySku !== null && !tReference
+    skuOnly: !independentHybridPrimary && primarySku !== null && !tReference
   };
 }
 
@@ -2452,11 +2459,35 @@ function mfImageCollectorApplySalesSku_(review, targetVersionKey, options) {
 
 function mfImageCollectorSalesSkuInfo_(sku) {
   var normalized = String(sku || '').trim().toUpperCase();
-  var numeric = normalized.match(/^(TFG|TJC|TB|TC|TE|TF|TP|TA)(\d{2,6})$/);
-  if (numeric) return { sku: normalized, prefix: numeric[1], suffix: numeric[2], numericSuffix: true };
-  var tj = normalized.match(/^(TJ)([A-Z0-9]{2,8})$/);
-  if (tj) return { sku: normalized, prefix: tj[1], suffix: tj[2], numericSuffix: false };
+  var prefixes = MF_IMAGE_COLLECTOR_HYBRID_REFERENCE_PREFIXES
+    .slice()
+    .sort(function(left, right) { return right.length - left.length; });
+  for (var i = 0; i < prefixes.length; i += 1) {
+    var prefix = prefixes[i];
+    if (normalized.indexOf(prefix) !== 0) continue;
+    var suffix = normalized.slice(prefix.length);
+    if (prefix === 'TJ') {
+      if (/^[A-Z0-9]{2,8}$/.test(suffix)) return { sku: normalized, prefix: prefix, suffix: suffix, numericSuffix: false };
+      continue;
+    }
+    if (/^\d{2,6}$/.test(suffix)) return { sku: normalized, prefix: prefix, suffix: suffix, numericSuffix: true };
+  }
   return null;
+}
+
+function mfImageCollectorIsHybridReference_(reference) {
+  var sku = mfImageCollectorSalesSkuInfo_(reference);
+  return !!(sku && MF_IMAGE_COLLECTOR_HYBRID_REFERENCE_PREFIXES.indexOf(sku.prefix) >= 0);
+}
+
+function mfImageCollectorIsIndependentHybridPrimaryReview_(review, info, skuInfo) {
+  var detectionType = String(review['検出種別'] || '').trim();
+  if (detectionType !== 'unregistered_reference' && detectionType !== 'unregistered_reference_image') return false;
+  if (!skuInfo || !mfImageCollectorIsHybridReference_(skuInfo.sku)) return false;
+  if (info.independent_primary !== true || info.hybrid_reference !== true) return false;
+  var primary = String(info.primary_reference || review['Tリファレンス番号'] || '').trim().toUpperCase();
+  var tReference = String(info.t_reference || '').trim().toUpperCase();
+  return primary === skuInfo.sku && !tReference;
 }
 
 function mfImageCollectorSalesSkuColumns_(prefix) {
@@ -3156,7 +3187,9 @@ function decisionOptions(it){
   var displayRef=String(it['Tリファレンス番号']||'').toUpperCase();
   var jsonRef=String(info.primary_reference||'').toUpperCase();
   var isSales=function(ref){return /^(TFG|TJC|TB|TC|TE|TF|TP|TA)\\d+$/.test(ref)||/^TJ[A-Z0-9]+$/.test(ref);};
-  if(isSales(displayRef)||isSales(jsonRef))return ['販売SKUとして追加','誤検出','保留'];
+  var isHybrid=function(ref){return /^(TFG|TJC|TA|TB|TC|TE|TF|TP)\\d+$/.test(ref)||/^TJ[A-Z0-9]+$/.test(ref);};
+  var independent=(it['検出種別']==='unregistered_reference'||it['検出種別']==='unregistered_reference_image')&&info.independent_primary===true&&info.hybrid_reference===true&&isHybrid(jsonRef||displayRef)&&!String(info.t_reference||'');
+  if((isSales(displayRef)||isSales(jsonRef))&&!independent)return ['販売SKUとして追加','誤検出','保留'];
   return ['新規銘柄として追加','既存銘柄を更新','既存銘柄の新バージョンとして追加','既存銘柄と同一','終売情報として更新','誤検出','保留'];
 }
 function actionControls(it,idx){

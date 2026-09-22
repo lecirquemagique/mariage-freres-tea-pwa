@@ -15,7 +15,9 @@ const IMAGE_TYPE_FOLDERS = {
 const DRIVE_THUMBNAIL_SIZE = 'w1200';
 const PRODUCT_URL_DISCOVERY_VERSION = 'official-search-fr-en-jp-v1';
 const PRODUCT_URL_NOT_FOUND_MESSAGE = 'No official product page with exact reference was verified.';
-const SALES_SKU_PREFIXES = ['TFG', 'TJC', 'TB', 'TC', 'TE', 'TF', 'TP', 'TA', 'TJ'];
+const HYBRID_REFERENCE_PREFIXES = ['TFG', 'TJC', 'TA', 'TB', 'TC', 'TE', 'TF', 'TP', 'TJ'];
+const SALES_SKU_PREFIXES = [...HYBRID_REFERENCE_PREFIXES]
+  .sort((left, right) => right.length - left.length);
 const PRIMARY_REFERENCE_BACKFILL_BATCH_SIZE = 100;
 const MASTER_COLUMNS = {
   primaryReference: 'Primary Reference',
@@ -293,6 +295,11 @@ function isLegacyMasterTeaReference(value) {
 
 function isSalesSkuReference(value) {
   return Boolean(salesSkuParts(value));
+}
+
+function isHybridReference(value) {
+  const prefix = salesSkuParts(value)?.prefix || '';
+  return HYBRID_REFERENCE_PREFIXES.includes(prefix);
 }
 
 function canonicalProductReference(value) {
@@ -691,7 +698,9 @@ async function fetchMasterProducts(config, baseDir, debug) {
         reference,
         tReference,
         primaryReference: reference,
-        primaryReferenceType: isSalesSkuReference(reference) ? 'sales_sku' : 'tea',
+        primaryReferenceType: isTfbfReference(reference)
+          ? 'primary_tfbf'
+          : (isHybridReference(reference) && !tReference ? 'independent_hybrid_primary' : (isSalesSkuReference(reference) ? 'sales_sku' : 'primary_t')),
         salesReferences,
         name: normalizeText(row[MASTER_COLUMNS.name]) || normalizeText(row[MASTER_COLUMNS.fallbackName]),
         productUrl,
@@ -2291,16 +2300,16 @@ function targetedMasterMatches(reference, officialName, masterProducts) {
   };
 }
 
-function mergeTargetedUnregisteredReview({ reference, pages, primaryPage, source, masterProducts }) {
+function mergeTargetedUnregisteredReview({ reference, pages, primaryPage, source, masterProducts, independentHybridPrimary = false }) {
   const urlsByLanguage = targetedOfficialUrlByLanguage(pages);
   const namesByLanguage = targetedOfficialNamesByLanguage(pages);
   const descriptionsByLanguage = targetedDescriptionsByLanguage(pages);
   const categoriesByLanguage = targetedCategoriesByLanguage(pages);
   const officialCategory = primaryPage.facts?.category || Object.values(categoriesByLanguage)[0] || defaultOfficialCategoryForReference(reference);
   const allSalesReferences = [...new Set(pages.flatMap((page) => page.sales_references || []))];
-  const salesReferences = salesSkuReferencesByPrefix(allSalesReferences);
+  const salesReferences = independentHybridPrimary ? {} : salesSkuReferencesByPrefix(allSalesReferences);
   const skuOnly = primaryPage.sku_only === true && !primaryPage.t_references?.length;
-  const tReference = isTfbfReference(reference)
+  const tReference = isTfbfReference(reference) || independentHybridPrimary
     ? ''
     : (skuOnly ? '' : (primaryPage.t_references?.find(isTeaReference) || (isTeaReference(reference) ? reference : '')));
   const candidate = buildUnregisteredReferenceReview({
@@ -2314,11 +2323,16 @@ function mergeTargetedUnregisteredReview({ reference, pages, primaryPage, source
     masterProducts,
   });
   candidate.primary_reference = reference;
-  candidate.primary_reference_type = skuOnly || isSalesSkuReference(reference) ? 'sales_sku' : 'tea';
+  candidate.primary_reference_type = independentHybridPrimary
+    ? 'independent_hybrid_primary'
+    : (skuOnly || isSalesSkuReference(reference) ? 'sales_sku' : 'tea');
   candidate.t_reference = tReference;
   candidate.sales_references = salesReferences;
-  candidate.sales_prefix = salesSkuParts(reference)?.prefix || '';
-  candidate.sku_only = skuOnly;
+  candidate.sales_prefix = independentHybridPrimary ? '' : (salesSkuParts(reference)?.prefix || '');
+  candidate.sku_only = independentHybridPrimary ? false : skuOnly;
+  candidate.independent_primary = independentHybridPrimary;
+  candidate.hybrid_reference = independentHybridPrimary;
+  candidate.reference_prefix = independentHybridPrimary ? (salesSkuParts(reference)?.prefix || '') : '';
   candidate.source_language = Object.keys(urlsByLanguage).join('+') || primaryPage.language;
   candidate.fr_official_url = urlsByLanguage.FR || '';
   candidate.en_official_url = urlsByLanguage.EN || '';
@@ -2569,7 +2583,10 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
     const primaryPage = preferredTargetedPage(resolved.pages);
     const masterMatches = targetedMasterMatches(resolved.reference, primaryPage.official_name, master?.products || []);
     const existingMaster = masterMatches.exact.length > 0;
+    const primaryMasterMatches = targetedPrimaryMasterMatches(resolved.reference, master?.products || []);
+    const existingIndependentPrimary = primaryMasterMatches.length > 0;
     const salesSkuTarget = isSalesSkuReference(resolved.reference) && !isTfbfReference(resolved.reference);
+    const hybridReferenceTarget = isHybridReference(resolved.reference);
     const vocabulary = structuredFactVocabulary(master?.products || []);
     const structuredProduct = resolveStructuredFactMasterProduct({
       reference: resolved.reference,
@@ -2587,7 +2604,12 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
     const reviewCandidates = [];
     let unregisteredReview = null;
     let salesParentResolution = null;
-    if (salesSkuTarget && existingMaster) {
+    let independentPrimary = null;
+    if (existingIndependentPrimary) {
+      const nameReview = structuredProduct ? officialNameReviewCandidate(structuredProduct, primaryPage.official_name, primaryPage.url) : null;
+      if (nameReview) reviewCandidates.push(nameReview);
+      reviewCandidates.push(...structuredCandidates);
+    } else if (salesSkuTarget && existingMaster) {
       // The sales SKU is already present in a Master sales-reference column.
     } else if (salesSkuTarget) {
       salesParentResolution = resolveTargetedSalesSkuParent({
@@ -2616,6 +2638,19 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
         salesReview.jp_official_url = salesReview.official_urls_by_language.JP || '';
         salesReview.detection_id = reviewCandidateKey(salesReview);
         reviewCandidates.push(salesReview);
+      } else if (hybridReferenceTarget) {
+        independentPrimary = independentHybridPrimaryEligibility(resolved.reference, primaryPage, salesParentResolution);
+        if (independentPrimary.eligible) {
+          unregisteredReview = mergeTargetedUnregisteredReview({
+            reference: resolved.reference,
+            pages: resolved.pages,
+            primaryPage,
+            source,
+            masterProducts: master?.products || [],
+            independentHybridPrimary: true,
+          });
+          reviewCandidates.push(unregisteredReview);
+        }
       }
     } else if (!existingMaster) {
       unregisteredReview = mergeTargetedUnregisteredReview({
@@ -2637,18 +2672,23 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
       writeBackResults = await writeBackReviewCandidates({ config, baseDir, candidates: reviewCandidates, debug: args.debug });
     }
 
+    const independentHybridMode = independentPrimary?.eligible || (existingIndependentPrimary && hybridReferenceTarget);
     const result = {
       ok: true,
       mode: 'targeted_tea_discovery',
       resolved: true,
       target_input: input,
       resolved_reference: resolved.reference,
-      reference_type: resolved.reference_type || primaryPage.reference_type || (isSalesSkuReference(resolved.reference) ? 'sales_sku' : 'tea'),
-      t_reference: isTfbfReference(resolved.reference)
+      reference_type: independentHybridMode
+        ? 'independent_hybrid_primary'
+        : (resolved.reference_type || primaryPage.reference_type || (isSalesSkuReference(resolved.reference) ? 'sales_sku' : 'tea')),
+      t_reference: isTfbfReference(resolved.reference) || independentHybridMode
         ? ''
         : (primaryPage.t_references?.find(isTeaReference) || (isTeaReference(resolved.reference) ? resolved.reference : '')),
-      sales_references: salesSkuReferencesByPrefix(resolved.pages.flatMap((page) => page.sales_references || [])),
-      sku_only: primaryPage.sku_only === true,
+      sales_references: independentHybridMode
+        ? {}
+        : salesSkuReferencesByPrefix(resolved.pages.flatMap((page) => page.sales_references || [])),
+      sku_only: independentHybridMode ? false : primaryPage.sku_only === true,
       official_name: primaryPage.official_name,
       source_language: primaryPage.language,
       fr_official_url: targetedOfficialUrlByLanguage(resolved.pages).FR || '',
@@ -2657,10 +2697,23 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
       matched_product_pages: resolved.pages.map(summarizeTargetedPage),
       master_existing_match: masterMatches.exact,
       similar_candidates: masterMatches.similar,
-      unregistered: !existingMaster && !salesSkuTarget,
-      sales_sku_target: salesSkuTarget,
-      sales_sku_already_registered: salesSkuTarget && existingMaster,
+      unregistered: Boolean(unregisteredReview),
+      sales_sku_target: salesSkuTarget && !existingIndependentPrimary && !independentPrimary?.eligible,
+      sales_sku_already_registered: salesSkuTarget && existingMaster && !existingIndependentPrimary,
       sales_parent_resolution: salesParentResolution,
+      reference_resolution: {
+        reference: resolved.reference,
+        prefix: salesSkuParts(resolved.reference)?.prefix || '',
+        mode: existingIndependentPrimary
+          ? 'existing_independent_primary'
+          : (salesParentResolution?.resolved
+            ? 'child_sales_sku'
+            : (independentPrimary?.eligible
+              ? 'independent_primary'
+              : (hybridReferenceTarget ? 'hybrid_parent_unresolved' : 'primary'))),
+        parent_resolution: salesParentResolution,
+        independent_primary: independentPrimary,
+      },
       structured_suggestions: structured.officialStructuredFacts?.structured_review_suggestions || [],
       structured_suggestions_skipped: structured.skippedSuggestions || [],
       review_candidates_would_create: reviewCandidates.map((candidate) => ({
@@ -3678,9 +3731,43 @@ function targetQueueCompletionFromResult(result, error = null) {
     resultReference: result.resolved_reference || '',
     resultName: result.official_name || '',
     message: result.unregistered
-      ? `${isTfbfReference(result.resolved_reference) ? 'tfbf' : 'new_reference'}:${result.resolved_reference || ''}; 変更候補レビューへ送信しました。`
+      ? `${isTfbfReference(result.resolved_reference)
+        ? 'tfbf'
+        : (result.reference_resolution?.mode === 'independent_primary' ? 'new_primary' : 'new_reference')}:${result.resolved_reference || ''}; 変更候補レビューへ送信しました。`
       : `existing:${result.master_existing_match?.[0]?.version_key || result.resolved_reference || ''}`,
   };
+}
+
+function targetedPrimaryMasterMatches(reference, masterProducts) {
+  const normalizedReference = normalizeTargetReference(reference);
+  return (masterProducts || []).filter((product) =>
+    normalizeTargetReference(product?.reference || product?.primaryReference) === normalizedReference
+  );
+}
+
+function independentHybridPrimaryEligibility(reference, page, parentResolution) {
+  const normalizedReference = normalizeTargetReference(reference);
+  const prefix = salesSkuParts(normalizedReference)?.prefix || '';
+  if (!HYBRID_REFERENCE_PREFIXES.includes(prefix)) {
+    return { eligible: false, reason: 'not_hybrid_reference' };
+  }
+  const officialUrl = normalizeText(page?.url || page?.facts?.url || '');
+  const officialName = normalizeText(page?.official_name || page?.facts?.h1 || page?.facts?.title || '');
+  const verifiedReferences = new Set([...(page?.refs || []), ...(page?.sales_references || [])].map(normalizeTargetReference));
+  if (!officialUrl || !officialName || !verifiedReferences.has(normalizedReference)) {
+    return { eligible: false, reason: 'official_product_not_verified' };
+  }
+  const explicitParentReferences = (page?.explicit_parent_t_references || []).map(normalizeTargetReference).filter(isTeaReference);
+  const explicitParentNames = targetedPageParentNames(page);
+  if (!parentResolution?.resolved && (explicitParentReferences.length || explicitParentNames.length)) {
+    return {
+      eligible: false,
+      reason: 'explicit_parent_not_resolved',
+      explicit_parent_references: explicitParentReferences,
+      explicit_parent_names: explicitParentNames,
+    };
+  }
+  return { eligible: true, reason: 'official_product_verified' };
 }
 
 async function processTargetDiscoveryQueueRequest({ context, config, master, baseDir, args, request }) {
@@ -4058,13 +4145,14 @@ function extractSalesSkuReferences(text) {
 
 function salesSkuParts(sku) {
   const normalized = String(sku || '').trim().toUpperCase();
-  const numeric = normalized.match(/^(TFG|TJC|TB|TC|TE|TF|TP|TA)(\d{2,6})$/);
-  if (numeric) {
-    return { sku: normalized, prefix: numeric[1], suffix: numeric[2], numericSuffix: true };
-  }
-  const tj = normalized.match(/^(TJ)([A-Z0-9]{2,8})$/);
-  if (tj) {
-    return { sku: normalized, prefix: tj[1], suffix: tj[2], numericSuffix: false };
+  for (const prefix of SALES_SKU_PREFIXES) {
+    if (!normalized.startsWith(prefix)) continue;
+    const suffix = normalized.slice(prefix.length);
+    if (prefix === 'TJ') {
+      if (/^[A-Z0-9]{2,8}$/.test(suffix)) return { sku: normalized, prefix, suffix, numericSuffix: false };
+      continue;
+    }
+    if (/^\d{2,6}$/.test(suffix)) return { sku: normalized, prefix, suffix, numericSuffix: true };
   }
   return null;
 }
@@ -4121,7 +4209,7 @@ function targetedResolutionFailureReason(rejected, hasResolvableGroups) {
   return 'no_verified_product';
 }
 
-function normalizeTfgParentName(value) {
+function normalizeHybridParentName(value) {
   return normalizeText(value)
     .replace(/[®™]/g, '')
     .normalize('NFKC')
@@ -4135,8 +4223,8 @@ function normalizeTfgParentName(value) {
     .toUpperCase();
 }
 
-function stripTfgNameDecoration(value) {
-  const original = normalizeTfgParentName(value);
+function stripHybridNameDecoration(value) {
+  const original = normalizeHybridParentName(value);
   if (!original) return { name: '', changed: false };
   const decoration = '(?:ICED TEA|ICED|COLD BREW|COLD INFUSION|THE GLACE|INFUSION A FROID)';
   let name = original
@@ -4212,7 +4300,7 @@ function targetedParentResolution(sku, products, matchMethod, page, evidenceText
   };
 }
 
-function resolveTargetedTfgParent({ sku, page, masterProducts }) {
+function resolveTargetedHybridParent({ sku, page, masterProducts }) {
   const normalizedSku = normalizeTargetReference(sku);
   const masterTeaProducts = (masterProducts || []).filter((product) => {
     const reference = normalizeTargetReference(product?.tReference || product?.reference);
@@ -4236,17 +4324,17 @@ function resolveTargetedTfgParent({ sku, page, masterProducts }) {
 
   const parentNames = targetedPageParentNames(page);
   if (parentNames.length) {
-    const normalizedParentNames = new Set(parentNames.map(normalizeTfgParentName).filter(Boolean));
-    const namedProducts = masterTeaProducts.filter((product) => normalizedParentNames.has(normalizeTfgParentName(product?.name || '')));
+    const normalizedParentNames = new Set(parentNames.map(normalizeHybridParentName).filter(Boolean));
+    const namedProducts = masterTeaProducts.filter((product) => normalizedParentNames.has(normalizeHybridParentName(product?.name || '')));
     const nameResult = targetedParentResolution(normalizedSku, namedProducts, 'official_parent_name', page, `Official parent name: ${parentNames.join(' | ')}`);
     if (nameResult) return nameResult;
   }
 
   const officialName = normalizeText(page?.official_name || '');
-  const undecorated = stripTfgNameDecoration(officialName);
+  const undecorated = stripHybridNameDecoration(officialName);
   if (undecorated.changed) {
-    const decoratedProducts = masterTeaProducts.filter((product) => normalizeTfgParentName(product?.name || '') === undecorated.name);
-    const decorationResult = targetedParentResolution(normalizedSku, decoratedProducts, 'tfg_decorated_name', page, `TFG name decoration removed: ${officialName} -> ${undecorated.name}`);
+    const decoratedProducts = masterTeaProducts.filter((product) => normalizeHybridParentName(product?.name || '') === undecorated.name);
+    const decorationResult = targetedParentResolution(normalizedSku, decoratedProducts, 'hybrid_decorated_name', page, `Hybrid name decoration removed: ${officialName} -> ${undecorated.name}`);
     if (decorationResult) return decorationResult;
   }
 
@@ -4256,7 +4344,7 @@ function resolveTargetedTfgParent({ sku, page, masterProducts }) {
     ? masterTeaProducts.filter((product) => normalizeTargetReference(product?.tReference || product?.reference) === suffixReference)
     : [];
   const safeSuffixProducts = suffixProducts.filter((product) =>
-    normalizeTfgParentName(product?.name || '') === normalizeTfgParentName(officialName)
+    normalizeHybridParentName(product?.name || '') === normalizeHybridParentName(officialName)
   );
   const suffixResult = targetedParentResolution(normalizedSku, safeSuffixProducts, 'suffix_and_canonical_name', page, `Suffix candidate ${suffixReference}; canonical official name matched`);
   if (suffixResult) return suffixResult;
@@ -4282,8 +4370,8 @@ function resolveTargetedTfgParent({ sku, page, masterProducts }) {
 
 function resolveTargetedSalesSkuParent({ sku, page, masterProducts }) {
   if (!isSalesSkuReference(sku) || isTfbfReference(sku)) return { resolved: false, reason: 'not_sales_sku' };
-  if (salesSkuParts(sku)?.prefix === 'TFG') {
-    return resolveTargetedTfgParent({ sku, page, masterProducts });
+  if (isHybridReference(sku)) {
+    return resolveTargetedHybridParent({ sku, page, masterProducts });
   }
   const officialName = normalizeNameForCompare(page?.official_name || '');
   if (!officialName) return { resolved: false, reason: 'official_name_missing' };
