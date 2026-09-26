@@ -1254,6 +1254,16 @@ function masterHasSuggestedValue(product, column, suggestedValue) {
   return structuredFactSuggestionAlreadyApplied(product, { column, suggested_value: suggestedValue });
 }
 
+function normalizeConfiguredMasterProducts(products) {
+  return (products || []).map((product) => {
+    const primaryReference = canonicalProductReference(product?.primaryReference || product?.reference);
+    return {
+      ...product,
+      primaryReference,
+    };
+  });
+}
+
 function canonicalAromaDetailTerm(value) {
   return normalizeText(value)
     .normalize('NFKC')
@@ -2000,7 +2010,7 @@ async function verifyImageDiscoveredReference({ context, reference, config, page
   }
 }
 
-async function updateDiscoveryCache({ cache, candidates, product, pageUrl, masterReferences, masterProducts = [], context = null, config = {}, debug }) {
+async function updateDiscoveryCache({ cache, candidates, product, pageUrl, masterProducts = [], context = null, config = {}, debug }) {
   const detectedAt = nowIso();
   let added = 0;
   let reviewAdded = 0;
@@ -2016,21 +2026,37 @@ async function updateDiscoveryCache({ cache, candidates, product, pageUrl, maste
       verificationStatus = 'current_verified_product_page';
     }
     if (!reference) continue;
-    if (!masterReferences.has(reference)) {
-      if (info.imageType !== 'liqueur') {
-        let review = buildImageOnlyReviewCandidate({ reference, info, candidate, pageUrl, detectedAt });
-        if (context) {
-          const verified = await verifyImageDiscoveredReference({ context, reference, config, pageUrl, debug });
-          if (verified.ok) {
-            review = enrichImageReviewWithVerifiedPage({ imageReview: review, verifiedPage: verified.page, verifiedPages: verified.pages, source: verified.source, masterProducts });
-          } else {
-            review.evidence = mergeUniqueTextLines(review.evidence, `official_reverify=${verified.reason}; candidate_urls=${(verified.candidate_urls || []).join(',')}; error=${verified.error_message || ''}`);
-          }
-        }
-        if (cacheReviewCandidate(cache, review)) reviewAdded += 1;
+    let referenceResolution = resolveReferenceIdentity({ reference, masterProducts });
+    let verified = null;
+    if (referenceResolution.mode !== 'existing_primary' && info.imageType !== 'liqueur' && context) {
+      verified = await verifyImageDiscoveredReference({ context, reference, config, pageUrl, debug });
+      if (verified.ok) {
+        referenceResolution = resolveReferenceIdentity({ reference, page: verified.page, masterProducts });
       }
+    }
+    if (referenceResolution.mode === 'sales_sku' && referenceResolution.parent_resolution?.resolution_method !== 'master_sales_reference' && verified?.ok) {
+      const review = buildSalesSkuReview({
+        sku: reference,
+        facts: verified.page.facts,
+        url: verified.page.url,
+        source: verified.source,
+        sourceLanguage: verified.page.language,
+        discoverySource: 'image_official_reverify',
+        snippet: verified.page.facts?.snippet || '',
+        parent: referenceResolution.parent_resolution,
+      });
+      applyReferenceResolutionToReview(review, referenceResolution);
+      if (cacheReviewCandidate(cache, review)) reviewAdded += 1;
       continue;
     }
+    if (referenceResolution.mode === 'independent_primary' && verified?.ok) {
+      const imageReview = buildImageOnlyReviewCandidate({ reference, info, candidate, pageUrl, detectedAt });
+      const review = enrichImageReviewWithVerifiedPage({ imageReview, verifiedPage: verified.page, verifiedPages: verified.pages, source: verified.source, masterProducts });
+      applyReferenceResolutionToReview(review, referenceResolution);
+      if (cacheReviewCandidate(cache, review)) reviewAdded += 1;
+      continue;
+    }
+    if (referenceResolution.mode === 'unresolved') continue;
 
     const key = discoveryCacheKey(reference, info.imageType, candidate.url);
     if (cache.images[key]) {
@@ -2592,11 +2618,12 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
     const resolved = resolvableGroups[0];
     const primaryPage = preferredTargetedPage(resolved.pages);
     const masterMatches = targetedMasterMatches(resolved.reference, primaryPage.official_name, master?.products || []);
-    const existingMaster = masterMatches.exact.length > 0;
-    const primaryMasterMatches = targetedPrimaryMasterMatches(resolved.reference, master?.products || []);
-    const existingIndependentPrimary = primaryMasterMatches.length > 0;
-    const salesSkuTarget = isSalesSkuReference(resolved.reference) && !isTfbfReference(resolved.reference);
-    const hybridReferenceTarget = isHybridReference(resolved.reference);
+    const referenceResolution = resolveReferenceIdentity({
+      reference: resolved.reference,
+      page: primaryPage,
+      masterProducts: master?.products || [],
+    });
+    const primaryMasterMatches = referenceResolution.primary_matches || [];
     const vocabulary = structuredFactVocabulary(master?.products || []);
     const structuredProduct = resolveStructuredFactMasterProduct({
       reference: resolved.reference,
@@ -2613,9 +2640,9 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
       : [];
     const reviewCandidates = [];
     let unregisteredReview = null;
-    let salesParentResolution = null;
-    let independentPrimary = null;
-    if (existingIndependentPrimary) {
+    const salesParentResolution = referenceResolution.parent_resolution || null;
+    const independentPrimary = referenceResolution.independent_primary || null;
+    if (referenceResolution.mode === 'existing_primary') {
       const nameReview = structuredProduct ? officialNameReviewCandidate(structuredProduct, primaryPage.official_name, primaryPage.url) : null;
       if (nameReview) reviewCandidates.push(nameReview);
       reviewCandidates.push(...structuredCandidates);
@@ -2624,15 +2651,8 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
         pages: resolved.pages,
         reference: resolved.reference,
       }));
-    } else if (salesSkuTarget && existingMaster) {
-      // The sales SKU is already present in a Master sales-reference column.
-    } else if (salesSkuTarget) {
-      salesParentResolution = resolveTargetedSalesSkuParent({
-        sku: resolved.reference,
-        page: primaryPage,
-        masterProducts: master?.products || [],
-      });
-      if (salesParentResolution.resolved) {
+    } else if (referenceResolution.mode === 'sales_sku') {
+      if (salesParentResolution.resolution_method !== 'master_sales_reference') {
         const salesReview = buildSalesSkuReview({
           sku: resolved.reference,
           facts: primaryPage.facts,
@@ -2651,35 +2671,21 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
         salesReview.fr_official_url = salesReview.official_urls_by_language.FR || '';
         salesReview.en_official_url = salesReview.official_urls_by_language.EN || '';
         salesReview.jp_official_url = salesReview.official_urls_by_language.JP || '';
+        applyReferenceResolutionToReview(salesReview, referenceResolution);
         salesReview.detection_id = reviewCandidateKey(salesReview);
         reviewCandidates.push(salesReview);
-      } else if (hybridReferenceTarget) {
-        independentPrimary = independentHybridPrimaryEligibility(resolved.reference, primaryPage, salesParentResolution);
-        if (independentPrimary.eligible) {
-          unregisteredReview = mergeTargetedUnregisteredReview({
-            reference: resolved.reference,
-            pages: resolved.pages,
-            primaryPage,
-            source,
-            masterProducts: master?.products || [],
-            independentHybridPrimary: true,
-          });
-          reviewCandidates.push(unregisteredReview);
-        }
       }
-    } else if (!existingMaster) {
+    } else if (referenceResolution.mode === 'independent_primary') {
       unregisteredReview = mergeTargetedUnregisteredReview({
         reference: resolved.reference,
         pages: resolved.pages,
         primaryPage,
         source,
         masterProducts: master?.products || [],
+        independentHybridPrimary: isHybridReference(resolved.reference),
       });
+      applyReferenceResolutionToReview(unregisteredReview, referenceResolution);
       reviewCandidates.push(unregisteredReview);
-    } else {
-      const nameReview = structuredProduct ? officialNameReviewCandidate(structuredProduct, primaryPage.official_name, primaryPage.url) : null;
-      if (nameReview) reviewCandidates.push(nameReview);
-      reviewCandidates.push(...structuredCandidates);
     }
 
     let writeBackResults = [];
@@ -2687,7 +2693,8 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
       writeBackResults = await writeBackReviewCandidates({ config, baseDir, candidates: reviewCandidates, debug: args.debug });
     }
 
-    const independentHybridMode = independentPrimary?.eligible || (existingIndependentPrimary && hybridReferenceTarget);
+    const independentHybridMode = (referenceResolution.mode === 'existing_primary' || referenceResolution.mode === 'independent_primary') && isHybridReference(resolved.reference);
+    const compatibility = referenceResolutionCompatibility(referenceResolution);
     const result = {
       ok: true,
       mode: 'targeted_tea_discovery',
@@ -2703,7 +2710,7 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
       sales_references: independentHybridMode
         ? {}
         : salesSkuReferencesByPrefix(resolved.pages.flatMap((page) => page.sales_references || [])),
-      sku_only: independentHybridMode ? false : primaryPage.sku_only === true,
+      sku_only: compatibility.sku_only,
       official_name: primaryPage.official_name,
       source_language: primaryPage.language,
       fr_official_url: targetedOfficialUrlByLanguage(resolved.pages).FR || '',
@@ -2713,22 +2720,10 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
       master_existing_match: masterMatches.exact,
       similar_candidates: masterMatches.similar,
       unregistered: Boolean(unregisteredReview),
-      sales_sku_target: salesSkuTarget && !existingIndependentPrimary && !independentPrimary?.eligible,
-      sales_sku_already_registered: salesSkuTarget && existingMaster && !existingIndependentPrimary,
+      sales_sku_target: compatibility.sales_sku_target,
+      sales_sku_already_registered: referenceResolution.mode === 'sales_sku' && salesParentResolution?.resolution_method === 'master_sales_reference',
       sales_parent_resolution: salesParentResolution,
-      reference_resolution: {
-        reference: resolved.reference,
-        prefix: salesSkuParts(resolved.reference)?.prefix || '',
-        mode: existingIndependentPrimary
-          ? 'existing_independent_primary'
-          : (salesParentResolution?.resolved
-            ? 'child_sales_sku'
-            : (independentPrimary?.eligible
-              ? 'independent_primary'
-              : (hybridReferenceTarget ? 'hybrid_parent_unresolved' : 'primary'))),
-        parent_resolution: salesParentResolution,
-        independent_primary: independentPrimary,
-      },
+      reference_resolution: referenceResolutionForOutput(referenceResolution),
       structured_suggestions: structured.officialStructuredFacts?.structured_review_suggestions || [],
       structured_suggestions_skipped: structured.skippedSuggestions || [],
       review_candidates_would_create: reviewCandidates.map((candidate) => ({
@@ -2754,7 +2749,7 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
   }
 }
 
-async function discoverProductPageUrl(context, product, config, debug, discoveryCache = null, masterReferences = new Set()) {
+async function discoverProductPageUrl(context, product, config, debug, discoveryCache = null, masterProducts = []) {
   const page = await context.newPage();
   const queries = productSearchQueries(product);
   const seen = new Set();
@@ -2788,30 +2783,18 @@ async function discoverProductPageUrl(context, product, config, debug, discovery
           continue;
         }
 
-        const candidates = await collectProductSearchCandidates(page);
-        for (const candidate of candidates) {
-          for (const token of candidateReferenceTokens(candidate)) {
-            if (token === String(product.reference || '').toUpperCase()) continue;
-            if (masterReferences.has(token)) continue;
-            cacheReviewCandidate(discoveryCache, {
-              detected_at: nowIso(),
-              reference: token,
-              official_name: candidate.text || '',
-              detection_type: 'unregistered_reference_search_result',
-              official_url: candidate.href,
-              source_language: sourceLanguageFromUrl(candidate.href || searchUrl),
-              existing_reference: '',
-              existing_version_key: '',
-              existing_name: '',
-              diff_summary: `Unregistered ${token} was discovered in official search results.`,
-              evidence: `search_url=${searchUrl}; query=${query}; result_text=${candidate.text || candidate.closestText || ''}`,
-              status: '要確認',
-              human_decision: '',
-              target_version_key: '',
-              comment: '',
-            });
+          const candidates = await collectProductSearchCandidates(page);
+          for (const candidate of candidates) {
+            for (const token of candidateReferenceTokens(candidate)) {
+              if (token === String(product.reference || '').toUpperCase()) continue;
+              const resolution = resolveReferenceIdentity({ reference: token, masterProducts });
+              // Search-result text alone is not verified official-product evidence.
+              // Only the subsequent product-page inspection may create an actionable review.
+              if (resolution.mode !== 'unresolved' && debug) {
+                console.log(`[url-search-reference] ${token} mode=${resolution.mode}`);
+              }
+            }
           }
-        }
         const urls = candidates
           .map((candidate) => candidate.href)
           .filter((url) => looksLikeProductUrl(url))
@@ -3214,7 +3197,6 @@ async function processProduct({
   reloadExistingPages = true,
   keepPagesOpen = false,
   discoveryCache = null,
-  masterReferences = new Set(),
   masterProducts = [],
 }) {
   const pageInfo = await getProductPage(context, product, { useExistingPages });
@@ -3262,7 +3244,7 @@ async function processProduct({
     const discoveredCandidates = discoveryCache ? discoveryCacheCandidates(discoveryCache, product) : [];
     const allCandidates = [...domCandidates, ...cacheCandidates, ...networkCandidates, ...discoveredCandidates];
     if (discoveryCache) {
-      await updateDiscoveryCache({ cache: discoveryCache, candidates: allCandidates, product, pageUrl, masterReferences, masterProducts, context, config, debug });
+      await updateDiscoveryCache({ cache: discoveryCache, candidates: allCandidates, product, pageUrl, masterProducts, context, config, debug });
     }
 
     if (debug) {
@@ -3756,7 +3738,7 @@ function targetQueueCompletionFromResult(result, error = null) {
 function targetedPrimaryMasterMatches(reference, masterProducts) {
   const normalizedReference = normalizeTargetReference(reference);
   return (masterProducts || []).filter((product) =>
-    normalizeTargetReference(product?.reference || product?.primaryReference) === normalizedReference
+    normalizeTargetReference(product?.primaryReference) === normalizedReference
   );
 }
 
@@ -3772,7 +3754,9 @@ function independentHybridPrimaryEligibility(reference, page, parentResolution) 
   if (!officialUrl || !officialName || !verifiedReferences.has(normalizedReference)) {
     return { eligible: false, reason: 'official_product_not_verified' };
   }
-  const explicitParentReferences = (page?.explicit_parent_t_references || []).map(normalizeTargetReference).filter(isTeaReference);
+  const explicitParentReferences = (page?.explicit_parent_t_references || [])
+    .map(normalizeTargetReference)
+    .filter((candidate) => isTeaReference(candidate) && candidate !== normalizedReference);
   const explicitParentNames = targetedPageParentNames(page);
   if (!parentResolution?.resolved && (explicitParentReferences.length || explicitParentNames.length)) {
     return {
@@ -3783,6 +3767,141 @@ function independentHybridPrimaryEligibility(reference, page, parentResolution) 
     };
   }
   return { eligible: true, reason: 'official_product_verified' };
+}
+
+function independentPrimaryEligibility(reference, page, parentResolution = null) {
+  const normalizedReference = normalizeTargetReference(reference);
+  const officialUrl = normalizeText(page?.url || page?.facts?.url || '');
+  const officialName = normalizeText(page?.official_name || page?.facts?.h1 || page?.facts?.title || '');
+  const verifiedReferences = new Set([...(page?.refs || []), ...(page?.sales_references || [])].map(normalizeTargetReference));
+  if (!normalizedReference || !officialUrl || !officialName || !verifiedReferences.has(normalizedReference)) {
+    return { eligible: false, reason: 'official_product_not_verified' };
+  }
+  const explicitParentReferences = (page?.explicit_parent_t_references || [])
+    .map(normalizeTargetReference)
+    .filter((candidate) => isTeaReference(candidate) && candidate !== normalizedReference);
+  const explicitParentNames = targetedPageParentNames(page);
+  if (!parentResolution?.resolved && (explicitParentReferences.length || explicitParentNames.length)) {
+    return {
+      eligible: false,
+      reason: 'explicit_parent_not_resolved',
+      explicit_parent_references: explicitParentReferences,
+      explicit_parent_names: explicitParentNames,
+    };
+  }
+  return { eligible: true, reason: 'official_product_verified' };
+}
+
+function resolveReferenceIdentity({ reference, page = null, masterProducts = [] }) {
+  const normalizedReference = normalizeTargetReference(reference);
+  if (!normalizedReference) return { mode: 'unresolved', reference: '', reason: 'invalid_reference' };
+
+  const primaryMatches = targetedPrimaryMasterMatches(normalizedReference, masterProducts);
+  if (primaryMatches.length) {
+    return {
+      mode: 'existing_primary',
+      reference: normalizedReference,
+      primary_matches: primaryMatches,
+      parent_resolution: null,
+      reason: 'master_primary_reference_exact',
+    };
+  }
+
+  if (isTfbfReference(normalizedReference)) {
+    const eligibility = independentPrimaryEligibility(normalizedReference, page);
+    return {
+      mode: eligibility.eligible ? 'independent_primary' : 'unresolved',
+      reference: normalizedReference,
+      primary_matches: [],
+      parent_resolution: null,
+      independent_primary: eligibility,
+      reason: eligibility.reason,
+    };
+  }
+
+  if (isHybridReference(normalizedReference)) {
+    const parentResolution = resolveTargetedHybridParent({ sku: normalizedReference, page, masterProducts });
+    if (parentResolution.resolved) {
+      return {
+        mode: 'sales_sku',
+        reference: normalizedReference,
+        primary_matches: [],
+        parent_resolution: parentResolution,
+        reason: parentResolution.resolution_method,
+      };
+    }
+    const eligibility = independentHybridPrimaryEligibility(normalizedReference, page, parentResolution);
+    return {
+      mode: eligibility.eligible ? 'independent_primary' : 'unresolved',
+      reference: normalizedReference,
+      primary_matches: [],
+      parent_resolution: parentResolution,
+      independent_primary: eligibility,
+      reason: eligibility.reason || parentResolution.reason || 'unresolved',
+    };
+  }
+
+  if (isTeaReference(normalizedReference)) {
+    const eligibility = independentPrimaryEligibility(normalizedReference, page);
+    return {
+      mode: eligibility.eligible ? 'independent_primary' : 'unresolved',
+      reference: normalizedReference,
+      primary_matches: [],
+      parent_resolution: null,
+      independent_primary: eligibility,
+      reason: eligibility.reason,
+    };
+  }
+
+  return { mode: 'unresolved', reference: normalizedReference, primary_matches: [], parent_resolution: null, reason: 'unsupported_reference_family' };
+}
+
+function referenceResolutionCompatibility(resolution) {
+  const mode = resolution?.mode || 'unresolved';
+  const hybrid = isHybridReference(resolution?.reference || '');
+  return {
+    sku_only: mode === 'sales_sku',
+    primary_reference_type: mode === 'sales_sku'
+      ? 'sales_sku'
+      : (mode === 'independent_primary' && hybrid ? 'independent_hybrid_primary' : (mode === 'independent_primary' ? 'primary' : '')),
+    independent_primary: mode === 'independent_primary',
+    hybrid_reference: mode === 'independent_primary' && hybrid,
+    sales_sku_target: mode === 'sales_sku',
+  };
+}
+
+function referenceResolutionForOutput(resolution) {
+  return {
+    mode: resolution?.mode || 'unresolved',
+    reference: resolution?.reference || '',
+    reason: resolution?.reason || '',
+    primary_matches: (resolution?.primary_matches || []).map((product) => ({
+      primary_reference: product?.primaryReference || '',
+      version_key: product?.master?.versionKey || '',
+      official_name: product?.name || '',
+    })),
+    parent_resolution: resolution?.parent_resolution || null,
+    independent_primary: resolution?.independent_primary || null,
+  };
+}
+
+function applyReferenceResolutionToReview(candidate, resolution) {
+  const compatibility = referenceResolutionCompatibility(resolution);
+  candidate.reference_resolution = referenceResolutionForOutput(resolution);
+  candidate.target_provenance = resolution.mode === 'sales_sku' || resolution.mode === 'independent_primary'
+    ? 'resolver'
+    : 'legacy_unknown';
+  candidate.primary_reference = resolution.reference;
+  candidate.primary_reference_type = compatibility.primary_reference_type;
+  candidate.sku_only = compatibility.sku_only;
+  candidate.independent_primary = compatibility.independent_primary;
+  candidate.hybrid_reference = compatibility.hybrid_reference;
+  candidate.sales_sku_target = compatibility.sales_sku_target;
+  if (resolution.mode === 'independent_primary') {
+    candidate.t_reference = '';
+    candidate.target_version_key = `${resolution.reference}-B01`;
+  }
+  return candidate;
 }
 
 function targetedOfficialTextEntries(pages) {
@@ -4276,31 +4395,6 @@ function productHasReference(product, reference) {
   if (String(product?.tReference || '').toUpperCase() === normalized) return true;
   if (String(product?.master?.versionKey || '').toUpperCase().startsWith(`${normalized}-B`)) return true;
   return (product?.salesReferences || []).some((ref) => String(ref || '').toUpperCase() === normalized);
-}
-
-function resolveSalesSkuParent({ sku, pageRefs, masterProducts }) {
-  const parts = salesSkuParts(sku);
-  if (!parts) return null;
-  const refs = [...(pageRefs || [])].map((ref) => String(ref || '').toUpperCase()).filter((ref) => /^T\d+$/.test(ref));
-  if (!refs.length) return null;
-
-  let parentReference = '';
-  if (parts.numericSuffix) {
-    parentReference = refs.find((ref) => teaReferenceNumber(ref) === parts.suffix) || '';
-    if (!parentReference) return null;
-  } else if (refs.length === 1) {
-    parentReference = refs[0];
-  } else {
-    return null;
-  }
-
-  const product = findMasterProductByReference(masterProducts, parentReference);
-  return {
-    reference: parentReference,
-    versionKey: product?.master?.versionKey || '',
-    name: product?.name || '',
-    inMaster: Boolean(product),
-  };
 }
 
 function targetedResolutionFailureReason(rejected, hasResolvableGroups) {
@@ -4910,11 +5004,6 @@ async function runEnrichIncompleteRecords({ context, config, master, baseDir, ar
     : args.refs;
   const products = selectEnrichmentProducts(master?.products || [], refs, config.batchSize || 5);
   const vocabulary = structuredFactVocabulary(master?.products || []);
-  const masterReferences = new Set((master?.products || []).flatMap((product) => [
-    product.reference,
-    product.tReference,
-    ...(product.salesReferences || []),
-  ]).filter(Boolean));
   const page = await context.newPage();
   const results = [];
   try {
@@ -4922,7 +5011,7 @@ async function runEnrichIncompleteRecords({ context, config, master, baseDir, ar
       let productUrl = product.productUrl || '';
       let discovery = null;
       if (!hasValue(productUrl)) {
-        discovery = await discoverProductPageUrl(context, product, config, args.debug, null, masterReferences);
+        discovery = await discoverProductPageUrl(context, product, config, args.debug, null, master?.products || []);
         if (discovery.success) productUrl = discovery.url;
       }
       if (!hasValue(productUrl)) {
@@ -6592,11 +6681,6 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
   const sources = config.newReferenceDiscovery?.sources || defaultNewReferenceDiscoverySources();
   const state = normalizeNewReferenceDiscoveryState(readJson(paths.newReferenceDiscoveryStateFile, {}), sources);
   const masterProducts = master?.products || [];
-  const masterReferences = new Set(masterProducts.flatMap((product) => [
-    product.reference,
-    product.tReference,
-    ...(product.salesReferences || []),
-  ]).filter(Boolean));
   const vocabulary = structuredFactVocabulary(masterProducts);
   const maxPages = Number.isFinite(config.newReferenceDiscovery?.maxPagesPerRun) ? config.newReferenceDiscovery.maxPagesPerRun : 8;
   const maxPagesPerSource = Number.isFinite(config.newReferenceDiscovery?.maxPagesPerSourcePerRun)
@@ -6667,7 +6751,17 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
           }
 
           if (pageIsProduct) {
+            const resolutionPage = {
+              url: facts.canonical || facts.url,
+              official_name: facts.h1 || facts.title || '',
+              refs: [...new Set([...pageRefs, ...pageSalesSkus])],
+              t_references: [...pageRefs].filter(isTeaReference),
+              explicit_parent_t_references: [...pageRefs].filter(isTeaReference),
+              sales_references: [...pageSalesSkus],
+              facts,
+            };
             for (const ref of pageRefs) {
+              const referenceResolution = resolveReferenceIdentity({ reference: ref, page: resolutionPage, masterProducts });
               const structuredProduct = resolveStructuredFactMasterProduct({ reference: ref, masterProducts, facts, officialName: facts.h1, debug: args.debug });
               if (structuredProduct) {
                 const structuredFacts = structuredFactReviewCandidatesForProduct({ product: structuredProduct, facts, vocabulary });
@@ -6675,7 +6769,7 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
                   if (cacheReviewCandidate(discoveryCache, candidate)) createdOrQueuedReviews += 1;
                 }
               }
-              if (masterReferences.has(ref)) {
+              if (referenceResolution.mode === 'existing_primary') {
                 existingReferences += 1;
                 const staleReviewId = reviewCandidateKey({ detection_type: 'unregistered_reference', reference: ref });
                 if (discoveryCache.review_candidates?.[staleReviewId] && (facts.productDescription || facts.snippet)) {
@@ -6693,6 +6787,7 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
                 }
                 continue;
               }
+              if (referenceResolution.mode !== 'independent_primary') continue;
               const review = buildUnregisteredReferenceReview({
                 reference: ref,
                 facts,
@@ -6703,6 +6798,7 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
                 snippet: facts.snippet,
                 masterProducts,
               });
+              applyReferenceResolutionToReview(review, referenceResolution);
               if (cacheReviewCandidate(discoveryCache, review)) createdOrQueuedReviews += 1;
               const previousDiscovery = state.discovered_references[ref] || {};
               state.discovered_references[ref] = {
@@ -6718,11 +6814,32 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
             }
 
             for (const sku of pageSalesSkus) {
-              const parent = resolveSalesSkuParent({ sku, pageRefs, masterProducts });
-              if (!parent) {
-                if (args.debug) console.log(`[sales-sku-skip] ${sku} did not match verified page reference(s): ${[...pageRefs].join(',')}`);
+              const referenceResolution = resolveReferenceIdentity({ reference: sku, page: resolutionPage, masterProducts });
+              if (referenceResolution.mode === 'existing_primary') {
+                existingReferences += 1;
                 continue;
               }
+              if (referenceResolution.mode === 'independent_primary') {
+                const review = buildUnregisteredReferenceReview({
+                  reference: sku,
+                  facts,
+                  url: facts.canonical || facts.url,
+                  source,
+                  sourceLanguage: source.language,
+                  discoverySource: pageIsProduct ? 'product_page' : source.source,
+                  snippet: facts.snippet,
+                  masterProducts,
+                });
+                applyReferenceResolutionToReview(review, referenceResolution);
+                if (cacheReviewCandidate(discoveryCache, review)) createdOrQueuedReviews += 1;
+                continue;
+              }
+              if (referenceResolution.mode !== 'sales_sku') {
+                if (args.debug) console.log(`[reference-unresolved] ${sku} reason=${referenceResolution.reason}`);
+                continue;
+              }
+              if (referenceResolution.parent_resolution?.resolution_method === 'master_sales_reference') continue;
+              const parent = referenceResolution.parent_resolution;
               const review = buildSalesSkuReview({
                 sku,
                 facts,
@@ -6733,6 +6850,7 @@ async function runNewReferenceDiscovery({ context, config, paths, master, discov
                 snippet: facts.snippet,
                 parent,
               });
+              applyReferenceResolutionToReview(review, referenceResolution);
               if (cacheReviewCandidate(discoveryCache, review)) createdOrQueuedReviews += 1;
               salesSkus += 1;
             }
@@ -6807,6 +6925,7 @@ async function main() {
   const configlessMode = args.taxonomyDryRun || enrichmentDataIssuesReportRequested || hasValue(args.targetName) || hasValue(args.targetRef) || hasValue(args.targetUrl);
   const config = readJson(configPath, readJson(fallbackConfigPath, configlessMode ? {} : null));
   if (!config) throw new Error(`Config not found: ${configPath}`);
+  if (Array.isArray(config.products)) config.products = normalizeConfiguredMasterProducts(config.products);
   if (args.writeBack !== null) {
     config.writeBack = { ...(config.writeBack || {}), enabled: args.writeBack };
   }
@@ -6915,12 +7034,6 @@ async function main() {
     !args.dryRun &&
     !args.authSetup;
   let targetQueueRequest = null;
-  const masterReferences = new Set((master?.products || config.products || []).flatMap((product) => [
-    product.reference,
-    product.tReference,
-    ...(product.salesReferences || []),
-  ]).filter(Boolean));
-
   if (args.statusJson) {
     console.log(JSON.stringify(buildStatusSummary(config, state, master, products, discoveryCache, newReferenceDiscoveryState)));
     return;
@@ -7088,7 +7201,7 @@ async function main() {
               acquired_at: nowIso(),
               error_message: '',
             }
-          : await discoverProductPageUrl(context, product, config, args.debug, discoveryCache, masterReferences);
+          : await discoverProductPageUrl(context, product, config, args.debug, discoveryCache, master?.products || config.products || []);
         const previous = state.products?.[product.reference] || {};
         const maxRetries = Number.isFinite(config.maxRetries) ? config.maxRetries : 3;
         const normalizedDiscoveryStatus = normalizeProductUrlStatus(discovery.status);
@@ -7182,7 +7295,6 @@ async function main() {
         reloadExistingPages: args.reloadExistingPages,
         keepPagesOpen: Boolean(args.connectCdp),
         discoveryCache,
-        masterReferences,
         masterProducts: master?.products || config.products || [],
       });
       try {
