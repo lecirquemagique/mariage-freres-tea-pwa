@@ -1413,6 +1413,7 @@ function mfImageCollectorRecordReviewCandidate_(payload) {
         'source_type': rowValues['source_type'],
         'confidence': rowValues['confidence']
       });
+      mfImageCollectorApplyReviewValidation_(sheet);
       return { ok: true, action: 'updated_existing', detection_id: detectionId, sheet_row: existingRow };
     }
     return { ok: true, action: 'skipped_existing_final', detection_id: detectionId, sheet_row: existingRow };
