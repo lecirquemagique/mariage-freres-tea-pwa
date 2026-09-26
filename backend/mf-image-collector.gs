@@ -1413,7 +1413,7 @@ function mfImageCollectorRecordReviewCandidate_(payload) {
         'source_type': rowValues['source_type'],
         'confidence': rowValues['confidence']
       });
-      mfImageCollectorApplyReviewValidation_(sheet);
+      mfImageCollectorApplyReviewRowValidation_(sheet, existingRow);
       return { ok: true, action: 'updated_existing', detection_id: detectionId, sheet_row: existingRow };
     }
     return { ok: true, action: 'skipped_existing_final', detection_id: detectionId, sheet_row: existingRow };
@@ -1860,6 +1860,15 @@ function mfImageCollectorApplyReviewValidation_(sheet) {
       mfImageCollectorSetReviewDecisionValidation_(sheet, decisionCol, dataRowCount + 2, maxRows - dataRowCount, MF_IMAGE_COLLECTOR_REVIEW_DECISIONS);
     }
   }
+}
+
+function mfImageCollectorApplyReviewRowValidation_(sheet, rowNumber) {
+  var headers = mfImageCollectorSheetHeaders_(sheet);
+  var decisionCol = headers.indexOf('人間判定') + 1;
+  if (decisionCol < 1) throw new Error('Review decision column is missing.');
+  var values = sheet.getRange(rowNumber, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var review = mfImageCollectorReviewObject_(headers, values);
+  mfImageCollectorSetReviewDecisionValidation_(sheet, decisionCol, rowNumber, 1, mfImageCollectorReviewDecisionOptions_(review));
 }
 
 function mfImageCollectorSetReviewDecisionValidation_(sheet, decisionCol, startRow, rowCount, options) {
