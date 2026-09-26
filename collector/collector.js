@@ -2635,7 +2635,7 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
     const structured = structuredProduct
       ? structuredFactReviewCandidatesForProduct({ product: structuredProduct, facts: primaryPage.facts, vocabulary })
       : { officialStructuredFacts: null, reviewCandidates: [], skippedSuggestions: [] };
-    const structuredCandidates = existingMaster
+    const structuredCandidates = referenceResolution.mode === 'existing_primary'
       ? structured.reviewCandidates.filter((candidate) => hasValue(candidate.target_version_key))
       : [];
     const reviewCandidates = [];
