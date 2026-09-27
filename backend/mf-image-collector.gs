@@ -662,7 +662,9 @@ function mfImageCollectorApplySelectedReviewRow() {
     comment,
     approvedDescription
   );
-  ui.alert('反映完了', '行 ' + rowNumber + ' を「' + result.status + '」に更新しました。', ui.ButtonSet.OK);
+  var completionMessage = '行 ' + rowNumber + ' を「' + result.status + '」に更新しました。';
+  if (result.refresh_error) completionMessage += '\n\nMaster反映成功\nReview再同期失敗\n' + result.refresh_error;
+  ui.alert('反映完了', completionMessage, ui.ButtonSet.OK);
   return result;
 }
 
@@ -706,13 +708,24 @@ function mfImageCollectorApplySelectedReviewRows() {
     '- 反映済み確認（Master書込なし）: ' + counts.already_applied + '件',
     '- 保留: ' + counts.hold + '件',
     '- 誤検出/却下: ' + counts.reject + '件',
-    '',
-    'この' + processItems.length + '件を反映しますか？'
+    ''
   ];
+  if (preflight.dependency_order && preflight.dependency_order.length) {
+    lines.push('依存関係を検出したため、次の順で処理します:');
+    for (var orderIndex = 0; orderIndex < preflight.dependency_order.length; orderIndex += 1) {
+      lines.push((orderIndex + 1) + '. ' + preflight.dependency_order[orderIndex]);
+    }
+    lines.push('');
+  }
+  lines.push('この' + processItems.length + '件を反映しますか？');
   var response = ui.alert('選択行を一括反映', lines.join('\n'), ui.ButtonSet.YES_NO);
   if (response !== ui.Button.YES) return { ok: false, cancelled: true };
 
   var results = [];
+  var selectedRowNumbers = [];
+  for (var selectedRowIndex = 0; selectedRowIndex < range.getNumRows(); selectedRowIndex += 1) {
+    selectedRowNumbers.push(range.getRow() + selectedRowIndex);
+  }
   for (var i = 0; i < processItems.length; i += 1) {
     var item = processItems[i];
     try {
@@ -721,7 +734,8 @@ function mfImageCollectorApplySelectedReviewRows() {
         item.decision,
         item.target_version_key,
         item.comment,
-        item.approved_japanese_description
+        item.approved_japanese_description,
+        { refresh_excluded_rows: selectedRowNumbers }
       ));
     } catch (error) {
       var remaining = processItems.length - i - 1;
@@ -741,7 +755,8 @@ function mfImageCollectorApplySelectedReviewRows() {
     '既に反映済み（Master書込なし）: ' + summary.already_applied + '件\n' +
     '保留: ' + summary.hold + '件\n' +
     '却下: ' + summary.reject + '件\n' +
-    '失敗: 0件',
+    '失敗: 0件' +
+    (summary.refresh_errors.length ? '\n\nMaster反映成功\nReview再同期失敗\n' + summary.refresh_errors.join('\n') : ''),
     ui.ButtonSet.OK
   );
   return { ok: true, results: results, summary: summary };
@@ -750,24 +765,236 @@ function mfImageCollectorApplySelectedReviewRows() {
 function mfImageCollectorPreflightReviewRows_(sheet, startRow, rowCount) {
   var headers = mfImageCollectorSheetHeaders_(sheet);
   var values = sheet.getRange(startRow, 1, rowCount, sheet.getLastColumn()).getValues();
+  var selected = [];
+  for (var selectedIndex = 0; selectedIndex < values.length; selectedIndex += 1) {
+    selected.push({
+      row_number: startRow + selectedIndex,
+      review: mfImageCollectorReviewObject_(headers, values[selectedIndex])
+    });
+  }
+  var plan = mfImageCollectorPlanReviewDependencies_(sheet, selected);
   var items = [];
-  var errors = [];
+  var errors = plan.errors.slice();
   var counts = { apply: 0, hold: 0, reject: 0, skip_finalized: 0, already_applied: 0, error: 0 };
-  for (var i = 0; i < values.length; i += 1) {
-    var rowNumber = startRow + i;
+  counts.error = errors.length;
+  if (errors.length) return { selected_count: rowCount, items: items, errors: errors, counts: counts, dependency_order: plan.order_labels };
+
+  var masterSnapshot = mfImageCollectorMasterSnapshot_();
+  for (var i = 0; i < plan.ordered.length; i += 1) {
+    var selectedItem = plan.ordered[i];
     try {
-      var item = mfImageCollectorPreflightReviewRow_(rowNumber, mfImageCollectorReviewObject_(headers, values[i]));
+      var item = mfImageCollectorPreflightReviewRow_(selectedItem.row_number, selectedItem.review, {
+        master_snapshot: masterSnapshot,
+        simulate_write: true
+      });
       items.push(item);
       counts[item.category] += 1;
     } catch (error) {
-      errors.push('行 ' + rowNumber + ': ' + error.message);
+      errors.push('行 ' + selectedItem.row_number + ': ' + mfImageCollectorFriendlyDependencyError_(selectedItem, error, plan));
       counts.error += 1;
     }
   }
-  return { selected_count: rowCount, items: items, errors: errors, counts: counts };
+  return { selected_count: rowCount, items: items, errors: errors, counts: counts, dependency_order: plan.order_labels };
 }
 
-function mfImageCollectorPreflightReviewRow_(rowNumber, review) {
+function mfImageCollectorMasterSnapshot_() {
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  return {
+    values: values,
+    headers: values[0].map(function(value) { return String(value).trim(); })
+  };
+}
+
+function mfImageCollectorReviewPrimaryProducer_(item) {
+  var review = item.review;
+  var status = String(review['ステータス'] || '').trim();
+  var decision = String(review['人間判定'] || '').trim();
+  if (MF_IMAGE_COLLECTOR_REVIEW_APPLY_STATUSES.indexOf(status) < 0 || decision !== '新規銘柄として追加') return null;
+  try {
+    var info = mfImageCollectorReviewReferenceInfo_(review);
+    return {
+      row_number: item.row_number,
+      reference: info.primaryReference,
+      version_key: String(review['対象VersionKey'] || '').trim().toUpperCase() || info.primaryReference + '-B01',
+      name: String(review['公式名'] || '').trim(),
+      item: item
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+function mfImageCollectorReviewDependency_(item, snapshot) {
+  var review = item.review;
+  var status = String(review['ステータス'] || '').trim();
+  if (MF_IMAGE_COLLECTOR_REVIEW_APPLY_STATUSES.indexOf(status) < 0) return null;
+  var decision = String(review['人間判定'] || '').trim();
+  var detectionType = String(review['検出種別'] || '').trim();
+  if (detectionType === 'structured_fact' && decision === '既存銘柄を更新') {
+    var explicitStructuredTarget = String(review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim().toUpperCase();
+    if (explicitStructuredTarget) {
+      try {
+        mfImageCollectorResolveExplicitTargetMasterRow_(snapshot.values, snapshot.headers, explicitStructuredTarget);
+        return null;
+      } catch (explicitError) {
+        var structuredReference = String(review['Tリファレンス番号'] || '').trim().toUpperCase();
+        return { type: 'structured_fact', reference: structuredReference, version_key: explicitStructuredTarget };
+      }
+    }
+    var resolved = mfImageCollectorResolveStructuredFactMasterRow_(snapshot.values, snapshot.headers, review);
+    if (resolved.ok) return null;
+    return {
+      type: 'structured_fact',
+      reference: String(review['Tリファレンス番号'] || '').trim().toUpperCase(),
+      version_key: ''
+    };
+  }
+  if (decision === '販売SKUとして追加') {
+    var identity = mfImageCollectorReviewSalesSkuIdentity_(review);
+    if (!identity.sku_info) return null;
+    var targetVersionKey = String(review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim().toUpperCase();
+    try {
+      var currentParent = mfImageCollectorResolveSalesSkuParent_(review, targetVersionKey, identity.sku_info, snapshot.values, snapshot.headers);
+      if (currentParent) return null;
+    } catch (parentError) {
+    }
+    var info = mfImageCollectorReviewOfficialInfo_(review);
+    var parentResolution = info.reference_resolution && info.reference_resolution.parent_resolution
+      ? info.reference_resolution.parent_resolution
+      : {};
+    var resolvedParent = parentResolution.resolved_parent || {};
+    return {
+      type: 'sales_sku',
+      reference: String(parentResolution.reference || resolvedParent.t_reference || review['DB既存T'] || '').trim().toUpperCase(),
+      version_key: String(parentResolution.versionKey || resolvedParent.version_key || targetVersionKey || '').trim().toUpperCase()
+    };
+  }
+  return null;
+}
+
+function mfImageCollectorPlanReviewDependencies_(sheet, selected) {
+  var snapshot = mfImageCollectorMasterSnapshot_();
+  var allHeaders = mfImageCollectorSheetHeaders_(sheet);
+  var allRowCount = Math.max(sheet.getLastRow() - 1, 0);
+  var allValues = allRowCount > 0
+    ? sheet.getRange(2, 1, allRowCount, sheet.getLastColumn()).getValues()
+    : [];
+  var allItems = allValues.map(function(row, index) {
+    return { row_number: index + 2, review: mfImageCollectorReviewObject_(allHeaders, row) };
+  });
+  var selectedRows = {};
+  for (var i = 0; i < selected.length; i += 1) selectedRows[selected[i].row_number] = true;
+  var allProducers = {};
+  for (var allIndex = 0; allIndex < allItems.length; allIndex += 1) {
+    var producer = mfImageCollectorReviewPrimaryProducer_(allItems[allIndex]);
+    if (!producer) continue;
+    if (!allProducers[producer.reference]) allProducers[producer.reference] = [];
+    allProducers[producer.reference].push(producer);
+  }
+
+  var edges = {};
+  var indegree = {};
+  var errors = [];
+  var dependencyRows = {};
+  for (var itemIndex = 0; itemIndex < selected.length; itemIndex += 1) {
+    var item = selected[itemIndex];
+    edges[item.row_number] = [];
+    indegree[item.row_number] = 0;
+  }
+  for (var dependencyIndex = 0; dependencyIndex < selected.length; dependencyIndex += 1) {
+    var dependent = selected[dependencyIndex];
+    var dependency = mfImageCollectorReviewDependency_(dependent, snapshot);
+    if (!dependency) continue;
+    var candidates = allProducers[dependency.reference] || [];
+    if (dependency.version_key) {
+      candidates = candidates.filter(function(candidate) { return candidate.version_key === dependency.version_key; });
+    }
+    if (candidates.length !== 1) {
+      errors.push(mfImageCollectorMissingDependencyMessage_(dependent, dependency, candidates));
+      continue;
+    }
+    var parent = candidates[0];
+    if (!selectedRows[parent.row_number]) {
+      errors.push(mfImageCollectorMissingDependencyMessage_(dependent, dependency, candidates));
+      continue;
+    }
+    edges[parent.row_number].push(dependent.row_number);
+    indegree[dependent.row_number] += 1;
+    dependencyRows[dependent.row_number] = parent.row_number;
+  }
+
+  var byRow = {};
+  for (var mapIndex = 0; mapIndex < selected.length; mapIndex += 1) byRow[selected[mapIndex].row_number] = selected[mapIndex];
+  var ready = selected.filter(function(item) { return indegree[item.row_number] === 0; });
+  var ordered = [];
+  while (ready.length) {
+    ready.sort(mfImageCollectorReviewDependencyOrderCompare_);
+    var next = ready.shift();
+    ordered.push(next);
+    var children = edges[next.row_number] || [];
+    for (var childIndex = 0; childIndex < children.length; childIndex += 1) {
+      indegree[children[childIndex]] -= 1;
+      if (indegree[children[childIndex]] === 0) ready.push(byRow[children[childIndex]]);
+    }
+  }
+  if (ordered.length !== selected.length) errors.push('依存関係にcycleがあるため一括反映できません。');
+  var hasDependencies = Object.keys(dependencyRows).length > 0;
+  return {
+    ordered: ordered,
+    errors: errors,
+    dependencies: dependencyRows,
+    producer_rows: allProducers,
+    order_labels: hasDependencies && !errors.length ? ordered.map(mfImageCollectorReviewDependencyLabel_) : []
+  };
+}
+
+function mfImageCollectorReviewDependencyOrderCompare_(left, right) {
+  function rank(item) {
+    if (mfImageCollectorReviewPrimaryProducer_(item)) return 0;
+    if (String(item.review['検出種別'] || '').trim() === 'structured_fact') return 1;
+    if (String(item.review['人間判定'] || '').trim() === '販売SKUとして追加') return 2;
+    return 3;
+  }
+  var rankDifference = rank(left) - rank(right);
+  return rankDifference || left.row_number - right.row_number;
+}
+
+function mfImageCollectorReviewDependencyLabel_(item) {
+  var review = item.review;
+  var reference = String(review['Tリファレンス番号'] || '').trim();
+  var name = String(review['公式名'] || '').trim();
+  var kind = mfImageCollectorReviewPrimaryProducer_(item)
+    ? '新規Primary'
+    : (String(review['検出種別'] || '').trim() === 'structured_fact' ? 'structured_fact' : 'sales_sku');
+  return 'Row ' + item.row_number + ' ' + reference + (name ? ' / ' + name : '') + ' ' + kind;
+}
+
+function mfImageCollectorMissingDependencyMessage_(item, dependency, candidates) {
+  var review = item.review;
+  var name = String(review['公式名'] || '').trim() || String(review['Tリファレンス番号'] || '').trim();
+  var required = dependency.reference || dependency.version_key || '対象Primary';
+  if (candidates.length === 1) {
+    var candidate = candidates[0];
+    return '行 ' + item.row_number + ' ' + name + ' の更新には、先に ' + required + ' をMasterへ追加する必要があります。\n' +
+      '先に処理する候補: 行 ' + candidate.row_number + ' ' + candidate.reference + (candidate.name ? ' / ' + candidate.name : '') + '\n' +
+      '行 ' + candidate.row_number + 'を選択に追加して再実行するか、先にその行だけ反映してください。';
+  }
+  if (candidates.length > 1) {
+    return '行 ' + item.row_number + ' ' + name + ' が必要とする ' + required + ' の新規Primary候補が複数あります: ' +
+      candidates.map(function(candidate) { return '行 ' + candidate.row_number; }).join(', ') + '。対象を一意にしてください。';
+  }
+  return '行 ' + item.row_number + ' ' + name + ' の更新に必要なPrimary ' + required + ' がMasterになく、選択可能な新規Primary候補も見つかりません。';
+}
+
+function mfImageCollectorFriendlyDependencyError_(item, error, plan) {
+  return error && error.message ? error.message : String(error);
+}
+
+function mfImageCollectorPreflightReviewRow_(rowNumber, review, options) {
+  options = options || {};
   var status = String(review['ステータス'] || '').trim();
   if (MF_IMAGE_COLLECTOR_REVIEW_APPLY_STATUSES.indexOf(status) < 0) {
     if (MF_IMAGE_COLLECTOR_REVIEW_FINAL_STATUSES.indexOf(status) < 0) {
@@ -787,11 +1014,13 @@ function mfImageCollectorPreflightReviewRow_(rowNumber, review) {
   var targetVersionKey = String(review['対象VersionKey'] || '').trim();
   var comment = String(review['コメント'] || '').trim();
   var approvedDescription = String(review['承認済み日本語説明'] || '').trim();
-  mfImageCollectorAssertReviewDecisionAllowed_(review, decision, targetVersionKey, approvedDescription);
+  mfImageCollectorAssertReviewDecisionAllowed_(review, decision, targetVersionKey, approvedDescription, options);
   var result = mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey, {
     dry_run: true,
     target_version_key: targetVersionKey,
-    approved_japanese_description: approvedDescription
+    approved_japanese_description: approvedDescription,
+    master_snapshot: options.master_snapshot || null,
+    simulate_write: options.simulate_write === true
   });
   return {
     row_number: rowNumber,
@@ -811,11 +1040,12 @@ function mfImageCollectorBatchReviewCategory_(review, decision) {
 }
 
 function mfImageCollectorSummarizeBatchReviewResults_(results) {
-  var summary = { hold: 0, reject: 0, already_applied: 0 };
+  var summary = { hold: 0, reject: 0, already_applied: 0, refresh_errors: [] };
   for (var i = 0; i < results.length; i += 1) {
     if (results[i].status === '保留') summary.hold += 1;
     if (results[i].status === '却下') summary.reject += 1;
     if (results[i].already_applied) summary.already_applied += 1;
+    if (results[i].refresh_error) summary.refresh_errors.push('行 ' + results[i].row_number + ': ' + results[i].refresh_error);
   }
   return summary;
 }
@@ -1246,7 +1476,8 @@ function mfImageCollectorReviewDecisionOptions_(review) {
   ];
 }
 
-function mfImageCollectorAssertReviewDecisionAllowed_(review, decision, targetVersionKey, approvedJapaneseDescription) {
+function mfImageCollectorAssertReviewDecisionAllowed_(review, decision, targetVersionKey, approvedJapaneseDescription, options) {
+  options = options || {};
   var normalizedDecision = String(decision || '').trim();
   var allowed = mfImageCollectorReviewDecisionOptions_(review);
   if (allowed.indexOf(normalizedDecision) < 0) {
@@ -1259,7 +1490,15 @@ function mfImageCollectorAssertReviewDecisionAllowed_(review, decision, targetVe
     if (salesIdentity.conflict) {
       throw new Error('表示REFと公式情報JSONの販売SKUが一致しません。');
     }
-    var parent = mfImageCollectorSalesSkuParentForReview_(review, targetVersionKey);
+    var parent = options.master_snapshot
+      ? mfImageCollectorResolveSalesSkuParent_(
+          review,
+          targetVersionKey,
+          skuInfo,
+          options.master_snapshot.values,
+          options.master_snapshot.headers
+        )
+      : mfImageCollectorSalesSkuParentForReview_(review, targetVersionKey);
     if (!parent) {
       throw new Error('販売SKUの親Tを現在のMasterから安全に一意解決できません。対象VersionKeyを明示してください: ' + skuInfo.sku);
     }
@@ -1308,7 +1547,8 @@ function mfImageCollectorEnsureReviewFilter_(sheet) {
   sheet.getRange(1, 1, rowCount, sheet.getLastColumn()).createFilter();
 }
 
-function mfImageCollectorApplyReviewDecision(rowNumber, decision, targetVersionKey, comment, approvedJapaneseDescription) {
+function mfImageCollectorApplyReviewDecision(rowNumber, decision, targetVersionKey, comment, approvedJapaneseDescription, internalOptions) {
+  internalOptions = internalOptions || {};
   var sheet = mfImageCollectorGetOrCreateReviewSheet_();
   var row = Number(rowNumber);
   if (!row || row < 2 || row > sheet.getLastRow()) throw new Error('Invalid review row.');
@@ -1356,12 +1596,265 @@ function mfImageCollectorApplyReviewDecision(rowNumber, decision, targetVersionK
     reviewUpdates['DB既存名'] = applyResult.name || '';
   }
   mfImageCollectorSetReviewRowValues_(sheet, row, reviewUpdates);
+  var refreshResult = null;
+  var refreshError = '';
+  var masterChange = mfImageCollectorReviewMasterChange_(review, decision, applyResult, reviewUpdates['対象VersionKey']);
+  if (masterChange) {
+    try {
+      var excludedRows = (internalOptions.refresh_excluded_rows || []).slice();
+      if (excludedRows.indexOf(row) < 0) excludedRows.push(row);
+      refreshResult = mfImageCollectorRefreshDependentReviews_(masterChange, { excluded_rows: excludedRows });
+      if (refreshResult.errors && refreshResult.errors.length) {
+        refreshError = refreshResult.errors.map(function(error) {
+          return 'Row ' + error.row_number + ': ' + error.error;
+        }).join('\n');
+      }
+    } catch (refreshFailure) {
+      refreshError = refreshFailure && refreshFailure.message ? refreshFailure.message : String(refreshFailure);
+    }
+  }
   return {
     ok: true,
     row_number: row,
     status: finalStatus,
     decision: decision,
-    already_applied: !!(applyResult && applyResult.already_applied)
+    already_applied: !!(applyResult && applyResult.already_applied),
+    refresh: refreshResult,
+    refresh_error: refreshError
+  };
+}
+
+function mfImageCollectorReviewMasterChange_(review, decision, applyResult, targetVersionKey) {
+  if (!applyResult || applyResult.already_applied) return null;
+  if (decision === '新規銘柄として追加' || decision === '既存銘柄の新バージョンとして追加') {
+    return {
+      type: 'primary_created',
+      primary_reference: String(applyResult.primary_reference || '').trim().toUpperCase(),
+      version_key: String(applyResult.target_version_key || targetVersionKey || '').trim().toUpperCase()
+    };
+  }
+  if (decision === '販売SKUとして追加') {
+    return {
+      type: 'sales_sku_registered',
+      primary_reference: String(applyResult.primary_reference || '').trim().toUpperCase(),
+      version_key: String(applyResult.target_version_key || targetVersionKey || '').trim().toUpperCase(),
+      sales_sku: String(applyResult.sales_sku || review['Tリファレンス番号'] || '').trim().toUpperCase()
+    };
+  }
+  return null;
+}
+
+function mfImageCollectorRefreshDependentReviews_(change, options) {
+  options = options || {};
+  var excludedRows = options.excluded_rows || [];
+  var excluded = {};
+  for (var excludedIndex = 0; excludedIndex < excludedRows.length; excludedIndex += 1) excluded[excludedRows[excludedIndex]] = true;
+  var reviewSheet = mfImageCollectorGetOrCreateReviewSheet_();
+  var reviewValues = reviewSheet.getDataRange().getValues();
+  if (reviewValues.length < 2) return { refreshed: 0, skipped: 0, errors: [] };
+  var reviewHeaders = reviewValues[0].map(function(value) { return String(value).trim(); });
+  var masterSnapshot = mfImageCollectorMasterSnapshot_();
+  var refreshed = [];
+  var skipped = 0;
+  var errors = [];
+
+  for (var rowIndex = 1; rowIndex < reviewValues.length; rowIndex += 1) {
+    var rowNumber = rowIndex + 1;
+    if (excluded[rowNumber]) continue;
+    var review = mfImageCollectorReviewObject_(reviewHeaders, reviewValues[rowIndex]);
+    var status = String(review['ステータス'] || '').trim();
+    if (MF_IMAGE_COLLECTOR_REVIEW_APPLY_STATUSES.indexOf(status) < 0) continue;
+    if (!mfImageCollectorReviewDependsOnMasterChange_(review, change, masterSnapshot)) continue;
+    try {
+      var updates = mfImageCollectorRefreshReviewSemantic_(review, change, masterSnapshot);
+      if (!updates) {
+        skipped += 1;
+        continue;
+      }
+      var updatedReview = {};
+      for (var headerIndex = 0; headerIndex < reviewHeaders.length; headerIndex += 1) {
+        updatedReview[reviewHeaders[headerIndex]] = review[reviewHeaders[headerIndex]];
+      }
+      Object.keys(updates).forEach(function(header) { updatedReview[header] = updates[header]; });
+      updates['確認内容'] = mfImageCollectorReviewConfirmationLabel_(updatedReview);
+      mfImageCollectorSetReviewRowValues_(reviewSheet, rowNumber, updates);
+      mfImageCollectorApplyReviewRowValidation_(reviewSheet, rowNumber);
+      refreshed.push(rowNumber);
+    } catch (error) {
+      errors.push({ row_number: rowNumber, error: error && error.message ? error.message : String(error) });
+    }
+  }
+  return { refreshed: refreshed.length, refreshed_rows: refreshed, skipped: skipped, errors: errors };
+}
+
+function mfImageCollectorReviewDependsOnMasterChange_(review, change, snapshot) {
+  var detectionType = String(review['検出種別'] || '').trim();
+  var reference = String(review['Tリファレンス番号'] || '').trim().toUpperCase();
+  var targetVersionKey = String(review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim().toUpperCase();
+  if (detectionType === 'structured_fact') {
+    return reference === change.primary_reference || (!!targetVersionKey && targetVersionKey === change.version_key);
+  }
+  var skuInfo = mfImageCollectorSalesSkuInfo_(reference);
+  if (!skuInfo) {
+    var infoForSku = mfImageCollectorReviewOfficialInfo_(review);
+    skuInfo = mfImageCollectorSalesSkuInfo_(infoForSku.primary_reference);
+  }
+  if (!skuInfo) return false;
+  if (change.sales_sku && skuInfo.sku === change.sales_sku) return true;
+  var parentIdentity = mfImageCollectorReviewStoredParentIdentity_(review);
+  if (parentIdentity.reference === change.primary_reference || parentIdentity.version_key === change.version_key) return true;
+  if (change.type !== 'primary_created' || !snapshot) return false;
+  try {
+    var resolvedParent = mfImageCollectorResolveSalesSkuParent_(review, '', skuInfo, snapshot.values, snapshot.headers, {
+      explicit_target_version_key: '',
+      use_stored_target_version_key: false,
+      use_stored_db_version_key: false
+    });
+    return !!resolvedParent &&
+      resolvedParent.reference === change.primary_reference &&
+      resolvedParent.version_key === change.version_key;
+  } catch (error) {
+    return false;
+  }
+}
+
+function mfImageCollectorReviewStoredParentIdentity_(review) {
+  var info = mfImageCollectorReviewOfficialInfo_(review);
+  var parentResolution = info.reference_resolution && info.reference_resolution.parent_resolution
+    ? info.reference_resolution.parent_resolution
+    : {};
+  var resolvedParent = parentResolution.resolved_parent || {};
+  return {
+    reference: String(parentResolution.reference || resolvedParent.t_reference || review['DB既存T'] || '').trim().toUpperCase(),
+    version_key: String(parentResolution.versionKey || resolvedParent.version_key || review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim().toUpperCase()
+  };
+}
+
+function mfImageCollectorRefreshReviewSemantic_(review, change, snapshot) {
+  var detectionType = String(review['検出種別'] || '').trim();
+  if (detectionType === 'structured_fact') {
+    var structured = mfImageCollectorResolveStructuredFactMasterRow_(snapshot.values, snapshot.headers, review);
+    if (!structured.ok) throw new Error('structured_fact dependency refresh failed: ' + structured.reason);
+    return {
+      'DB既存T': structured.reference || '',
+      'DB既存VersionKey': structured.version_key,
+      'DB既存名': structured.name || '',
+      '対象VersionKey': structured.version_key,
+      '差分概要': String(review['差分概要'] || '').trim() || '現在Masterの対象行を再解決'
+    };
+  }
+
+  var displayReference = String(review['Tリファレンス番号'] || '').trim().toUpperCase();
+  var officialInfo = mfImageCollectorReviewOfficialInfo_(review);
+  var skuInfo = mfImageCollectorSalesSkuInfo_(displayReference) || mfImageCollectorSalesSkuInfo_(officialInfo.primary_reference);
+  if (!skuInfo) return null;
+  var registrations = mfImageCollectorSalesSkuRegistrations_(snapshot.values, snapshot.headers, skuInfo.sku);
+  var storedParent = mfImageCollectorReviewStoredParentIdentity_(review);
+  var parent = null;
+  var unresolvedReason = '';
+
+  if (registrations.length > 1) {
+    unresolvedReason = 'sales_sku_ownership_ambiguous';
+  } else if (registrations.length === 1) {
+    var registration = registrations[0];
+    if ((storedParent.version_key && storedParent.version_key !== registration.version_key) ||
+        (storedParent.reference && storedParent.reference !== registration.primary_reference)) {
+      unresolvedReason = 'sales_sku_ownership_conflict';
+    } else {
+      parent = mfImageCollectorMasterParentFromRegistration_(snapshot.values, snapshot.headers, registration);
+    }
+  } else {
+    try {
+      parent = mfImageCollectorResolveSalesSkuParent_(review, '', skuInfo, snapshot.values, snapshot.headers, {
+        explicit_target_version_key: '',
+        use_stored_target_version_key: false,
+        use_stored_db_version_key: false
+      });
+    } catch (error) {
+      unresolvedReason = 'sales_sku_parent_ambiguous';
+    }
+    if (!parent && !unresolvedReason) unresolvedReason = 'sales_sku_parent_unresolved';
+  }
+
+  var previousResolution = officialInfo.reference_resolution || {};
+  var previousParentResolution = previousResolution.parent_resolution || {};
+  if (!parent) {
+    officialInfo.reference_resolution = {
+      mode: 'unresolved',
+      reference: skuInfo.sku,
+      reason: unresolvedReason,
+      primary_matches: [],
+      parent_resolution: null,
+      independent_primary: null
+    };
+    officialInfo.target_provenance = 'resolver';
+    return {
+      '検出種別': 'sales_sku_detected',
+      'DB既存T': '',
+      'DB既存VersionKey': '',
+      'DB既存名': '',
+      '対象VersionKey': '',
+      '差分概要': '販売SKUの親Primaryを現在Masterから安全に一意解決できません: ' + unresolvedReason,
+      '公式情報JSON': mfImageCollectorStableJson_(officialInfo)
+    };
+  }
+
+  var resolutionMethod = String(previousParentResolution.resolution_method || '').trim() || 'current_master_safe_parent';
+  var evidence = previousParentResolution.evidence || [];
+  officialInfo.primary_reference = skuInfo.sku;
+  officialInfo.primary_reference_type = 'sales_sku';
+  officialInfo.sku_only = true;
+  officialInfo.independent_primary = false;
+  officialInfo.sales_sku_target = true;
+  officialInfo.target_provenance = 'resolver';
+  officialInfo.reference_resolution = {
+    mode: 'sales_sku',
+    reference: skuInfo.sku,
+    reason: resolutionMethod,
+    primary_matches: [],
+    parent_resolution: {
+      sku: skuInfo.sku,
+      resolved: true,
+      reference: parent.reference,
+      versionKey: parent.version_key,
+      name: parent.name || '',
+      inMaster: true,
+      resolved_parent: {
+        version_key: parent.version_key,
+        t_reference: parent.reference,
+        official_name: parent.name || '',
+        match_method: resolutionMethod,
+        evidence_url: parent.url || '',
+        evidence_text: ''
+      },
+      resolution_method: resolutionMethod,
+      evidence: evidence,
+      candidates: [],
+      reason: ''
+    },
+    independent_primary: null
+  };
+  return {
+    '検出種別': 'sales_sku_detected',
+    'DB既存T': parent.reference,
+    'DB既存VersionKey': parent.version_key,
+    'DB既存名': parent.name || '',
+    '対象VersionKey': parent.version_key,
+    '差分概要': '販売SKU ' + skuInfo.sku + ' → ' + parent.reference + ' / ' + parent.version_key,
+    '公式情報JSON': mfImageCollectorStableJson_(officialInfo)
+  };
+}
+
+function mfImageCollectorMasterParentFromRegistration_(values, headers, registration) {
+  var row = registration.row_number;
+  var nameCol = headers.indexOf('現在の公式名');
+  var urlCol = headers.indexOf('公式商品ページURL');
+  return {
+    row_number: row,
+    version_key: registration.version_key,
+    reference: registration.primary_reference,
+    name: nameCol >= 0 ? String(values[row - 1][nameCol] || '').trim() : '',
+    url: urlCol >= 0 ? mfImageCollectorNormalizeUrlForCompare_(values[row - 1][urlCol]) : ''
   };
 }
 
@@ -2115,11 +2608,10 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
   }
   if (decision === '既存銘柄と同一' || decision === '終売情報として更新') return;
 
-  var ss = mfImageCollectorOpenSpreadsheet_();
-  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
-  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
-  var values = sheet.getDataRange().getValues();
-  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var masterContext = mfImageCollectorMasterContext_(options);
+  var sheet = masterContext.sheet;
+  var values = masterContext.values;
+  var headers = masterContext.headers;
   var versionCol = headers.indexOf('VersionKey');
   var primaryRefCol = headers.indexOf('Primary Reference');
   var refCol = headers.indexOf('Tリファレンス番号');
@@ -2140,8 +2632,12 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
     );
     var versionLabel = mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey);
     var newRow = mfImageCollectorBuildApprovedNewTeaRow_(headers, review, referenceInfo, versionKey, versionLabel);
-    if (!options.dry_run) mfImageCollectorAppendMasterRow_(sheet, headers, newRow);
-    return { target_version_key: versionKey };
+    if (!options.dry_run) {
+      mfImageCollectorAppendMasterRow_(sheet, headers, newRow);
+    } else if (options.simulate_write) {
+      values.push(newRow.slice());
+    }
+    return { target_version_key: versionKey, primary_reference: reference, name: String(review['公式名'] || '').trim() };
   }
 
   if (decision === '既存銘柄を更新') {
@@ -2153,6 +2649,26 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
     }
     return { target_version_key: targetVersionKey || String(review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim() };
   }
+}
+
+function mfImageCollectorMasterContext_(options) {
+  options = options || {};
+  if (options.master_snapshot) {
+    return {
+      sheet: null,
+      values: options.master_snapshot.values,
+      headers: options.master_snapshot.headers
+    };
+  }
+  var ss = mfImageCollectorOpenSpreadsheet_();
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  return {
+    sheet: sheet,
+    values: values,
+    headers: values[0].map(function(value) { return String(value).trim(); })
+  };
 }
 
 function mfImageCollectorApplyOfficialDescriptionTranslation_(review, options) {
@@ -2194,11 +2710,10 @@ function mfImageCollectorApplyStructuredFact_(review, options) {
     throw new Error('structured_fact cannot update this column: ' + targetColumn);
   }
 
-  var ss = mfImageCollectorOpenSpreadsheet_();
-  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
-  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
-  var values = sheet.getDataRange().getValues();
-  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var masterContext = mfImageCollectorMasterContext_(options);
+  var sheet = masterContext.sheet;
+  var values = masterContext.values;
+  var headers = masterContext.headers;
   var resolved = null;
   if (!targetVersionKey) {
     resolved = mfImageCollectorResolveStructuredFactMasterRow_(values, headers, review);
@@ -2211,13 +2726,14 @@ function mfImageCollectorApplyStructuredFact_(review, options) {
   var targetCol = headers.indexOf(targetColumn);
   if (targetCol < 0) throw new Error('Target master column was not found for structured_fact: ' + targetColumn);
 
-  var range = sheet.getRange(targetRow, targetCol + 1);
-  var actualCurrentValue = String(range.getValue() || '').trim();
+  var range = sheet ? sheet.getRange(targetRow, targetCol + 1) : null;
+  var actualCurrentValue = String(values[targetRow - 1][targetCol] || '').trim();
   var evaluation = String(review['source_type'] || '').trim() === 'tag_spelling_normalization' && mfImageCollectorIsVanillaTagColumn_(targetColumn)
     ? mfImageCollectorEvaluateTagSpellingNormalization_(actualCurrentValue, candidateCurrentValue, suggestedValue)
     : mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue);
-  if (!evaluation.already_applied && evaluation.next_value !== actualCurrentValue && !options.dry_run) {
-    range.setValue(evaluation.next_value);
+  if (!evaluation.already_applied && evaluation.next_value !== actualCurrentValue) {
+    if (!options.dry_run) range.setValue(evaluation.next_value);
+    if (options.simulate_write) values[targetRow - 1][targetCol] = evaluation.next_value;
   }
   return {
     target_version_key: targetVersionKey,
@@ -2602,12 +3118,10 @@ function mfImageCollectorApplySalesSku_(review, targetVersionKey, options) {
   var sku = skuInfo ? skuInfo.sku : '';
   if (!skuInfo) throw new Error('Unsupported sales SKU reference: ' + sku);
 
-  var ss = mfImageCollectorOpenSpreadsheet_();
-  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
-  if (!sheet) throw new Error('Sheet not found: ' + MF_IMAGE_COLLECTOR_SHEET_NAME);
-
-  var values = sheet.getDataRange().getValues();
-  var headers = values[0].map(function(value) { return String(value).trim(); });
+  var masterContext = mfImageCollectorMasterContext_(options);
+  var sheet = masterContext.sheet;
+  var values = masterContext.values;
+  var headers = masterContext.headers;
   var parent = mfImageCollectorResolveSalesSkuParent_(review, targetVersionKey, skuInfo, values, headers);
   if (!parent) throw new Error('Target master row was not found for sales SKU: ' + sku);
   var targetRow = parent.row_number;
@@ -2620,7 +3134,7 @@ function mfImageCollectorApplySalesSku_(review, targetVersionKey, options) {
     throw new Error('Sales SKU is already registered to another Primary Reference: ' + sku);
   }
   if (registrations.length) {
-    return { target_version_key: parent.version_key, already_applied: true };
+    return { target_version_key: parent.version_key, primary_reference: parent.reference, sales_sku: sku, already_applied: true };
   }
 
   var mapping = mfImageCollectorSalesSkuColumns_(skuInfo.prefix);
@@ -2641,8 +3155,26 @@ function mfImageCollectorApplySalesSku_(review, targetVersionKey, options) {
     if (mapping.reference) mfImageCollectorAppendDelimitedCellByHeader_(sheet, headers, targetRow, mapping.reference, sku);
     if (mapping.kind) mfImageCollectorAppendDelimitedCellByHeader_(sheet, headers, targetRow, mapping.kind, skuInfo.prefix);
     if (mapping.evidence) mfImageCollectorAppendDelimitedCellByHeader_(sheet, headers, targetRow, mapping.evidence, evidence);
+  } else if (options.simulate_write) {
+    mfImageCollectorSetSnapshotCellByHeader_(values, headers, targetRow, mapping.flag, 'はい', false);
+    mfImageCollectorSetSnapshotCellByHeader_(values, headers, targetRow, mapping.reference, sku, true);
+    mfImageCollectorSetSnapshotCellByHeader_(values, headers, targetRow, mapping.kind, skuInfo.prefix, true);
+    mfImageCollectorSetSnapshotCellByHeader_(values, headers, targetRow, mapping.evidence, evidence, true);
   }
-  return { target_version_key: parent.version_key };
+  return { target_version_key: parent.version_key, primary_reference: parent.reference, sales_sku: sku };
+}
+
+function mfImageCollectorSetSnapshotCellByHeader_(values, headers, rowNumber, header, value, appendDelimited) {
+  if (!header) return;
+  var col = headers.indexOf(header);
+  if (col < 0) throw new Error('Required Master column is missing: ' + header);
+  if (!appendDelimited) {
+    values[rowNumber - 1][col] = value;
+    return;
+  }
+  var existing = mfImageCollectorDelimitedValues_(values[rowNumber - 1][col]);
+  if (value && existing.indexOf(value) < 0) existing.push(value);
+  values[rowNumber - 1][col] = existing.join('、');
 }
 
 function mfImageCollectorSalesSkuInfo_(sku) {
@@ -2706,14 +3238,19 @@ function mfImageCollectorSalesSkuRegistrations_(values, headers, sku) {
   return registrations;
 }
 
-function mfImageCollectorResolveSalesSkuParent_(review, targetVersionKey, skuInfo, values, headers) {
+function mfImageCollectorResolveSalesSkuParent_(review, targetVersionKey, skuInfo, values, headers, options) {
+  options = options || {};
   var versionCol = headers.indexOf('VersionKey');
   var refCol = headers.indexOf('Tリファレンス番号');
   if (versionCol < 0 || refCol < 0) throw new Error('Required Master identity columns are missing for sales SKU resolution.');
 
   // Explicit VersionKey is authoritative. It may point to any unique Master row;
   // it is NOT restricted to a Txxxx-B## parent row.
-  var explicitVersionKey = String(targetVersionKey || review['対象VersionKey'] || '').trim().toUpperCase();
+  var useStoredTargetVersionKey = options.use_stored_target_version_key !== false;
+  var useStoredDbVersionKey = options.use_stored_db_version_key !== false;
+  var explicitVersionKey = Object.prototype.hasOwnProperty.call(options, 'explicit_target_version_key')
+    ? String(options.explicit_target_version_key || '').trim().toUpperCase()
+    : String(targetVersionKey || (useStoredTargetVersionKey ? review['対象VersionKey'] : '') || '').trim().toUpperCase();
   if (explicitVersionKey) {
     var explicitTarget = mfImageCollectorResolveExplicitTargetMasterRow_(values, headers, explicitVersionKey);
     return {
@@ -2728,7 +3265,9 @@ function mfImageCollectorResolveSalesSkuParent_(review, targetVersionKey, skuInf
 
   // A stored DB VersionKey is resolved the same way: exact and unique, regardless
   // of whether the row uses B-series or N-series.
-  var existingVersionKey = String(review['DB既存VersionKey'] || '').trim().toUpperCase();
+  var existingVersionKey = useStoredDbVersionKey
+    ? String(review['DB既存VersionKey'] || '').trim().toUpperCase()
+    : '';
   if (existingVersionKey) {
     var existingTarget = mfImageCollectorResolveExplicitTargetMasterRow_(values, headers, existingVersionKey);
     return {
