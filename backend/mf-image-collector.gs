@@ -3127,10 +3127,10 @@ function mfImageCollectorApplySalesSku_(review, targetVersionKey, options) {
   var targetRow = parent.row_number;
 
   var registrations = mfImageCollectorSalesSkuRegistrations_(values, headers, sku);
-  var otherRegistrations = registrations.filter(function(registration) {
-    return registration.row_number !== targetRow;
+  var conflictingRegistrations = registrations.filter(function(registration) {
+    return registration.primary_reference !== parent.reference;
   });
-  if (otherRegistrations.length) {
+  if (conflictingRegistrations.length) {
     throw new Error('Sales SKU is already registered to another Primary Reference: ' + sku);
   }
   if (registrations.length) {
