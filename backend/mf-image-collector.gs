@@ -1375,18 +1375,16 @@ function mfImageCollectorRecordReviewCandidate_(payload) {
   var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(value) { return String(value).trim(); });
   var detectionId = mfImageCollectorReviewDedupeKey_(candidate);
   var existingRow = mfImageCollectorFindReviewRow_(sheet, headers, detectionId);
-  var matchedByIdentity = false;
   if (existingRow < 0) {
     existingRow = mfImageCollectorFindReviewRowByIdentity_(sheet, headers, candidate);
-    matchedByIdentity = existingRow > 0;
   }
   var rowValues = mfImageCollectorReviewCandidateToRow_(candidate, detectionId);
 
   if (existingRow > 0) {
     var status = String(sheet.getRange(existingRow, headers.indexOf('ステータス') + 1).getValue() || '');
     if (status === '要確認' || status === '保留') {
+      var existingDetectionId = String(sheet.getRange(existingRow, headers.indexOf('検出ID') + 1).getValue() || detectionId);
       mfImageCollectorSetReviewRowValues_(sheet, existingRow, {
-        '検出ID': matchedByIdentity ? detectionId : undefined,
         '検出日時': rowValues['検出日時'],
         '検出種別': rowValues['検出種別'],
         '公式名': rowValues['公式名'],
@@ -1419,7 +1417,7 @@ function mfImageCollectorRecordReviewCandidate_(payload) {
         'confidence': rowValues['confidence']
       });
       mfImageCollectorApplyReviewRowValidation_(sheet, existingRow);
-      return { ok: true, action: 'updated_existing', detection_id: detectionId, sheet_row: existingRow };
+      return { ok: true, action: 'updated_existing', detection_id: existingDetectionId, sheet_row: existingRow };
     }
     return { ok: true, action: 'skipped_existing_final', detection_id: detectionId, sheet_row: existingRow };
   }
@@ -1873,7 +1871,12 @@ function mfImageCollectorApplyReviewRowValidation_(sheet, rowNumber) {
   if (decisionCol < 1) throw new Error('Review decision column is missing.');
   var values = sheet.getRange(rowNumber, 1, 1, sheet.getLastColumn()).getValues()[0];
   var review = mfImageCollectorReviewObject_(headers, values);
-  mfImageCollectorSetReviewDecisionValidation_(sheet, decisionCol, rowNumber, 1, mfImageCollectorReviewDecisionOptions_(review));
+  var options = mfImageCollectorReviewDecisionOptions_(review);
+  var currentDecision = String(review['人間判定'] || '').trim();
+  if (currentDecision && options.indexOf(currentDecision) < 0) {
+    sheet.getRange(rowNumber, decisionCol).setValue('');
+  }
+  mfImageCollectorSetReviewDecisionValidation_(sheet, decisionCol, rowNumber, 1, options);
 }
 
 function mfImageCollectorSetReviewDecisionValidation_(sheet, decisionCol, startRow, rowCount, options) {
