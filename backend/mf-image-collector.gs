@@ -1388,6 +1388,7 @@ function mfImageCollectorRecordReviewCandidate_(payload) {
       mfImageCollectorSetReviewRowValues_(sheet, existingRow, {
         '検出ID': matchedByIdentity ? detectionId : undefined,
         '検出日時': rowValues['検出日時'],
+        '検出種別': rowValues['検出種別'],
         '公式名': rowValues['公式名'],
         '公式URL': rowValues['公式URL'],
         '言語': rowValues['言語'],
@@ -1404,6 +1405,10 @@ function mfImageCollectorRecordReviewCandidate_(payload) {
         'DB類似候補': rowValues['DB類似候補'],
         'Discovery source': rowValues['Discovery source'],
         '公式情報JSON': rowValues['公式情報JSON'],
+        'DB既存T': rowValues['DB既存T'],
+        'DB既存VersionKey': rowValues['DB既存VersionKey'],
+        'DB既存名': rowValues['DB既存名'],
+        '対象VersionKey': rowValues['対象VersionKey'],
         '対象列': rowValues['対象列'],
         '現在値': rowValues['現在値'],
         '候補値': rowValues['候補値'],
@@ -2030,11 +2035,13 @@ function mfImageCollectorFindReviewRowByIdentity_(sheet, headers, candidate) {
   var type = String(candidate.detection_type || '').trim();
   var reference = String(candidate.reference || '').trim().toUpperCase();
   var versionKey = String(candidate.existing_version_key || candidate.target_version_key || '').trim();
+  var referenceCandidateTypes = ['unregistered_reference', 'unregistered_reference_image', 'sales_sku_detected'];
   var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
   for (var i = 0; i < values.length; i += 1) {
     var rowType = String(values[i][typeCol] || '').trim();
     var rowReference = String(values[i][refCol] || '').trim().toUpperCase();
-    if (rowType !== type || rowReference !== reference) continue;
+    var sameReferenceCandidate = referenceCandidateTypes.indexOf(type) >= 0 && referenceCandidateTypes.indexOf(rowType) >= 0;
+    if ((!sameReferenceCandidate && rowType !== type) || rowReference !== reference) continue;
     if (type === 'structured_fact') {
       var rowVersionForStructured = versionCol >= 0 ? String(values[i][versionCol] || '').trim() : '';
       var targetColumnCol = headers.indexOf('対象列');

@@ -2618,9 +2618,14 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
     const resolved = resolvableGroups[0];
     const primaryPage = preferredTargetedPage(resolved.pages);
     const masterMatches = targetedMasterMatches(resolved.reference, primaryPage.official_name, master?.products || []);
+    const resolutionPage = {
+      ...primaryPage,
+      verified_pages: resolved.pages,
+      official_names_by_language: targetedOfficialNamesByLanguage(resolved.pages),
+    };
     const referenceResolution = resolveReferenceIdentity({
       reference: resolved.reference,
-      page: primaryPage,
+      page: resolutionPage,
       masterProducts: master?.products || [],
     });
     const primaryMasterMatches = referenceResolution.primary_matches || [];
@@ -3766,6 +3771,13 @@ function independentHybridPrimaryEligibility(reference, page, parentResolution) 
       explicit_parent_names: explicitParentNames,
     };
   }
+  if (!parentResolution?.resolved && parentResolution?.packaging_evidence?.matched) {
+    return {
+      eligible: false,
+      reason: 'sales_sku_packaging_parent_unresolved',
+      packaging_evidence: parentResolution.packaging_evidence,
+    };
+  }
   return { eligible: true, reason: 'official_product_verified' };
 }
 
@@ -4443,6 +4455,54 @@ function targetedPageParentNames(page) {
   return [...new Set(values.map(normalizeText).filter(Boolean))];
 }
 
+function targetedPageOfficialNames(page) {
+  const pages = [page, ...(Array.isArray(page?.verified_pages) ? page.verified_pages : [])].filter(Boolean);
+  const values = [];
+  for (const item of pages) {
+    values.push(
+      item?.official_name,
+      item?.facts?.h1,
+      item?.facts?.title,
+      ...Object.values(item?.names_by_language || {}),
+      ...Object.values(item?.official_names_by_language || {})
+    );
+  }
+  return [...new Set(values.map(normalizeText).filter(Boolean))];
+}
+
+function targetedHybridPackagingEvidence(sku, page) {
+  const prefix = salesSkuParts(sku)?.prefix || '';
+  const pages = [page, ...(Array.isArray(page?.verified_pages) ? page.verified_pages : [])].filter(Boolean);
+  const entries = [];
+  for (const item of pages) {
+    const facts = item?.facts || {};
+    entries.push({
+      url: normalizeText(item?.url || facts.url || ''),
+      text: [
+        item?.url,
+        facts.url,
+        facts.h1,
+        facts.title,
+        facts.productSummary,
+        facts.productDescription,
+        facts.snippet,
+      ].map(normalizeText).filter(Boolean).join('\n'),
+    });
+  }
+  const rules = {
+    TC: /(?:\bcanister\b|\btin\b|black classical sealed canister|icone[-\s]?canister|bo[iî]tes?\s+ic[oô]nes?)/i,
+    TB: /(?:\btea\s*bags?\b|cotton[-\s]?muslins?|muslin\s+tea\s*bags?|sachets?\s+mousseline)/i,
+  };
+  const rule = rules[prefix];
+  if (!rule) return { matched: false, prefix, evidence: [] };
+  const evidence = entries.filter((entry) => rule.test(entry.text));
+  return {
+    matched: evidence.length > 0,
+    prefix,
+    evidence: evidence.map((entry) => ({ url: entry.url, text: compactSnippet(entry.text, 500) })),
+  };
+}
+
 function uniqueMasterProductsByVersion(products) {
   const unique = new Map();
   for (const product of products || []) {
@@ -4525,6 +4585,35 @@ function resolveTargetedHybridParent({ sku, page, masterProducts }) {
     const namedProducts = masterTeaProducts.filter((product) => normalizedParentNames.has(normalizeHybridParentName(product?.name || '')));
     const nameResult = targetedParentResolution(normalizedSku, namedProducts, 'official_parent_name', page, `Official parent name: ${parentNames.join(' | ')}`);
     if (nameResult) return nameResult;
+  }
+
+  const packagingEvidence = targetedHybridPackagingEvidence(normalizedSku, page);
+  if (packagingEvidence.matched) {
+    const officialNames = new Set(targetedPageOfficialNames(page).map(normalizeHybridParentName).filter(Boolean));
+    const packagingProducts = masterTeaProducts.filter((product) =>
+      officialNames.has(normalizeHybridParentName(product?.name || ''))
+    );
+    const packagingResult = targetedParentResolution(
+      normalizedSku,
+      packagingProducts,
+      'official_packaging_and_unique_canonical_name',
+      page,
+      packagingEvidence.evidence.map((entry) => entry.text).join(' | ')
+    );
+    if (packagingResult?.resolved) {
+      packagingResult.packaging_evidence = packagingEvidence;
+      return packagingResult;
+    }
+    return {
+      sku: normalizedSku,
+      resolved: false,
+      resolved_parent: null,
+      resolution_method: '',
+      evidence: packagingEvidence.evidence,
+      candidates: packagingResult?.candidates || [],
+      packaging_evidence: packagingEvidence,
+      reason: 'sales_sku_packaging_parent_unresolved',
+    };
   }
 
   const officialName = normalizeText(page?.official_name || '');
