@@ -2921,7 +2921,17 @@ function mfImageCollectorNormalizeApprovedAromaCategoryValue_(value) {
     '乳香': ['甘香・菓子'],
     '旨味': []
   };
-  var normalized = safeMap.hasOwnProperty(raw) ? safeMap[raw] : [raw];
+  var normalized = safeMap.hasOwnProperty(raw) ? safeMap[raw] : [];
+  if (!safeMap.hasOwnProperty(raw)) {
+    var tokens = mfImageCollectorDelimitedValues_(raw);
+    for (var tokenIndex = 0; tokenIndex < tokens.length; tokenIndex += 1) {
+      var tokenCategories = mfImageCollectorNormalizeAromaCategoryToken_(tokens[tokenIndex]);
+      if (!tokenCategories.length) {
+        throw new Error('香味大分類 is not in the approved 14-category whitelist: ' + tokens[tokenIndex]);
+      }
+      normalized = normalized.concat(tokenCategories);
+    }
+  }
   var allowed = mfImageCollectorAromaCategoryOrder_();
   for (var i = 0; i < normalized.length; i += 1) {
     if (allowed.indexOf(normalized[i]) < 0) {
@@ -5406,6 +5416,8 @@ function mfImageCollectorNormalizeAromaCategoriesForMaster_(currentValue, detail
 
 function mfImageCollectorNormalizeAromaCategoryToken_(token) {
   var raw = String(token || '').trim();
+  var normalized = raw.replace(/[®™]/g, '').trim();
+  if (/^(?:グルマン|gourmand)$/i.test(normalized)) return ['甘香・菓子'];
   var map = {
     '花系': ['花'],
     '花': ['花'],

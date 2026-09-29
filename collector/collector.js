@@ -1095,7 +1095,8 @@ function orderedUniqueAromaCategories(values) {
 function normalizeAromaCategoryToken(token) {
   const raw = normalizeText(token);
   if (!raw) return [];
-  const normalized = raw.replace(/™/g, '').trim();
+  const normalized = raw.replace(/[®™]/g, '').trim();
+  if (/^(?:グルマン|gourmand)$/i.test(normalized)) return ['甘香・菓子'];
   const map = new Map([
     ['花系', ['花']],
     ['花', ['花']],
@@ -6415,11 +6416,28 @@ function normalizeWritebackAromaCategory(value) {
   ]);
   const mapped = directMap.get(raw);
   if (mapped) return { value: mapped, status: 'normalized', original_value: raw };
-  if (FIXED_AROMA_CATEGORY_VALUES.has(raw)) return { value: raw, status: 'valid' };
-  if (/[、,;／|+＋&＆]/.test(raw) || raw.includes('・')) {
-    return { value: raw, status: 'ambiguous', reason: 'ambiguous_aroma_category' };
+  const tokens = splitMasterListValue(raw);
+  const hasAmbiguousDelimiter = /[+＋&＆]/.test(raw) || raw.includes('・');
+  const normalized = [];
+  for (const token of tokens) {
+    const categories = normalizeAromaCategoryToken(token);
+    if (!categories.length) {
+      const ambiguous = tokens.length > 1 || hasAmbiguousDelimiter;
+      return {
+        value: raw,
+        status: ambiguous ? 'ambiguous' : 'invalid',
+        reason: ambiguous ? 'ambiguous_aroma_category' : 'invalid_aroma_category',
+      };
+    }
+    normalized.push(...categories);
   }
-  return { value: raw, status: 'invalid', reason: 'invalid_aroma_category' };
+  const normalizedValue = orderedUniqueAromaCategories(normalized).join('、');
+  if (!normalizedValue) return { value: '', status: 'invalid', reason: 'invalid_aroma_category' };
+  return {
+    value: normalizedValue,
+    status: normalizedValue === raw ? 'valid' : 'normalized',
+    ...(normalizedValue === raw ? {} : { original_value: raw }),
+  };
 }
 
 function planRecordIdentityValid(record, product) {
