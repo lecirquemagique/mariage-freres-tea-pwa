@@ -2728,9 +2728,12 @@ function mfImageCollectorApplyStructuredFact_(review, options) {
 
   var range = sheet ? sheet.getRange(targetRow, targetCol + 1) : null;
   var actualCurrentValue = String(values[targetRow - 1][targetCol] || '').trim();
-  var evaluation = String(review['source_type'] || '').trim() === 'tag_spelling_normalization' && mfImageCollectorIsVanillaTagColumn_(targetColumn)
+  var sourceType = String(review['source_type'] || '').trim();
+  var evaluation = sourceType === 'tag_spelling_normalization' && mfImageCollectorIsVanillaTagColumn_(targetColumn)
     ? mfImageCollectorEvaluateTagSpellingNormalization_(actualCurrentValue, candidateCurrentValue, suggestedValue)
-    : mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue);
+    : mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue, {
+        replace_aroma_categories: targetColumn === '香味大分類' && /(?:^|_)normalization$/.test(sourceType)
+      });
   if (!evaluation.already_applied && evaluation.next_value !== actualCurrentValue) {
     if (!options.dry_run) range.setValue(evaluation.next_value);
     if (options.simulate_write) values[targetRow - 1][targetCol] = evaluation.next_value;
@@ -2777,17 +2780,29 @@ function mfImageCollectorStructuredFactNextValue_(targetColumn, actualCurrentVal
   return mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue).next_value;
 }
 
-function mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue) {
+function mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue, options) {
+  options = options || {};
   var actual = String(actualCurrentValue || '').trim();
   var expected = String(candidateCurrentValue || '').trim();
   var incoming = targetColumn === '香味大分類'
     ? mfImageCollectorNormalizeApprovedAromaCategoryValue_(suggestedValue)
     : mfImageCollectorNormalizeApprovedStructuredFactCandidate_(targetColumn, suggestedValue);
+  if (targetColumn === '香味大分類') {
+    if (mfImageCollectorAromaCategorySetsEqual_(actual, incoming)) {
+      return { already_applied: true, next_value: actual };
+    }
+    if (options.replace_aroma_categories && !mfImageCollectorAromaCategorySetsEqual_(actual, expected)) {
+      throw new Error('Master value changed after structured_fact candidate was created: ' + targetColumn + ' expected "' + expected + '" but found "' + actual + '".');
+    }
+    if (options.replace_aroma_categories) {
+      return { already_applied: false, next_value: incoming };
+    }
+  }
   if (mfImageCollectorStructuredFactMultiValueColumns_()[targetColumn]) {
     var values = mfImageCollectorDelimitedValues_(actual);
     var expectedValues = mfImageCollectorDelimitedValues_(expected);
     var incomingValues = mfImageCollectorDelimitedValues_(incoming);
-    var alreadyApplied = incomingValues.length > 0 && incomingValues.every(function(value) {
+    var alreadyApplied = targetColumn !== '香味大分類' && incomingValues.length > 0 && incomingValues.every(function(value) {
       if (values.indexOf(value) >= 0) return true;
       return targetColumn === '香味詳細タグ' && values.some(function(existingValue) {
         return mfImageCollectorAromaDetailAlreadyRepresented_(existingValue, value);
@@ -2814,6 +2829,27 @@ function mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurre
     throw new Error('Master value changed after structured_fact candidate was created: ' + targetColumn + ' expected "' + expected + '" but found "' + actual + '".');
   }
   return { already_applied: false, next_value: incoming };
+}
+
+function mfImageCollectorAromaCategoryComparisonValues_(value) {
+  var values = [];
+  var tokens = mfImageCollectorDelimitedValues_(value);
+  for (var i = 0; i < tokens.length; i += 1) {
+    var normalized = mfImageCollectorNormalizeAromaCategoryToken_(tokens[i]);
+    if (normalized.length) values = values.concat(normalized);
+    else values.push(String(tokens[i] || '').normalize('NFKC').trim());
+  }
+  return mfImageCollectorOrderedUniqueAromaCategories_(values);
+}
+
+function mfImageCollectorAromaCategorySetsEqual_(left, right) {
+  var leftValues = mfImageCollectorAromaCategoryComparisonValues_(left);
+  var rightValues = mfImageCollectorAromaCategoryComparisonValues_(right);
+  if (leftValues.length !== rightValues.length) return false;
+  for (var i = 0; i < leftValues.length; i += 1) {
+    if (leftValues[i] !== rightValues[i]) return false;
+  }
+  return true;
 }
 
 function mfImageCollectorCanonicalAromaDetailTerm_(value) {
