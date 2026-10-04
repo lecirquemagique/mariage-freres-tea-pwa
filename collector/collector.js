@@ -1256,6 +1256,15 @@ function masterHasSuggestedValue(product, column, suggestedValue) {
   return structuredFactSuggestionAlreadyApplied(product, { column, suggested_value: suggestedValue });
 }
 
+function officialNameWithoutSafeEcDecoration(value, reference) {
+  const raw = normalizeText(value);
+  const normalizedReference = normalizeTargetReference(reference);
+  if (!raw || !normalizedReference) return raw;
+  const escapedReference = normalizedReference.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = raw.match(new RegExp(`^(.+?)\\s*/\\s*[^/]+?\\s+\\d+(?:[.,]\\d+)?\\s*(?:g|kg)\\s*\\(${escapedReference}\\)\\s*$`, 'i'));
+  return match ? normalizeText(match[1]) : raw;
+}
+
 function normalizeConfiguredMasterProducts(products) {
   return (products || []).map((product) => {
     const primaryReference = canonicalProductReference(product?.primaryReference || product?.reference);
@@ -1737,7 +1746,8 @@ async function extractOfficialName(page) {
 function officialNameReviewCandidate(product, officialName, pageUrl) {
   const existingName = normalizeText(product.name);
   if (!existingName || !officialName) return null;
-  if (normalizeNameForCompare(existingName) === normalizeNameForCompare(officialName)) return null;
+  const comparableOfficialName = officialNameWithoutSafeEcDecoration(officialName, product.reference);
+  if (normalizeNameForCompare(existingName) === normalizeNameForCompare(comparableOfficialName)) return null;
   const candidate = {
     detected_at: nowIso(),
     reference: product.reference,
@@ -1848,8 +1858,11 @@ function loadDiscoveryCache(filePath) {
 
 function discoveryCacheCandidates(cache, product) {
   const reference = String(product.reference || '').toUpperCase();
+  const versionKey = normalizeText(product.master?.versionKey).toUpperCase();
   return Object.values(cache.images || {})
-    .filter((entry) => entry.reference === reference && ['url_ref_exact', 'current_verified_product_page'].includes(entry.verification_status))
+    .filter((entry) => entry.reference === reference &&
+      (!entry.target_version_key || entry.target_version_key === versionKey) &&
+      ['url_ref_exact', 'current_verified_product_page'].includes(entry.verification_status))
     .map((entry) => ({
       sourceKind: 'discovery_cache',
       url: entry.source_url,
@@ -2029,6 +2042,17 @@ async function updateDiscoveryCache({ cache, candidates, product, pageUrl, maste
     }
     if (!reference) continue;
     let referenceResolution = resolveReferenceIdentity({ reference, masterProducts });
+    let targetVersionKey = '';
+    if (referenceResolution.mode === 'existing_primary') {
+      const versionKeys = [...new Set((referenceResolution.primary_matches || [])
+        .map((match) => normalizeText(match.master?.versionKey).toUpperCase())
+        .filter(Boolean))];
+      if (versionKeys.length !== 1) {
+        if (debug) console.log(`[opportunistic] skip ambiguous existing Primary image reference=${reference} version_keys=${versionKeys.join(',') || '(none)'}`);
+        continue;
+      }
+      targetVersionKey = versionKeys[0];
+    }
     let verified = null;
     if (referenceResolution.mode !== 'existing_primary' && info.imageType !== 'liqueur' && context) {
       verified = await verifyImageDiscoveredReference({ context, reference, config, pageUrl, debug });
@@ -2064,6 +2088,7 @@ async function updateDiscoveryCache({ cache, candidates, product, pageUrl, maste
     if (cache.images[key]) {
       cache.images[key] = {
         ...cache.images[key],
+        target_version_key: targetVersionKey || cache.images[key].target_version_key || '',
         last_seen_at: detectedAt,
         seen_count: (cache.images[key].seen_count || 1) + 1,
       };
@@ -2072,6 +2097,7 @@ async function updateDiscoveryCache({ cache, candidates, product, pageUrl, maste
 
     cache.images[key] = {
       reference,
+      target_version_key: targetVersionKey,
       image_type: info.imageType,
       source_url: candidate.url,
       discovered_from_page: pageUrl,
