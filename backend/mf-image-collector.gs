@@ -58,7 +58,12 @@ var MF_IMAGE_COLLECTOR_REVIEW_DECISIONS = [
   '既存銘柄の新バージョンとして追加',
   '販売SKUとして追加',
   '既存銘柄と同一',
+  '単純名称変更',
+  '同一系列の更新',
+  '完全別商品・T番号再利用',
   '終売情報として更新',
+  '判定保留',
+  '却下',
   '誤検出',
   '保留'
 ];
@@ -1034,6 +1039,7 @@ function mfImageCollectorPreflightReviewRow_(rowNumber, review, options) {
 }
 
 function mfImageCollectorBatchReviewCategory_(review, decision) {
+  decision = mfImageCollectorReviewDecisionAction_(decision);
   if (decision === '保留') return 'hold';
   if (decision === '誤検出') return 'reject';
   return 'apply';
@@ -1457,23 +1463,44 @@ function mfImageCollectorSalesSkuParentForReview_(review, targetVersionKey) {
 function mfImageCollectorReviewDecisionOptions_(review) {
   var detectionType = String(review['検出種別'] || '').trim();
   if (detectionType === 'structured_fact' || detectionType === 'official_description_translation') {
-    return ['既存銘柄を更新', '誤検出', '保留'];
+    return ['既存銘柄を更新', '却下', '誤検出', '判定保留', '保留'];
   }
+  if (detectionType === 'official_name_changed') return mfImageCollectorIdentityReviewDecisionOptions_();
 
   var referenceIdentity = mfImageCollectorReviewSalesSkuIdentity_(review);
-  if (referenceIdentity.mode === 'sales_sku') return ['販売SKUとして追加', '誤検出', '保留'];
-  if (referenceIdentity.mode === 'independent_primary') return ['新規銘柄として追加', '誤検出', '保留'];
-  if (referenceIdentity.mode === 'unresolved' || referenceIdentity.mode === 'existing_primary') return ['誤検出', '保留'];
+  if (referenceIdentity.mode === 'sales_sku') return ['販売SKUとして追加', '却下', '誤検出', '判定保留', '保留'];
+  if (referenceIdentity.mode === 'independent_primary') return ['新規銘柄として追加', '却下', '誤検出', '判定保留', '保留'];
+  if (referenceIdentity.mode === 'unresolved' || referenceIdentity.mode === 'existing_primary') return ['却下', '誤検出', '判定保留', '保留'];
 
+  return mfImageCollectorIdentityReviewDecisionOptions_();
+}
+
+function mfImageCollectorIdentityReviewDecisionOptions_() {
   return [
     '新規銘柄として追加',
     '既存銘柄を更新',
     '既存銘柄の新バージョンとして追加',
     '既存銘柄と同一',
+    '単純名称変更',
+    '同一系列の更新',
+    '完全別商品・T番号再利用',
     '終売情報として更新',
+    '却下',
     '誤検出',
+    '判定保留',
     '保留'
   ];
+}
+
+function mfImageCollectorReviewDecisionAction_(decision) {
+  var value = String(decision || '').trim();
+  if (value === '単純名称変更') return '既存銘柄を更新';
+  if (value === '同一系列の更新' || value === '完全別商品・T番号再利用') {
+    return '既存銘柄の新バージョンとして追加';
+  }
+  if (value === '判定保留') return '保留';
+  if (value === '却下') return '誤検出';
+  return value;
 }
 
 function mfImageCollectorAssertReviewDecisionAllowed_(review, decision, targetVersionKey, approvedJapaneseDescription, options) {
@@ -1503,11 +1530,13 @@ function mfImageCollectorAssertReviewDecisionAllowed_(review, decision, targetVe
       throw new Error('販売SKUの親Tを現在のMasterから安全に一意解決できません。対象VersionKeyを明示してください: ' + skuInfo.sku);
     }
   }
-  if (salesIdentity.mode === 'existing_primary' && normalizedDecision !== '誤検出' && normalizedDecision !== '保留') {
+  var detectionType = String(review['検出種別'] || '').trim();
+  if (salesIdentity.mode === 'existing_primary' && detectionType !== 'official_name_changed' &&
+      normalizedDecision !== '誤検出' && normalizedDecision !== '保留' &&
+      normalizedDecision !== '却下' && normalizedDecision !== '判定保留') {
     throw new Error('既存Primary Referenceに対する新規Referenceレビューは反映できません。');
   }
 
-  var detectionType = String(review['検出種別'] || '').trim();
   if (detectionType === 'official_description_translation' && normalizedDecision === '既存銘柄を更新') {
     if (!String(approvedJapaneseDescription || '').trim()) {
       throw new Error('official_description_translation の反映には、人間が明示入力した承認済み日本語説明が必要です。');
@@ -1516,15 +1545,21 @@ function mfImageCollectorAssertReviewDecisionAllowed_(review, decision, targetVe
 }
 
 function mfImageCollectorReviewDecisionDescription_(review, decision, parent) {
+  var actionDecision = mfImageCollectorReviewDecisionAction_(decision);
   if (decision === '販売SKUとして追加') {
     var target = parent
       ? ((parent.version_key || '') + (parent.reference ? ' / ' + parent.reference : ''))
       : '';
     return '既存銘柄 ' + target + ' に販売SKUを追加します。';
   }
-  if (decision === '新規銘柄として追加') return 'このREF自体をPrimary Referenceとする新しい銘柄行を追加します。';
-  if (decision === '既存銘柄の新バージョンとして追加') return '既存銘柄の新しいVersionKey行を追加します。';
-  if (decision === '既存銘柄を更新') {
+  if (decision === '単純名称変更') return '同一Versionの現在の公式名を、人間が確認した名称へ更新します。';
+  if (decision === '同一系列の更新') return '同じPrimary Referenceの連続した系列として、新しいVersionを追加します。';
+  if (decision === '完全別商品・T番号再利用') return '人間が完全別商品へのT番号再利用と判断したため、旧版を残して新しいVersionを追加します。';
+  if (decision === '判定保留') return 'マスターは変更せず、判断材料が揃うまで保留します。';
+  if (decision === '却下') return 'マスターは変更せず、候補を却下します。';
+  if (actionDecision === '新規銘柄として追加') return 'このREF自体をPrimary Referenceとする新しい銘柄行を追加します。';
+  if (actionDecision === '既存銘柄の新バージョンとして追加') return '既存銘柄の新しいVersionKey行を追加します。';
+  if (actionDecision === '既存銘柄を更新') {
     var detectionType = String(review['検出種別'] || '').trim();
     if (detectionType === 'official_description_translation') {
       return '既存行の現在の公式説明を、人間が入力した承認済み日本語説明で更新します。';
@@ -1562,9 +1597,10 @@ function mfImageCollectorApplyReviewDecision(rowNumber, decision, targetVersionK
     throw new Error('Review row has already been finalized or cannot be processed: ' + (currentStatus || '(blank)'));
   }
   mfImageCollectorAssertReviewDecisionAllowed_(review, decision, targetVersionKey, approvedJapaneseDescription);
+  var actionDecision = mfImageCollectorReviewDecisionAction_(decision);
   var finalStatus = '反映済み';
-  if (decision === '保留') finalStatus = '保留';
-  if (decision === '誤検出') finalStatus = '却下';
+  if (actionDecision === '保留') finalStatus = '保留';
+  if (actionDecision === '誤検出') finalStatus = '却下';
 
   var applyResult = null;
   if (finalStatus === '反映済み') {
@@ -1626,6 +1662,7 @@ function mfImageCollectorApplyReviewDecision(rowNumber, decision, targetVersionK
 
 function mfImageCollectorReviewMasterChange_(review, decision, applyResult, targetVersionKey) {
   if (!applyResult || applyResult.already_applied) return null;
+  decision = mfImageCollectorReviewDecisionAction_(decision);
   if (decision === '新規銘柄として追加' || decision === '既存銘柄の新バージョンとして追加') {
     return {
       type: 'primary_created',
@@ -2592,6 +2629,7 @@ function mfImageCollectorGetReviewSummary() {
 }
 
 function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey, options) {
+  decision = mfImageCollectorReviewDecisionAction_(decision);
   if (decision === '誤検出' || decision === '保留') return;
   options = options || {};
   if (String(review['検出種別'] || '').trim() === 'official_description_translation') {
@@ -4025,17 +4063,18 @@ function decisionOptions(it){
   var displayRef=String(it['Tリファレンス番号']||'').toUpperCase();
   var jsonRef=String(info.primary_reference||'').toUpperCase();
   var isSales=function(ref){return /^(TFG|TJC|TB|TC|TE|TF|TP|TA)\\d+$/.test(ref)||/^TJ[A-Z0-9]+$/.test(ref);};
-  if(it['検出種別']==='structured_fact'||it['検出種別']==='official_description_translation')return ['既存銘柄を更新','誤検出','保留'];
+  if(it['検出種別']==='structured_fact'||it['検出種別']==='official_description_translation')return ['既存銘柄を更新','却下','誤検出','判定保留','保留'];
+  if(it['検出種別']==='official_name_changed')return ['新規銘柄として追加','既存銘柄を更新','既存銘柄の新バージョンとして追加','既存銘柄と同一','単純名称変更','同一系列の更新','完全別商品・T番号再利用','終売情報として更新','却下','誤検出','判定保留','保留'];
   var mode=String((info.reference_resolution||{}).mode||'');
-  if(mode==='sales_sku')return ['販売SKUとして追加','誤検出','保留'];
-  if(mode==='independent_primary')return ['新規銘柄として追加','誤検出','保留'];
-  if(mode==='existing_primary'||mode==='unresolved')return ['誤検出','保留'];
+  if(mode==='sales_sku')return ['販売SKUとして追加','却下','誤検出','判定保留','保留'];
+  if(mode==='independent_primary')return ['新規銘柄として追加','却下','誤検出','判定保留','保留'];
+  if(mode==='existing_primary'||mode==='unresolved')return ['却下','誤検出','判定保留','保留'];
   var unregistered=it['検出種別']==='unregistered_reference'||it['検出種別']==='unregistered_reference_image';
   var independent=unregistered&&(((info.primary_reference_type||'')==='independent_hybrid_primary')||(info.independent_primary===true&&info.hybrid_reference===true&&info.sku_only!==true))&&!String(info.t_reference||'');
-  if(it['検出種別']==='sales_sku_detected'&&(isSales(displayRef)||isSales(jsonRef)))return ['販売SKUとして追加','誤検出','保留'];
-  if(independent)return ['新規銘柄として追加','誤検出','保留'];
-  if(unregistered&&(isSales(displayRef)||isSales(jsonRef)))return ['誤検出','保留'];
-  return ['新規銘柄として追加','既存銘柄を更新','既存銘柄の新バージョンとして追加','既存銘柄と同一','終売情報として更新','誤検出','保留'];
+  if(it['検出種別']==='sales_sku_detected'&&(isSales(displayRef)||isSales(jsonRef)))return ['販売SKUとして追加','却下','誤検出','判定保留','保留'];
+  if(independent)return ['新規銘柄として追加','却下','誤検出','判定保留','保留'];
+  if(unregistered&&(isSales(displayRef)||isSales(jsonRef)))return ['却下','誤検出','判定保留','保留'];
+  return ['新規銘柄として追加','既存銘柄を更新','既存銘柄の新バージョンとして追加','既存銘柄と同一','単純名称変更','同一系列の更新','完全別商品・T番号再利用','終売情報として更新','却下','誤検出','判定保留','保留'];
 }
 function actionControls(it,idx){
   var options=decisionOptions(it).map(function(value){return '<option>'+esc(value)+'</option>';}).join('');
