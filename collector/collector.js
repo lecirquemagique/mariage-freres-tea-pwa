@@ -1132,6 +1132,7 @@ function normalizeAromaCategoryToken(token) {
 function aromaCategoriesFromDetailTag(token) {
   const raw = normalizeText(token);
   if (!raw) return [];
+  if (/ヴァニラ|バニラ|\bvanilla\b/i.test(raw)) return ['甘香・菓子'];
   if (/ベリー|ストロベリー|苺|いちご|イチゴ|ラズベリー|フランボワーズ|ブルーベリー|ブラックベリー|クランベリー|カシス/.test(raw)) return ['果実', 'ベリー'];
   if (/ミント|ペパーミント|スペアミント/.test(raw)) return ['ハーブ', 'ミント'];
   if (/キャラメル|カラメル|ブロンドキャラメル/.test(raw)) return ['甘香・菓子', 'キャラメル'];
