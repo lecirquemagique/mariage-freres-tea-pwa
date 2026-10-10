@@ -1,8 +1,9 @@
-const CACHE = 'mf-tea-pwa-v1-1';
+const CACHE = 'mf-tea-pwa-v1-2-sales-state';
 const CORE = [
   './',
   './index.html',
   './app-config.js',
+  './sales-state.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png'

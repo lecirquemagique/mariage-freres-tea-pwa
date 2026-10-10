@@ -441,6 +441,10 @@
       color:#d9cdb5
     }
 
+    .sales-badges{display:flex;gap:5px;margin:5px 0 8px;flex-wrap:wrap}
+    .sales-badge{font-size:10px;color:#b9ab91;border:1px solid #4d3c23;border-radius:4px;padding:2px 5px}
+    .sales-migration-notice{font-size:11px;color:#b9ab91;margin:6px 0 0}
+
     .tag.detail{
       background:#2c2213;
       border-color:#73592d;
@@ -695,11 +699,14 @@
       <div id="timeChips" class="chips"></div>
     </div>
 
-    <div class="checks">
-      <label>
-        <input id="end" type="checkbox" checked>
-        終売を除く
-      </label>
+    <div class="section">
+      <label class="section-title" for="displayScope">表示範囲</label>
+      <select id="displayScope">
+        <option value="shopping" selected>買い物</option>
+        <option value="all">すべて</option>
+        <option value="past">過去・終売</option>
+      </select>
+      <p id="salesMigrationNotice" class="sales-migration-notice" hidden>掲載状況を確認中の銘柄も表示しています。</p>
     </div>
 
     <div class="meta-row">
@@ -717,9 +724,11 @@
 <main id="list" class="grid wrap"></main>
 
 <script src="app-config.js"></script>
+<script src="sales-state.js"></script>
 
 <script>
 let R=[];
+let salesMigrationComplete=false;
 let aromaSel=new Set();
 let detailSel=new Set();
 let timeSel='';
@@ -1244,6 +1253,7 @@ function hasSearchCriteria(){
 
 
 function matches(r){
+  if (!MFSalesState.matchesScope(r, $('displayScope').value, salesMigrationComplete)) return false;
   const q=n(
     $('q').value
   );
@@ -1336,15 +1346,6 @@ function matches(r){
   }
 
   if(
-    $('end').checked &&
-    ['終売','販売終了'].includes(
-      r['現行ステータス']
-    )
-  ){
-    return false;
-  }
-
-  if(
     $('milk').checked &&
     !yes(
       r['ミルクティー推奨']
@@ -1394,7 +1395,7 @@ function matches(r){
 
 
 function activeText(){
-  const a=[];
+  const a=['表示範囲:'+({shopping:'買い物',all:'すべて',past:'過去・終売'}[$('displayScope').value]||'買い物')];
 
   if($('tea').value){
     a.push(
@@ -1446,18 +1447,7 @@ function activeText(){
 
 
 function render(){
-
-  if(!hasSearchCriteria()){
-
-    $('meta').textContent='';
-
-    $('active').textContent='';
-
-    $('list').innerHTML=
-      '<div class="empty">検索または条件を選択してください。</div>';
-
-    return;
-  }
+  $('salesMigrationNotice').hidden = salesMigrationComplete || $('displayScope').value !== 'shopping';
 
   const a=
     R.filter(matches);
@@ -1580,6 +1570,9 @@ function render(){
             <span class="ref">
               ${esc(displayReference(r))}
             </span>
+            <div class="sales-badges" aria-label="販売・掲載状態">
+              ${MFSalesState.badges(r, R).map(label=>`<span class="sales-badge">${esc(label)}</span>`).join('')}
+            </div>
 
             <span class="name">
               ${
@@ -1669,7 +1662,7 @@ function reset(){
     $(x).checked=false
   );
 
-  $('end').checked=true;
+  $('displayScope').value='shopping';
 
   aromaSel.clear();
   detailSel.clear();
@@ -1693,8 +1686,9 @@ function initData(payload){
   }
 
   R=payload.rows;
+  salesMigrationComplete=MFSalesState.migrationComplete(payload);
 
-  $('q').value='T918';
+  $('displayScope').value='shopping';
 
   fillTeaTypes();
 
@@ -1824,7 +1818,7 @@ function loadJsonp(){
   'q',
   'tea',
   'origin',
-  'end',
+  'displayScope',
   'milk',
   'smoke',
   'cold',
