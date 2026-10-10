@@ -413,6 +413,7 @@ function encodeImageForWriteBack(row, imageType) {
 }
 
 async function writeBackImageResults({ config, baseDir, product, result, debug }) {
+  assertAutomaticProductTarget(product);
   const settings = getWriteBackSettings(config, baseDir);
   if (!settings) return null;
 
@@ -475,6 +476,7 @@ async function writeBackImageResults({ config, baseDir, product, result, debug }
 }
 
 async function writeBackProductPageUrl({ config, baseDir, product, discovery, debug }) {
+  assertAutomaticProductTarget(product);
   const settings = getWriteBackSettings(config, baseDir);
   if (!settings) return null;
 
@@ -577,6 +579,7 @@ async function postGasAction({ config, baseDir, action, payload = {}, debug }) {
 }
 
 async function writeBackMasterOfficialInfo({ config, baseDir, product, officialInfo, debug }) {
+  assertAutomaticProductTarget(product);
   const settings = getWriteBackSettings(config, baseDir);
   if (!settings) return null;
 
@@ -584,7 +587,8 @@ async function writeBackMasterOfficialInfo({ config, baseDir, product, officialI
     action: 'updateMasterOfficialInfo',
     secret: settings.secret,
     reference: product.reference,
-    version_key: product.master?.versionKey || '',
+    // A normal automatic fetch is reference-only; recheck live ambiguity in GAS.
+    version_key: '',
     product_page_url: product.productUrl,
     official_description: officialInfo.description || '',
     official_description_original: officialInfo.originalDescription || '',
@@ -660,9 +664,19 @@ function primaryReferenceFromMasterRow(row) {
   if (isLegacyMasterTeaReference(tReference)) return tReference;
   const salesReference = salesSkuReferencesFromMasterRow(row)[0] || '';
   if (salesReference) return salesReference;
-  const versionPrefix = normalizeText(row[MASTER_COLUMNS.versionKey]).toUpperCase().match(/^([A-Z]+\d[A-Z0-9]*)-[BN]\d{2}$/)?.[1] || '';
+  const versionPrefix = normalizeText(row[MASTER_COLUMNS.versionKey]).toUpperCase().match(/^([A-Z]+\d[A-Z0-9]*)-[BCN]\d{2}$/)?.[1] || '';
   if (canonicalProductReference(versionPrefix)) return versionPrefix;
   return '';
+}
+
+// A fetched row's key is not proof that an automatic T-reference discovery belongs to it.
+function hasUniqueAutomaticTarget(product, products) {
+  const matches = (products || []).filter(p => productHasReference(p, product.reference));
+  return matches.length === 1 && !product.master?.referenceAmbiguous;
+}
+
+function assertAutomaticProductTarget(product) {
+  if (product.master?.referenceAmbiguous) throw new Error('Ambiguous Primary Reference: ' + product.reference);
 }
 
 async function fetchMasterProducts(config, baseDir, debug) {
@@ -728,6 +742,9 @@ async function fetchMasterProducts(config, baseDir, debug) {
     })
     .filter(Boolean);
 
+  for (const product of products) {
+    product.master.referenceAmbiguous = products.filter(p => productHasReference(p, product.reference)).length !== 1;
+  }
   if (debug) {
     const productsWithUrls = products.filter((product) => hasValue(product.productUrl)).length;
     console.log(`[master] rows=${payload.rows.length} products=${products.length} productsWithUrls=${productsWithUrls} updatedAt=${payload.updatedAt || ''}`);
@@ -1211,6 +1228,7 @@ function buildOfficialDescriptionBackfillValue({ product, facts, language, confi
 }
 
 function buildOfficialDescriptionTranslationReviewCandidate({ product, facts, descriptionValue, category }) {
+  assertAutomaticProductTarget(product);
   return {
     reference: product.reference,
     version_key: product.master?.versionKey || '',
@@ -1610,22 +1628,6 @@ function resolveStructuredFactMasterProduct({ reference, masterProducts = [], fa
   );
   if (candidates.length === 1) return candidates[0];
 
-  const pageUrls = [
-    facts?.url,
-    facts?.canonical,
-    facts?.source_url,
-  ].map(normalizeUrlForCompare).filter(Boolean);
-  if (pageUrls.length) {
-    const urlMatches = candidates.filter((product) => pageUrls.includes(normalizeUrlForCompare(product.productUrl || product.master?.productUrl || '')));
-    if (urlMatches.length === 1) return urlMatches[0];
-  }
-
-  const normalizedOfficialName = normalizeNameForCompare(officialName || facts?.h1 || facts?.title || '');
-  if (normalizedOfficialName) {
-    const nameMatches = candidates.filter((product) => normalizeNameForCompare(product.name || '') === normalizedOfficialName);
-    if (nameMatches.length === 1) return nameMatches[0];
-  }
-
   if (debug && candidates.length !== 1) {
     const keys = candidates.map((product) => product.master?.versionKey || '').filter(Boolean).join(',');
     console.log(`[structured_fact] target row ambiguous reference=${normalizedReference} candidates=${candidates.length}${keys ? ` version_keys=${keys}` : ''}`);
@@ -1634,6 +1636,7 @@ function resolveStructuredFactMasterProduct({ reference, masterProducts = [], fa
 }
 
 function structuredFactReviewCandidatesForProduct({ product, facts, vocabulary }) {
+  assertAutomaticProductTarget(product);
   const language = sourceLanguageFromUrl(facts?.url) || sourceLanguageFromUrl(product.productUrl);
   const officialStructuredFacts = buildOfficialStructuredFacts({ product, facts, language, vocabulary });
   const partition = partitionStructuredFactSuggestions(product, officialStructuredFacts.structured_review_suggestions);
@@ -2047,7 +2050,7 @@ async function updateDiscoveryCache({ cache, candidates, product, pageUrl, maste
       const versionKeys = [...new Set((referenceResolution.primary_matches || [])
         .map((match) => normalizeText(match.master?.versionKey).toUpperCase())
         .filter(Boolean))];
-      if (versionKeys.length !== 1) {
+      if (versionKeys.length !== 1 || referenceResolution.primary_matches.length !== 1) {
         if (debug) console.log(`[opportunistic] skip ambiguous existing Primary image reference=${reference} version_keys=${versionKeys.join(',') || '(none)'}`);
         continue;
       }
@@ -2679,8 +2682,8 @@ async function runTargetedTeaDiscovery({ context, config, master, baseDir, args 
       const nameReview = structuredProduct ? officialNameReviewCandidate(structuredProduct, primaryPage.official_name, primaryPage.url) : null;
       if (nameReview) reviewCandidates.push(nameReview);
       reviewCandidates.push(...structuredCandidates);
-      reviewCandidates.push(...independentHybridAttributeReviewCandidates({
-        product: structuredProduct || primaryMasterMatches[0],
+      if (structuredProduct) reviewCandidates.push(...independentHybridAttributeReviewCandidates({
+        product: structuredProduct,
         pages: resolved.pages,
         reference: resolved.reference,
       }));
@@ -3387,13 +3390,15 @@ function selectProducts(config, state, refs, sourceProducts = null) {
   const now = Date.now();
   const hasMasterProducts = Boolean(sourceProducts?.length);
   const productList = hasMasterProducts ? sourceProducts : config.products || [];
-  const merged = productList.map((product) => {
+  const merged = productList.filter(product => hasUniqueAutomaticTarget(product, productList)).map((product) => {
     const localState = state.products?.[product.reference] || {};
     const masterStatus = productImageStatus(product);
     return {
       ...product,
       master_status: masterStatus,
       ...localState,
+      master: product.master,
+      reference: product.reference,
       productUrl: product.productUrl || localState.productUrl,
     };
   });
@@ -4148,6 +4153,7 @@ function buildStatusSummary(config, state, master, products, discoveryCache = nu
 async function normalizeNotFoundProductUrlWriteBacks({ config, baseDir, state, master, debug }) {
   if (!writeBackRequired(config) || !master?.products?.length) return;
   for (const product of master.products) {
+    if (!hasUniqueAutomaticTarget(product, master.products)) continue;
     const localState = state.products?.[product.reference];
     const masterUrlStatus = normalizeProductUrlStatus(product.master?.productUrlStatus);
     if (hasValue(product.master?.productUrl) || masterUrlStatus === 'not_found' || !isCurrentDiscoveryNotFoundResult(localState?.urlDiscovery)) {
@@ -4425,7 +4431,8 @@ function teaReferenceNumber(reference) {
 
 function findMasterProductByReference(masterProducts, reference) {
   const normalized = String(reference || '').trim().toUpperCase();
-  return (masterProducts || []).find((product) => productHasReference(product, normalized)) || null;
+  const matches = (masterProducts || []).filter(product => productHasReference(product, normalized));
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function productHasReference(product, reference) {
@@ -4433,7 +4440,7 @@ function productHasReference(product, reference) {
   if (!normalized) return false;
   if (String(product?.reference || '').toUpperCase() === normalized) return true;
   if (String(product?.tReference || '').toUpperCase() === normalized) return true;
-  if (String(product?.master?.versionKey || '').toUpperCase().startsWith(`${normalized}-B`)) return true;
+  if (String(product?.master?.versionKey || '').toUpperCase().replace(/-[A-Z]\d{2}$/, '') === normalized) return true;
   return (product?.salesReferences || []).some((ref) => String(ref || '').toUpperCase() === normalized);
 }
 
@@ -4556,7 +4563,7 @@ function targetedParentCandidate(product, matchMethod, page, evidenceText, safe 
 function targetedParentResolution(sku, products, matchMethod, page, evidenceText) {
   const unique = uniqueMasterProductsByVersion(products);
   const candidates = unique.map((product) => targetedParentCandidate(product, matchMethod, page, evidenceText));
-  if (unique.length > 1) {
+  if (unique.length > 1 || products.length !== unique.length || unique.some(p => p.master?.referenceAmbiguous)) {
     return {
       sku,
       resolved: false,
@@ -4963,6 +4970,7 @@ function buildSalesSkuReview({ sku, facts, url, source, sourceLanguage, discover
 function selectOfficialDescriptionBackfillProducts(masterProducts, refs = null) {
   const refFilter = refs?.length ? new Set(refs.map((ref) => String(ref || '').toUpperCase())) : null;
   return (masterProducts || []).filter((product) => {
+    if (!hasUniqueAutomaticTarget(product, masterProducts)) return false;
     if (refFilter && !refFilter.has(String(product.reference || '').toUpperCase())) return false;
     if (!hasValue(product.productUrl)) return false;
     return !hasValue(product.master?.officialDescription);
@@ -5107,6 +5115,7 @@ function selectEnrichmentProducts(masterProducts, refs = null, limit = 5) {
   const refFilter = refs?.length ? new Set(refs.map((ref) => String(ref || '').toUpperCase())) : null;
   const selected = [];
   for (const product of masterProducts || []) {
+    if (!hasUniqueAutomaticTarget(product, masterProducts)) continue;
     if (refFilter && ![...refFilter].some((ref) => productHasReference(product, ref))) continue;
     if (!refFilter && !productNeedsEnrichment(product)) continue;
     selected.push(product);
@@ -5580,7 +5589,7 @@ function normalizeAuditListFilter(values = []) {
 }
 
 function versionKeyPrefix(versionKey) {
-  return normalizeText(versionKey).toUpperCase().match(/^([A-Z]+\d[A-Z0-9]*)-[BN]\d{2}$/)?.[1] || '';
+  return normalizeText(versionKey).toUpperCase().match(/^([A-Z]+\d[A-Z0-9]*)-[BCN]\d{2}$/)?.[1] || '';
 }
 
 function referenceAlphaPrefix(reference) {
