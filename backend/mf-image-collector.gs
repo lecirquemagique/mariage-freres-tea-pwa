@@ -68,8 +68,8 @@ var MF_IMAGE_COLLECTOR_REVIEW_DECISIONS = [
   '保留'
 ];
 var MF_IMAGE_COLLECTOR_TAXONOMY_COLUMNS = ['茶種タグ', '現在のカテゴリ', '香味大分類'];
-var MF_IMAGE_COLLECTOR_REVIEW_APPLY_STATUSES = ['要確認', '保留'];
-var MF_IMAGE_COLLECTOR_REVIEW_FINAL_STATUSES = ['承認', '却下', '反映済み'];
+var MF_IMAGE_COLLECTOR_REVIEW_APPLY_STATUSES = ['要確認', '保留', '承認'];
+var MF_IMAGE_COLLECTOR_REVIEW_FINAL_STATUSES = ['却下', '反映済み'];
 var MF_IMAGE_COLLECTOR_TAXONOMY_LOG_HEADERS = [
   'batch_id',
   'timestamp',
