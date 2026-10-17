@@ -1475,9 +1475,50 @@ function mfImageCollectorReviewDecisionOptions_(review) {
   var referenceIdentity = mfImageCollectorReviewSalesSkuIdentity_(review);
   if (referenceIdentity.mode === 'sales_sku') return ['販売SKUとして追加', '却下', '誤検出', '判定保留', '保留'];
   if (referenceIdentity.mode === 'independent_primary') return ['新規銘柄として追加', '却下', '誤検出', '判定保留', '保留'];
+  if (mfImageCollectorReviewHasIndependentEvidence_(review)) return ['新規銘柄として追加', '却下', '誤検出', '判定保留', '保留'];
   if (referenceIdentity.mode === 'unresolved' || referenceIdentity.mode === 'existing_primary') return ['却下', '誤検出', '判定保留', '保留'];
 
   return mfImageCollectorIdentityReviewDecisionOptions_();
+}
+
+// Evidence eligibility is separate from the resolver result and from the human decision.
+// This permits selecting a decision without silently changing unresolved to independent_primary.
+function mfImageCollectorReviewHasIndependentEvidence_(review) {
+  if (String(review['検出種別'] || '') !== 'unregistered_reference') return false;
+  if (mfImageCollectorReviewReferenceMode_(review) !== 'unresolved') return false;
+  var info = mfImageCollectorReviewOfficialInfo_(review);
+  var ref = String(review['Tリファレンス番号'] || '').trim();
+  var name = String(review['公式名'] || '').trim();
+  var url = String(review['公式URL'] || '').trim();
+  // Only a safe literal official reference; this does not broaden the automatic validator.
+  if (!/^T[A-Z0-9]+$/.test(ref) || info.primary_reference !== ref || !name) return false;
+  if (mfImageCollectorIsTfbfReference_(ref)) return false; // Separate existing TFBF policy.
+  if (!/^https:\/\/www\.mariagefreres\.com\/(?:en|fr)\/[^?#]+\.html$/.test(url)) return false;
+  if (!new RegExp('(?:/|-)' + ref.toLowerCase() + '(?:-|\\.)').test(url.toLowerCase())) return false;
+  if (info.t_reference || review['DB既存VersionKey'] || review['DB既存T']) return false;
+  var resolution = info.reference_resolution || {};
+  var parent = resolution.parent_resolution || {}, independent = resolution.independent_primary || {};
+  if ((resolution.primary_matches || []).length || parent.resolved || parent.resolved_parent || info.sales_sku_target) return false;
+  if (resolution.reference && resolution.reference !== ref) return false;
+  if ((independent.explicit_parent_references || []).length || (independent.explicit_parent_names || []).length ||
+      independent.reason === 'explicit_parent_not_resolved' || resolution.reason === 'explicit_parent_not_resolved') return false;
+  if ((parent.candidates || []).some(function(candidate) {
+    return candidate.match_method === 'official_explicit_t_reference' || candidate.match_method === 'official_parent_name';
+  })) return false;
+  var names = info.names_by_language || {}, urls = info.urls_by_language || {};
+  if (!Object.keys(names).some(function(k) { return names[k] === name && urls[k] === url; })) return false;
+  var evidence = String(review['Collectorが取得した根拠'] || '');
+  return new RegExp('\\bREF\\s*[:：]?\\s*' + ref + '(?![A-Z0-9])').test(evidence) && evidence.indexOf(url) >= 0 && evidence.indexOf(name) >= 0;
+}
+
+function mfImageCollectorReviewHumanNewPrimary_(review) {
+  return !!review && String(review['人間判定'] || '').trim() === '新規銘柄として追加' &&
+    mfImageCollectorReviewHasIndependentEvidence_(review);
+}
+
+function mfImageCollectorAssertReviewPrimary_(reference, review) {
+  if (mfImageCollectorReviewHumanNewPrimary_(review) && reference === review['Tリファレンス番号']) return;
+  mfImageCollectorAssertPrimaryReference_(reference);
 }
 
 function mfImageCollectorIdentityReviewDecisionOptions_() {
@@ -2664,17 +2705,24 @@ function mfImageCollectorApplyApprovedReview_(review, decision, targetVersionKey
   if (versionCol < 0 || refCol < 0 || nameCol < 0) throw new Error('Master columns required for approved review are missing.');
 
   if (decision === '新規銘柄として追加' || decision === '既存銘柄の新バージョンとして追加') {
+    if (mfImageCollectorReviewReferenceMode_(review) === 'unresolved' && !mfImageCollectorReviewHumanNewPrimary_(review)) {
+      throw new Error('Unresolved candidate requires official evidence and the explicit human new-primary decision.');
+    }
     var referenceInfo = mfImageCollectorReviewReferenceInfo_(review);
     var reference = referenceInfo.primaryReference;
-    var versionKey = String(targetVersionKey || mfImageCollectorNextVersionKey_(values, headers, reference)).trim().toUpperCase();
+    var humanNewPrimary = mfImageCollectorReviewHumanNewPrimary_(review);
+    if (humanNewPrimary && decision !== '新規銘柄として追加') throw new Error('Human new-primary decision required.');
+    var versionKey = String(targetVersionKey || (humanNewPrimary ? reference + '-B01' : mfImageCollectorNextVersionKey_(values, headers, reference))).trim().toUpperCase();
+    if (humanNewPrimary && versionKey !== reference + '-B01') throw new Error('Human new Primary must start at B01.');
     mfImageCollectorAssertAppendVersionKey_(
       values,
       headers,
       reference,
       versionKey,
-      decision === '新規銘柄として追加'
+      decision === '新規銘柄として追加',
+      humanNewPrimary ? review : null
     );
-    var versionLabel = mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey);
+    var versionLabel = mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey, humanNewPrimary ? review : null);
     var newRow = mfImageCollectorBuildApprovedNewTeaRow_(headers, review, referenceInfo, versionKey, versionLabel);
     if (!options.dry_run) {
       mfImageCollectorAppendMasterRow_(sheet, headers, newRow);
@@ -3027,10 +3075,10 @@ function mfImageCollectorDelimitedValues_(value) {
   }).filter(Boolean);
 }
 
-function mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey) {
+function mfImageCollectorVersionLabelFromVersionKey_(reference, versionKey, review) {
   var ref = String(reference || '').trim().toUpperCase();
   var key = String(versionKey || '').trim().toUpperCase();
-  mfImageCollectorAssertPrimaryReference_(ref);
+  mfImageCollectorAssertReviewPrimary_(ref, review);
   var match = key.match(new RegExp('^' + ref + '-([BCN]\\d{2})$'));
   if (!match) {
     throw new Error('VersionKey and バージョン are inconsistent: ' + key);
@@ -3131,6 +3179,11 @@ function mfImageCollectorReviewReferenceInfo_(review) {
     info = {};
   }
   var primary = String(info.primary_reference || rawReference).trim().toUpperCase();
+  if (mfImageCollectorReviewHumanNewPrimary_(review)) {
+    var hybrid = MF_IMAGE_COLLECTOR_HYBRID_REFERENCE_PREFIXES.some(function(prefix) { return primary.indexOf(prefix) === 0; });
+    return { primaryReference: primary, primaryReferenceType: hybrid ? 'independent_hybrid_primary' : 'primary',
+      tReference: '', salesReferences: {}, skuOnly: false };
+  }
   mfImageCollectorAssertPrimaryReference_(primary);
   var salesRefs = {};
   var infoSalesRefs = info.sales_references || {};
@@ -3947,14 +4000,14 @@ function mfImageCollectorNextVersionKey_(values, headers, reference) {
   return prefix + ('0' + (max + 1)).slice(-2);
 }
 
-function mfImageCollectorAssertAppendVersionKey_(values, headers, reference, versionKey, requireNewPrimary) {
+function mfImageCollectorAssertAppendVersionKey_(values, headers, reference, versionKey, requireNewPrimary, review) {
   var versionCol = headers.indexOf('VersionKey');
   var primaryRefCol = headers.indexOf('Primary Reference');
   if (versionCol < 0) throw new Error('VersionKey column is missing.');
   if (requireNewPrimary && primaryRefCol < 0) throw new Error('Primary Reference column is missing.');
   var ref = String(reference || '').trim().toUpperCase();
   var key = String(versionKey || '').trim().toUpperCase();
-  mfImageCollectorAssertPrimaryReference_(ref);
+  mfImageCollectorAssertReviewPrimary_(ref, review);
   if (!new RegExp('^' + ref + '-B\\d{2}$').test(key)) {
     throw new Error('VersionKey must use the B-series for this reference: ' + ref + '-B##');
   }
