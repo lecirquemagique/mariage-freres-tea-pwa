@@ -3665,16 +3665,31 @@ function cardResearchStock(facts, reference) {
   return notify ? {value:'一時欠品・入荷待ち',evidence:facts.researchAvailability.text} : null;
 }
 
+function cardResearchLookupReason(pages) {
+  const diagnostics = pages.lookup || [];
+  if (pages.some(page => /mismatch|no_verified_reference|canonical_conflict/.test(page.reject_reason || ''))) return 'version_ambiguous';
+  const reasons = new Set(diagnostics.map(item => item.reason).filter(Boolean));
+  if (reasons.size === 1) return [...reasons][0];
+  return 'official_lookup_inconclusive';
+}
+
 function buildCardResearchPlan(request, pages) {
   cardResearchIdentity(request);
   const target = request.target;
   const effective = request.missing_fields.filter(field => !String(target[field] || '').trim() || target[field] === '未確認');
   const candidates = [], unresolved = {};
   const names = [target['現在の公式名'] || target['銘柄名（黒い本）'] || request.target_name].filter(Boolean).map(cardResearchName);
-  const verified = (pages || []).filter(page => {
+  pages = pages || [];
+  let verified = pages.filter(page => {
     try { return page.ok === true && normalizeOfficialTargetProductUrl(page.url) &&
       (page.refs || []).includes(request.tea_reference) && names.includes(cardResearchName(page.official_name)); } catch { return false; }
   });
+  // Multiple distinct verified page identities are not resolved by array order.
+  const multiple = new Set(verified.map(page => page.url)).size > 1;
+  const rejectedIdentity = pages.some(page => (page.ok === true && !verified.includes(page)) ||
+    /mismatch|no_verified_reference|canonical_conflict/.test(page.reject_reason || ''));
+  const lookupReason = multiple || rejectedIdentity ? 'version_ambiguous' : cardResearchLookupReason(pages);
+  if (multiple || rejectedIdentity) verified = [];
   const product = {reference:request.primary_reference,name:target['現在の公式名'] || target['銘柄名（黒い本）'],
     master:{...target,versionKey:request.version_key}, productUrl:target['公式商品ページURL'] || ''};
   const vocabulary = structuredFactVocabulary([product]);
@@ -3707,55 +3722,82 @@ function buildCardResearchPlan(request, pages) {
   for (const field of effective) {
     if (candidates.some(c => c.target_column === field)) continue;
     unresolved[field] = ['茶葉画像URL','茶葉サムネイルURL','水色画像URL'].includes(field)
-      ? 'image_review_pipeline_required' : field === '水出し用ブレンド' ? 'unsupported' : verified.length ? 'no_official_evidence' : 'version_ambiguous';
+      ? 'image_review_pipeline_required' : field === '水出し用ブレンド' ? 'unsupported' : verified.length ? 'no_official_evidence' : lookupReason;
   }
-  return {mode:'existing_primary',version_key:request.version_key,effective_missing_fields:effective,candidates,unresolved};
+  return {mode:'existing_primary',version_key:request.version_key,effective_missing_fields:effective,candidates,unresolved,lookup_diagnostics:pages.lookup || []};
 }
 
 async function inspectCardResearchPages({context,config,request,debug}) {
   const page = await context.newPage(), pages = [], seen = new Set();
+  pages.lookup = [];
   const input = {reference:request.tea_reference,name:request.target['現在の公式名'] || request.target['銘柄名（黒い本）'] || request.target_name,url_reference:''};
+  // Only the complete_card reader uses this facade; legacy discovery is unchanged.
+  const reader = new Proxy(page, {get(target,key) {
+    if (key === 'goto') return async (url,options) => {
+      const response = await target.goto(url,options);
+      const status = response?.status();
+      const title = typeof target.title === 'function' ? await target.title() : '';
+      const text = await target.locator('body').innerText();
+      const blocked = [403,429,503].includes(status) || /cloudflare|verify you are human|just a moment|vérifiez que vous êtes humain/i.test(title + '\n' + text);
+      const reason = blocked ? 'official_access_blocked' : !status || status >= 400 ? 'official_lookup_inconclusive' : '';
+      const entry = {url,status:status || null,title,reason};
+      pages.lookup.push(entry);
+      if (reason) { const error = new Error(reason); error.lookupRecorded = true; throw error; }
+      return response;
+    };
+    const value = target[key];
+    return typeof value === 'function' ? value.bind(target) : value;
+  }});
+  async function attempt(url,action) {
+    try { return await action(); }
+    catch(error) {
+      if (!error.lookupRecorded) pages.lookup.push({url,reason:'official_lookup_inconclusive'});
+      return null;
+    }
+  }
   async function inspect(url) {
     if (seen.size >= 12 || seen.has(url)) return;
-    normalizeOfficialTargetProductUrl(url);
-    seen.add(url);
-    const inspected = await inspectTargetedProductPage(page,url,input,config,debug,'complete_card');
-    if (!inspected.ok) return;
-    const extra = await page.evaluate(() => {
-      const root = document.querySelector('.product-info-main');
-      const text = root ? [...root.querySelectorAll('button,a,[role="button"]')].filter(el => {
-        const style = getComputedStyle(el);
-        return style.display !== 'none' && style.visibility !== 'hidden' && el.getBoundingClientRect().height > 0;
-      }).map(el => el.textContent.trim()).filter(t => /notify me|me prévenir|bientôt disponible|available soon/i.test(t)).join(' / ') : '';
-      const data = [...document.querySelectorAll('script[type="application/ld+json"]')].flatMap(el => {
-        try { return [JSON.parse(el.textContent)]; } catch { return []; }
+    await attempt(url,async () => {
+      normalizeOfficialTargetProductUrl(url);
+      seen.add(url);
+      const inspected = await inspectTargetedProductPage(reader,url,input,config,debug,'complete_card');
+      if (!inspected.ok) {
+        if (inspected.reject_reason === 'browser_verification') pages.lookup.push({url,reason:'official_access_blocked'});
+        else pages.push(inspected);
+        return;
+      }
+      const extra = await page.evaluate(() => {
+        const root = document.querySelector('.product-info-main');
+        const text = root ? [...root.querySelectorAll('button,a,[role="button"]')].filter(el => {
+          const style = getComputedStyle(el);
+          return style.display !== 'none' && style.visibility !== 'hidden' && el.getBoundingClientRect().height > 0;
+        }).map(el => el.textContent.trim()).filter(t => /notify me|me prévenir|bientôt disponible|available soon/i.test(t)).join(' / ') : '';
+        const data = [...document.querySelectorAll('script[type="application/ld+json"]')].flatMap(el => {
+          try { return [JSON.parse(el.textContent)]; } catch { return []; }
+        });
+        return {researchAvailability:{source:'visible_product_controls',text},researchProductData:data};
       });
-      return {researchAvailability:{source:'visible_product_controls',text},researchProductData:data};
+      Object.assign(inspected.facts,extra);
+      pages.push(inspected);
     });
-    Object.assign(inspected.facts,extra);
-    pages.push(inspected);
   }
   try {
-    const urls = [];
+    const urls = new Set();
     if (request.target['公式商品ページURL']) await inspect(request.target['公式商品ページURL']);
     for (const query of targetedSearchQueries({name:input.name,reference:input.reference}).slice(0,2)) {
-      for (const searchUrl of productSearchUrls(query)) {
-        await page.goto(searchUrl,{waitUntil:'domcontentloaded',timeout:config.navigationTimeoutMs || 45000});
-        const text = await page.locator('body').innerText();
-        if (/cloudflare|verify you are human|just a moment|vérifiez que vous êtes humain/i.test(text)) throw new Error('Official research blocked');
+      for (const searchUrl of productSearchUrls(query)) await attempt(searchUrl,async () => {
+        await reader.goto(searchUrl,{waitUntil:'domcontentloaded',timeout:config.navigationTimeoutMs || 45000});
         for (const item of await collectProductSearchCandidates(page)) {
-          const identity = `${item.href}\n${item.text}\n${item.closestText}`;
-          if (looksLikeProductUrl(item.href) && (referenceRegex(input.reference).test(identity) || targetedNameMatches(input.name,identity))) urls.push(item.href);
+          const identity = item.href + '\n' + item.text + '\n' + item.closestText;
+          if (looksLikeProductUrl(item.href) && (referenceRegex(input.reference).test(identity) || targetedNameMatches(input.name,identity))) urls.add(item.href);
         }
-      }
+        const entry = pages.lookup[pages.lookup.length - 1];
+        entry.reason = /no results|no products|aucun résultat|aucun produit|検索(?:結果|条件).*(?:ありません|見つかりません)|該当.*(?:ありません|ございません)/i.test(await page.locator('body').innerText())
+          ? 'official_search_no_result' : 'official_lookup_inconclusive';
+      });
     }
-    for (const url of urls) {
-      await inspect(url);
-    }
+    for (const url of urls) await inspect(url);
     return pages;
-  } catch(error) {
-    if (pages.length) return pages;
-    throw error;
   } finally { await page.close(); }
 }
 
@@ -3771,10 +3813,9 @@ async function cardResearchApi({config,baseDir},payload) {
 
 async function processCardResearchRequest({request,inspect,call,dryRun=false}) {
   const identity = cardResearchIdentity(request);
-  let pages = [], blocked = false;
-  try { pages = await inspect(request); } catch { blocked = true; }
+  let pages = [];
+  try { pages = await inspect(request); } catch { pages.lookup = [{reason:'official_lookup_inconclusive'}]; }
   const plan = buildCardResearchPlan(request,pages);
-  if (blocked) for (const field of Object.keys(plan.unresolved)) plan.unresolved[field] = 'blocked_or_unavailable';
   if (dryRun) return {ok:true,status:'dry_run',plan,normal_image_products:0,master_writes:0};
   if (!request.claim_token) throw new Error('Research claim token is missing');
   for (const candidate of plan.candidates) {

@@ -264,7 +264,7 @@ function mfImageCollectorCardResearchWorker_(payload) {
       proposed.push({field:field,detection_id:r[rh.indexOf('検出ID')],review_row:i+2});
     });
     var reasons = payload.unresolved || {};
-    var allowedReasons = ['no_official_evidence','blocked_or_unavailable','version_ambiguous','unsupported','image_review_pipeline_required'];
+    var allowedReasons = ['no_official_evidence','blocked_or_unavailable','official_access_blocked','official_search_no_result','official_lookup_inconclusive','version_ambiguous','unsupported','image_review_pipeline_required'];
     if (typeof reasons !== 'object' || Array.isArray(reasons) || Object.keys(reasons).some(function(k) { return c.fields.indexOf(k) < 0 || allowedReasons.indexOf(reasons[k]) < 0; })) throw new Error('Invalid unresolved result.');
     var result = {mode:'review_only',version_key:c.request.version_key,proposed:proposed,
       unresolved:c.effective.filter(function(k) { return !proposed.some(function(p) { return p.field === k; }); }).map(function(k) { return {field:k,reason:reasons[k] || 'no_official_evidence'}; }),

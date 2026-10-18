@@ -80,3 +80,15 @@ tests/complete-card-collector.test.jsは公式ページもmockし、専用worker
 
 GitHub mainのGASは本番のResearch受付や保護ガードをまだ含まない。本作業前からの未commit差分が混在するので、mainのGAS全体を本番へ上書きしない。
 将来、専用POSTを導入するには既存本番プロジェクトへの保存と既存Web App deployment更新が必要。今回どちらも行わない。
+
+## Preview失敗理由の分類（ローカル修正・未反映）
+
+complete_card専用readerは検索・商品ページのHTTP statusを確認し、403/429/503、またはCloudflare等のtitle/bodyをofficial_access_blockedとする。その他のHTTP失敗・通信失敗・不明な検索画面はofficial_lookup_inconclusive。HTTP200で明示された検索結果なしはofficial_search_no_result。空の検索画面だけでは検索結果なしと断定しない。
+
+複数ソースの失敗理由が混在する場合はofficial_lookup_inconclusive。plan.lookup_diagnosticsにはURL・HTTP status・title・理由を残す。Version/REF/名称不一致、canonical衝突、異なる検証済み商品URLが複数残る場合はversion_ambiguousとして配列先頭を採用しない。正しい単一ページが確認できた場合も既存の公式URL・exact REF・名称検証は必須。アクセス阻害や検索結果なしを未掲載・終売に変換しない。
+
+画像3種のimage_review_pipeline_required、水出しのunsupportedは、アクセス失敗時も専用理由を維持する。例外で理由を全項目上書きしない。根拠のない候補は生成せず、Master更新なし。
+
+T2306のfixtureを、検索を省略するresolved-product成功ケース（5候補/9未解決）とFR/EN403＋日本公式200検索結果なしの検索失敗ケース（0候補/14未解決）に分離。後者は10項目official_lookup_inconclusive＋画像3項目＋unsupported1項目。HTTP403本文空、本文Cloudflare、429、503、titleのみchallenge、200検索結果なしも個別検証する。
+
+GAS側のローカル変更は完了APIの理由allowlistに新3分類を加えるだけ。旧理由も保持し、Master/Reviewへの書込み制御・対象検証は変更しない。本番には未保存のため、実write-back前には対応版の安全な統合が必要。今回はpreview/mockのみ。
