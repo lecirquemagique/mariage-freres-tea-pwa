@@ -1577,10 +1577,24 @@ function mfImageCollectorAssertReviewDecisionAllowed_(review, decision, targetVe
     }
   }
   var detectionType = String(review['検出種別'] || '').trim();
-  if (salesIdentity.mode === 'existing_primary' && detectionType !== 'official_name_changed' &&
+  var existingUpdate = salesIdentity.mode === 'existing_primary' && normalizedDecision === '既存銘柄を更新' &&
+    ['official_name_changed', 'official_description_translation', 'structured_fact'].indexOf(detectionType) >= 0;
+  if (salesIdentity.mode === 'existing_primary' && !existingUpdate &&
       normalizedDecision !== '誤検出' && normalizedDecision !== '保留' &&
       normalizedDecision !== '却下' && normalizedDecision !== '判定保留') {
     throw new Error('既存Primary Referenceに対する新規Referenceレビューは反映できません。');
+  }
+  if (existingUpdate) {
+    var existingTargetKey = String(targetVersionKey || review['対象VersionKey'] || review['DB既存VersionKey'] || '').trim();
+    if (!existingTargetKey) throw new Error('既存Primaryの更新には対象VersionKeyが必要です。');
+    var existingContext = mfImageCollectorMasterContext_(options);
+    var existingTarget = mfImageCollectorResolveExplicitTargetMasterRow_(existingContext.values, existingContext.headers, existingTargetKey);
+    var reviewPrimary = mfImageCollectorReviewPrimaryReference_(review);
+    var displayReference = String(review['Tリファレンス番号'] || '').trim().toUpperCase();
+    if (!reviewPrimary || existingTarget.primary_reference !== reviewPrimary ||
+        (displayReference && displayReference !== existingTarget.primary_reference)) {
+      throw new Error('VersionKey / Primary Reference mismatch: ' + existingTargetKey + ' / ' + reviewPrimary);
+    }
   }
 
   if (detectionType === 'official_description_translation' && normalizedDecision === '既存銘柄を更新') {
