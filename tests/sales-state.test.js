@@ -38,6 +38,7 @@ function pwaContext() {
     return nodes[id] ||= { value: id === 'displayScope' ? 'shopping' : '', checked: false,
       addEventListener() {}, innerHTML: '', textContent: '', querySelectorAll: () => [] };
   }};
+  document.querySelectorAll = () => []; // Research-button DOM query in render().
   const ctx = { document, window: { MF_APP_CONFIG: {} }, MFSalesState: sales };
   vm.createContext(ctx);
   // Exercise actual app functions; omit only network/SW bootstrap.

@@ -615,7 +615,21 @@
         padding-bottom:23px
       }
     }
-  </style>
+      .research-actions{margin-top:14px;display:flex;justify-content:flex-end}
+    .research-button,.research-dialog .card-button{min-height:44px;display:inline-flex;align-items:center;justify-content:center;padding:8px 11px;border:1px solid #79613b;border-radius:6px;font:inherit;font-size:12px;background:#201a12;color:#d8c394;cursor:pointer}
+    .research-button:disabled{opacity:.5;cursor:not-allowed}
+    .research-button:focus-visible,.research-dialog button:focus-visible{outline:2px solid #e9c581;outline-offset:3px}
+    .research-button{font-size:12px;padding:8px 11px;min-height:44px;background:transparent;color:#d8c394}
+    .research-feedback{font-size:12px;line-height:1.6;color:#ead5ac;overflow-wrap:anywhere}
+    .research-dialog{width:min(420px,calc(100% - 32px));max-height:calc(100dvh - 32px);overflow:auto;padding:22px;border:1px solid #947543;border-radius:10px;background:#171511;color:#f1e4cc}
+    .research-dialog::backdrop{background:rgba(0,0,0,.72)}
+    .research-dialog h2{font-size:18px;margin:0 0 16px;color:#e4c78d}
+    .research-dialog p{line-height:1.7;overflow-wrap:anywhere}
+    .research-dialog .dialog-ref{font-size:12px;color:#d8c394;margin-bottom:6px}
+    .research-dialog .dialog-name{font-size:16px;margin-top:0}
+    .research-dialog .dialog-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:10px;margin-top:20px}
+    .research-dialog .confirm-research{background:#d5b477;color:#17120b}
+</style>
 </head>
 
 <body>
@@ -723,11 +737,62 @@
 
 <main id="list" class="grid wrap"></main>
 
+<dialog id="researchDialog" class="research-dialog" aria-labelledby="researchDialogTitle" aria-describedby="researchDialogMessage">
+  <h2 id="researchDialogTitle">情報を補完</h2>
+  <p id="researchDialogRef" class="dialog-ref"></p>
+  <p id="researchDialogName" class="dialog-name"></p>
+  <p id="researchDialogMessage">この銘柄の不足情報を調査キューへ送ります</p>
+  <div class="dialog-actions">
+    <button type="button" id="cancelResearch" class="card-button" autofocus>キャンセル</button>
+    <button type="button" id="confirmResearch" class="card-button confirm-research">調査依頼する</button>
+  </div>
+</dialog>
+<script id="complete-card-client">
+(function(root){
+  'use strict';
+  function payload(row) {
+    if(!row || typeof row.VersionKey!=='string' || !row.VersionKey.trim()) throw new Error('対象VersionKeyがありません。');
+    return {action:'requestResearch',versionKey:row.VersionKey,primaryReference:String(row['Primary Reference']||''),
+      teaReference:String(row['Tリファレンス番号']||''),displayName:String(row['現在の公式名']||row['銘柄名（黒い本）']||''),
+      requestType:'complete_card',requestedAt:new Date().toISOString()};
+  }
+  function errorMessage(status,reason) {
+    const messages={reference_mismatch:'REFが登録情報と一致しません。',invalid_version:'対象Versionが見つかりません。',
+      conflict:'対象Versionまたは受付情報が一致しません。',disabled:'現在、調査依頼の受付は停止中です。',
+      error:'調査依頼を登録できませんでした。時間をおいて再試行してください。',
+      invalid_request_type:'調査依頼の種類が不正です。',schema_required:'受付の準備が整っていません。',busy:'受付が混み合っています。再試行してください。'};
+    return messages[reason]||messages[status]||messages.error;
+  }
+  async function send(row,config,fetcher=fetch) {
+    const body=payload(row);
+    if(config.RESEARCH_API_ENABLED===false) throw new Error(errorMessage('disabled'));
+    let endpoint;
+    try{endpoint=new URL(config.GAS_API_URL);}catch(_){throw new Error('受付URLが設定されていません。');}
+    if(endpoint.protocol!=='https:' && !(endpoint.protocol==='http:'&&['localhost','127.0.0.1'].includes(endpoint.hostname)))throw new Error('受付URLが不正です。');
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);
+    try{
+      const response=await fetcher(endpoint.href,{method:'POST',mode:'cors',credentials:'omit',redirect:'follow',
+        headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(config.RESEARCH_DRY_RUN===true?{...body,dryRun:true}:body),signal:controller.signal});
+      if(!response.ok)throw new Error('受付サーバーとの通信に失敗しました。');
+      const result=await response.json();
+      if(!result.ok || !['queued','already_queued','dry_run'].includes(result.status)){
+        throw new Error(errorMessage(result.status,result.reason));
+      }
+      if(result.versionKey!==row.VersionKey)throw new Error('受付結果のVersionKeyが一致しません。');
+      return result;
+    }catch(e){if(e.name==='AbortError'||e.name==='TimeoutError'||e instanceof TypeError)throw new Error('通信に失敗しました。接続を確認して再試行してください。');if(e instanceof SyntaxError)throw new Error('受付結果を読み取れませんでした。再試行してください。');throw e;}
+    finally{clearTimeout(timer);}
+  }
+  const api={payload,send,errorMessage};if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.MFResearchRequest=api;
+})(typeof globalThis!=='undefined'?globalThis:this);
+</script>
 <script src="app-config.js"></script>
 <script src="sales-state.js"></script>
 
 <script>
 let R=[];
+const researchStates=new Map();
+let researchConfirmation=null;
 let salesMigrationComplete=false;
 let aromaSel=new Set();
 let detailSel=new Set();
@@ -1561,7 +1626,7 @@ function render(){
           : '';
 
       return `
-        <article class="card">
+        <article class="card" data-version-key="${esc(r.VersionKey)}">
 
           ${visual}
 
@@ -1630,14 +1695,31 @@ function render(){
                 : ''
             }
 
+            <div class="research-actions">
+              <button type="button" class="card-button research-button" data-version-key="${esc(r.VersionKey)}" ${typeof r.VersionKey!=='string'||!r.VersionKey.trim()||R.filter(x=>x.VersionKey===r.VersionKey).length!==1?'disabled':''}>情報を補完</button>
+            </div>
           </div>
 
         </article>
       `;
 
     }).join('');
+  refreshResearchButtons();
 }
 
+
+function refreshResearchButtons(){
+  document.querySelectorAll('.research-button').forEach(button=>{
+    const state=researchStates.get(button.dataset.versionKey);
+    if(!state)return;
+    button.disabled=state.kind==='pending'||state.kind==='done'||!button.dataset.versionKey||R.filter(row=>row.VersionKey===button.dataset.versionKey).length!==1;
+    button.textContent=state.kind==='pending'?'受付中…':state.kind==='done'?'✓ 調査依頼済み':state.kind==='dry_run'?'検証済み（未送信）':'再試行する';
+    let message=button.closest('.body').querySelector('.research-feedback');
+    if(!message){message=document.createElement('p');message.className='research-feedback';message.setAttribute('role','status');button.parentElement.before(message);}
+    message.setAttribute('role',state.kind==='error'?'alert':'status');
+    message.textContent=state.message||'';
+  });
+}
 
 function reset(){
 
@@ -1835,6 +1917,43 @@ function loadJsonp(){
 
 );
 
+
+$('list').addEventListener('click',event=>{
+  const button=event.target.closest('.research-button');
+  if(!button || button.disabled || researchConfirmation) return;
+  const candidates=R.filter(row=>row.VersionKey===button.dataset.versionKey);
+  if(candidates.length!==1 || !button.dataset.versionKey) return;
+  const key=button.dataset.versionKey;
+  if(['pending','done'].includes(researchStates.get(key)?.kind))return;
+  // Snapshot the Master row, never reconstruct references or names from card text.
+  researchConfirmation={row:{...candidates[0]},button};
+  const row=researchConfirmation.row;
+  $('researchDialogRef').textContent='REF：'+String(row['Tリファレンス番号']||row['Primary Reference']||'');
+  $('researchDialogName').textContent=String(row['現在の公式名']||row['銘柄名（黒い本）']||'');
+  $('researchDialog').showModal();
+});
+$('cancelResearch').addEventListener('click',()=>$('researchDialog').close());
+$('researchDialog').addEventListener('close',()=>{if(!$('researchDialog').open)researchConfirmation=null;});
+$('confirmResearch').addEventListener('click',async()=>{
+  const confirmation=researchConfirmation;
+  if(!confirmation)return;
+  researchConfirmation=null; // Block repeated confirm clicks before starting any async work.
+  const {row}=confirmation,key=row.VersionKey;
+  $('researchDialog').close();
+  const candidates=R.filter(item=>item.VersionKey===key);
+  if(candidates.length!==1 || ['VersionKey','Primary Reference','Tリファレンス番号','現在の公式名','銘柄名（黒い本）'].some(field=>candidates[0][field]!==row[field])){
+    researchStates.set(key,{kind:'error',message:'表示データが更新されました。カードを確認して再試行してください。'});
+    refreshResearchButtons();return;
+  }
+  if(['pending','done'].includes(researchStates.get(key)?.kind))return;
+  researchStates.set(key,{kind:'pending'});refreshResearchButtons();
+  try{
+    const result=await MFResearchRequest.send(row,C);
+    const message=result.status==='queued'?'調査依頼を登録しました':result.status==='already_queued'?'この銘柄はすでに調査待ちです':'受付内容を検証しました。キューには書き込んでいません。';
+    researchStates.set(key,{kind:result.status==='dry_run'?'dry_run':'done',message});
+  }catch(error){researchStates.set(key,{kind:'error',message:error.message});}
+  refreshResearchButtons();
+});
 
 $('reset').addEventListener(
   'click',
