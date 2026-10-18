@@ -94,6 +94,8 @@ function parseArgs(argv) {
     reloadExistingPages: true,
     dryRun: false,
     writeBack: null,
+    researchQueueOnly: false,
+    requestId: '',
     useConfigProducts: false,
     discoverUrlsOnly: false,
     discoverNewReferences: false,
@@ -168,6 +170,9 @@ function parseArgs(argv) {
     else if (arg.startsWith('--apply-enrichment-review-plan=')) args.applyEnrichmentReviewPlan = arg.slice('--apply-enrichment-review-plan='.length);
     else if (arg === '--report-enrichment-data-issues') args.reportEnrichmentDataIssues = argv[++i] || '';
     else if (arg.startsWith('--report-enrichment-data-issues=')) args.reportEnrichmentDataIssues = arg.slice('--report-enrichment-data-issues='.length);
+    else if (arg === '--research-queue-only') args.researchQueueOnly = true;
+    else if (arg === '--request-id') args.requestId = argv[++i] || '';
+    else if (arg.startsWith('--request-id=')) args.requestId = arg.slice('--request-id='.length);
     else if (arg === '--write-review') args.writeReview = true;
     else if (arg === '--write-master') args.writeMaster = true;
     else if (arg === '--enrich-ref') {
@@ -3622,6 +3627,191 @@ async function writeBackReviewCandidates({ config, baseDir, candidates, debug })
   return results;
 }
 
+// This path never calls legacy discovery, image writeback, or normal Collector selection.
+const CARD_RESEARCH_FIELDS = ['公式商品ページURL','公式掲載状態','現行ステータス','現在の公式名','現在の公式説明','茶種タグ','産地・国','産地・地域／茶園','香味大分類','香味詳細タグ','水出し用ブレンド','アイスティー推奨','ミルクティー推奨','テインフリー','茶葉画像URL','茶葉サムネイルURL','水色画像URL'];
+
+function cardResearchIdentity(request) {
+  const target = request?.target;
+  if (request?.request_type !== 'complete_card' || request.source !== 'PWA' || !request.request_id ||
+      !request.version_key || target?.VersionKey !== request.version_key || !request.primary_reference || !request.tea_reference ||
+      target['Primary Reference'] !== request.primary_reference || target['Tリファレンス番号'] !== request.tea_reference) {
+    throw new Error('complete_card VersionKey/Primary/T identity mismatch');
+  }
+  if (!Array.isArray(request.missing_fields) || new Set(request.missing_fields).size !== request.missing_fields.length ||
+      request.missing_fields.some(field => !CARD_RESEARCH_FIELDS.includes(field) || !Object.hasOwn(target, field))) throw new Error('Invalid research missing_fields');
+  return {request_id:request.request_id, version_key:request.version_key, primary_reference:request.primary_reference,tea_reference:request.tea_reference};
+}
+
+function cardResearchName(value) {
+  return String(value || '').normalize('NFKD').replace(/\p{M}/gu,'').replace(/[®™]/g,'').toUpperCase().replace(/[^\p{L}\p{N}]/gu,'');
+}
+
+function cardResearchStock(facts, reference) {
+  const notify = facts.researchAvailability?.source === 'visible_product_controls' &&
+    /notify me|me prévenir|bientôt disponible|available soon/i.test(facts.researchAvailability.text || '');
+  let data; try { data = facts.researchProductData || JSON.parse(facts.structuredProductData || 'null'); } catch { data = null; }
+  const products = [];
+  function visit(value) {
+    if (Array.isArray(value)) { value.forEach(visit); return; }
+    if (!value || typeof value !== 'object') return;
+    if ([value['@type']].flat().includes('Product') && value.sku === reference) products.push(value);
+    if (value['@graph']) visit(value['@graph']);
+  }
+  visit(data);
+  if (products.length !== 1) return notify ? {value:'一時欠品・入荷待ち',evidence:facts.researchAvailability.text} : null;
+  const values = [products[0].offers].flat().filter(Boolean).map(offer => String(offer.availability || '').split('/').pop());
+  if (values.length && values.every(value => value === 'InStock')) return notify ? null : {value:'販売中',evidence:JSON.stringify(products[0])};
+  if (values.length && values.every(value => ['OutOfStock','PreOrder','BackOrder'].includes(value))) return {value:'一時欠品・入荷待ち',evidence:JSON.stringify(products[0])};
+  return notify ? {value:'一時欠品・入荷待ち',evidence:facts.researchAvailability.text} : null;
+}
+
+function buildCardResearchPlan(request, pages) {
+  cardResearchIdentity(request);
+  const target = request.target;
+  const effective = request.missing_fields.filter(field => !String(target[field] || '').trim() || target[field] === '未確認');
+  const candidates = [], unresolved = {};
+  const names = [target['現在の公式名'] || target['銘柄名（黒い本）'] || request.target_name].filter(Boolean).map(cardResearchName);
+  const verified = (pages || []).filter(page => {
+    try { return page.ok === true && normalizeOfficialTargetProductUrl(page.url) &&
+      (page.refs || []).includes(request.tea_reference) && names.includes(cardResearchName(page.official_name)); } catch { return false; }
+  });
+  const product = {reference:request.primary_reference,name:target['現在の公式名'] || target['銘柄名（黒い本）'],
+    master:{...target,versionKey:request.version_key}, productUrl:target['公式商品ページURL'] || ''};
+  const vocabulary = structuredFactVocabulary([product]);
+  // Existing vocabulary is only an allowlist, never proof of a fact.
+  for (const field of Object.keys(vocabulary)) vocabulary[field] = new Set([...vocabulary[field],...(request.vocabulary?.[field] || [])]);
+  function add(field, value, evidence, page) {
+    if (!effective.includes(field) || !value || !String(evidence || '').trim() || candidates.some(c => c.target_column === field)) return;
+    candidates.push({target_column:field,current_value:target[field],suggested_value:String(value),evidence_text:String(evidence),
+      evidence_url:page.url,evidence_language:page.language || sourceLanguageFromUrl(page.url),official_name:page.official_name,
+      verified_references:[request.tea_reference]});
+  }
+  for (const page of verified) {
+    const facts = page.facts || {};
+    const identityEvidence = `${page.official_name} / REF ${request.tea_reference} / ${page.url}`;
+    add('公式商品ページURL',page.url,identityEvidence,page);
+    add('公式掲載状態','掲載中',identityEvidence,page);
+    add('現在の公式名',page.official_name,identityEvidence,page);
+    const stock = cardResearchStock(facts,request.tea_reference);
+    if (stock) add('現行ステータス',stock.value,stock.evidence,page);
+    if (facts.productDescription) add('現在の公式説明','翻訳レビュー候補',facts.productDescription,page);
+    // No REF/category defaults: tea type requires explicit official category evidence.
+    if (facts.category) add('茶種タグ',normalizeTeaTypeTagsForMaster(normalizeOfficialCategoryForMaster(facts.category)),facts.category,page);
+    for (const suggestion of buildStructuredFactSuggestions({product,facts:{...facts,url:page.url},vocabulary})) {
+      // The broad legacy parser is shared, but research never converts a negated claim into a positive flag.
+      if (['ミルクティー推奨','アイスティー推奨','テインフリー'].includes(suggestion.column) &&
+          /\b(?:not|never|no|without)\b|ne\b.{0,60}\bpas\b|非推奨|ありません|向きません/i.test(suggestion.evidence_text)) continue;
+      add(suggestion.column,suggestion.suggested_value,suggestion.evidence_text,page);
+    }
+  }
+  for (const field of effective) {
+    if (candidates.some(c => c.target_column === field)) continue;
+    unresolved[field] = ['茶葉画像URL','茶葉サムネイルURL','水色画像URL'].includes(field)
+      ? 'image_review_pipeline_required' : field === '水出し用ブレンド' ? 'unsupported' : verified.length ? 'no_official_evidence' : 'version_ambiguous';
+  }
+  return {mode:'existing_primary',version_key:request.version_key,effective_missing_fields:effective,candidates,unresolved};
+}
+
+async function inspectCardResearchPages({context,config,request,debug}) {
+  const page = await context.newPage(), pages = [], seen = new Set();
+  const input = {reference:request.tea_reference,name:request.target['現在の公式名'] || request.target['銘柄名（黒い本）'] || request.target_name,url_reference:''};
+  async function inspect(url) {
+    if (seen.size >= 12 || seen.has(url)) return;
+    normalizeOfficialTargetProductUrl(url);
+    seen.add(url);
+    const inspected = await inspectTargetedProductPage(page,url,input,config,debug,'complete_card');
+    if (!inspected.ok) return;
+    const extra = await page.evaluate(() => {
+      const root = document.querySelector('.product-info-main');
+      const text = root ? [...root.querySelectorAll('button,a,[role="button"]')].filter(el => {
+        const style = getComputedStyle(el);
+        return style.display !== 'none' && style.visibility !== 'hidden' && el.getBoundingClientRect().height > 0;
+      }).map(el => el.textContent.trim()).filter(t => /notify me|me prévenir|bientôt disponible|available soon/i.test(t)).join(' / ') : '';
+      const data = [...document.querySelectorAll('script[type="application/ld+json"]')].flatMap(el => {
+        try { return [JSON.parse(el.textContent)]; } catch { return []; }
+      });
+      return {researchAvailability:{source:'visible_product_controls',text},researchProductData:data};
+    });
+    Object.assign(inspected.facts,extra);
+    pages.push(inspected);
+  }
+  try {
+    const urls = [];
+    if (request.target['公式商品ページURL']) await inspect(request.target['公式商品ページURL']);
+    for (const query of targetedSearchQueries({name:input.name,reference:input.reference}).slice(0,2)) {
+      for (const searchUrl of productSearchUrls(query)) {
+        await page.goto(searchUrl,{waitUntil:'domcontentloaded',timeout:config.navigationTimeoutMs || 45000});
+        const text = await page.locator('body').innerText();
+        if (/cloudflare|verify you are human|just a moment|vérifiez que vous êtes humain/i.test(text)) throw new Error('Official research blocked');
+        for (const item of await collectProductSearchCandidates(page)) {
+          const identity = `${item.href}\n${item.text}\n${item.closestText}`;
+          if (looksLikeProductUrl(item.href) && (referenceRegex(input.reference).test(identity) || targetedNameMatches(input.name,identity))) urls.push(item.href);
+        }
+      }
+    }
+    for (const url of urls) {
+      await inspect(url);
+    }
+    return pages;
+  } catch(error) {
+    if (pages.length) return pages;
+    throw error;
+  } finally { await page.close(); }
+}
+
+async function cardResearchApi({config,baseDir},payload) {
+  const settings = getWriteBackSettings({...config,writeBack:{...config.writeBack,enabled:true}},baseDir);
+  if (!settings) throw new Error('Research API settings required');
+  const response = await fetch(settings.gasApiUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
+    body:JSON.stringify({...payload,secret:settings.secret})});
+  const result = await response.json();
+  if (!response.ok || result.ok !== true) throw new Error(result.error || result.reason || 'Research API failed');
+  return result;
+}
+
+async function processCardResearchRequest({request,inspect,call,dryRun=false}) {
+  const identity = cardResearchIdentity(request);
+  let pages = [], blocked = false;
+  try { pages = await inspect(request); } catch { blocked = true; }
+  const plan = buildCardResearchPlan(request,pages);
+  if (blocked) for (const field of Object.keys(plan.unresolved)) plan.unresolved[field] = 'blocked_or_unavailable';
+  if (dryRun) return {ok:true,status:'dry_run',plan,normal_image_products:0,master_writes:0};
+  if (!request.claim_token) throw new Error('Research claim token is missing');
+  for (const candidate of plan.candidates) {
+    // Failures leave ownership in processing. Never report completed after uncertain Review writes.
+    const result = await call({action:'recordCardResearchCandidate',...identity,claim_token:request.claim_token,candidate});
+    if (!['recorded','already_recorded'].includes(result.status)) throw new Error('Review candidate not acknowledged');
+  }
+  const result = await call({action:'completeCardResearchRequest',...identity,claim_token:request.claim_token,unresolved:plan.unresolved});
+  if (!['completed','already_completed'].includes(result.status)) throw new Error('Research completion not acknowledged');
+  return {...result,plan,normal_image_products:0,master_writes:0};
+}
+
+async function runResearchQueueOnly({args,config,baseDir,call,connect=connectBrowser,inspect=inspectCardResearchPages}) {
+  if (!args.researchQueueOnly || !/^[A-Za-z0-9-]{1,100}$/.test(args.requestId || '') || !args.connectCdp ||
+      args.targetName || args.targetRef || args.targetUrl || args.refs?.length || args.versionKeys?.length || args.useConfigProducts ||
+      args.discoverNewReferences || args.discoverUrlsOnly || args.backfillOfficialDescriptions || args.enrichIncompleteRecords ||
+      args.auditIncompleteRecords || args.taxonomyDryRun || args.statusJson || args.authSetup || args.writeMaster || args.writeReview ||
+      args.writeStructuredReviewCandidates || args.auditPrimaryReferenceBackfill || args.planPrimaryReferenceColumn || args.ensurePrimaryReferenceColumn ||
+      args.planPrimaryReferenceBackfill || args.applyPrimaryReferenceBackfill || args.planEnrichmentReviewWriteback || args.applyEnrichmentReviewPlan || args.reportEnrichmentDataIssues) {
+    throw new Error('Use --research-queue-only --request-id <id> --connect-cdp <url> without other work modes');
+  }
+  const api = call || (payload => cardResearchApi({config,baseDir},payload));
+  const dryRun = args.writeBack !== true || args.dryRun === true;
+  // A dead CDP endpoint must not consume a real pending request.
+  let connection = dryRun ? null : await connect(args);
+  try {
+    const claim = await api({action:'claimCardResearchRequest',request_id:args.requestId,dryRun});
+    if (!['preview','claimed','busy','already_completed'].includes(claim.status)) throw new Error('Unexpected research claim response');
+    if (!claim.request) return {...claim,normal_image_products:0,master_writes:0};
+    if (claim.request.request_id !== args.requestId) throw new Error('Claim request_id mismatch');
+    cardResearchIdentity(claim.request);
+    if (!connection) connection = await connect(args);
+    return await processCardResearchRequest({request:claim.request,call:api,dryRun,
+      inspect:request => inspect({context:connection.context,config,request,debug:args.debug})});
+  } finally { if (connection) await connection.browser.close(); }
+}
+
 async function claimTargetDiscoveryRequest({ config, baseDir, debug }) {
   const settings = getWriteBackSettings(config, baseDir);
   if (!settings) return null;
@@ -7072,6 +7262,11 @@ async function main() {
   if (args.writeBack !== null) {
     config.writeBack = { ...(config.writeBack || {}), enabled: args.writeBack };
   }
+  if (args.researchQueueOnly) {
+    console.log(JSON.stringify(await runResearchQueueOnly({args,config,baseDir}),null,2));
+    return;
+  }
+  if (args.requestId) throw new Error('--request-id requires --research-queue-only');
   const primaryReferenceMigrationRequested = primaryReferenceBackfillAuditRequested ||
     primaryReferenceColumnPlanRequested ||
     primaryReferenceColumnEnsureRequested ||

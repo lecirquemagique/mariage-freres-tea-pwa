@@ -4,10 +4,18 @@ param(
   [string]$NodeExe = "node",
   [string]$MasterGasApiUrl = "",
   [switch]$Debug,
-  [switch]$WriteBack
+  [switch]$WriteBack,
+  [switch]$ResearchQueueOnly,
+  [string]$RequestId = ""
 )
 
 $ErrorActionPreference = "Stop"
+if ($ResearchQueueOnly -and $RequestId -notmatch '^[A-Za-z0-9-]{1,100}$') {
+  throw "ResearchQueueOnly requires an explicit RequestId."
+}
+if (-not $ResearchQueueOnly -and -not [string]::IsNullOrWhiteSpace($RequestId)) {
+  throw "RequestId requires ResearchQueueOnly."
+}
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
@@ -35,14 +43,14 @@ Add-Content -Path $RunLog -Encoding UTF8 -Value ("Root: " + $Root)
 Add-Content -Path $RunLog -Encoding UTF8 -Value ("CDP endpoint: " + $CdpEndpoint)
 Add-Content -Path $RunLog -Encoding UTF8 -Value ("Node: " + $NodeExe)
 
-if ($WriteBack -and [string]::IsNullOrWhiteSpace($env:MF_COLLECTOR_WRITE_SECRET)) {
+if (($WriteBack -or $ResearchQueueOnly) -and [string]::IsNullOrWhiteSpace($env:MF_COLLECTOR_WRITE_SECRET)) {
   $UserSecret = [Environment]::GetEnvironmentVariable("MF_COLLECTOR_WRITE_SECRET", "User")
   if (-not [string]::IsNullOrWhiteSpace($UserSecret)) {
     $env:MF_COLLECTOR_WRITE_SECRET = $UserSecret
   }
 }
 
-if ($WriteBack -and [string]::IsNullOrWhiteSpace($env:MF_COLLECTOR_WRITE_SECRET)) {
+if (($WriteBack -or $ResearchQueueOnly) -and [string]::IsNullOrWhiteSpace($env:MF_COLLECTOR_WRITE_SECRET)) {
   Add-Content -Path $RunLog -Encoding UTF8 -Value "ERROR: MF_COLLECTOR_WRITE_SECRET is not set."
   throw "MF_COLLECTOR_WRITE_SECRET is not set. Set the user environment variable before running write-back."
 }
@@ -55,6 +63,9 @@ try {
 }
 
 $args = @("collector\collector.js", "--connect-cdp", $CdpEndpoint)
+if ($ResearchQueueOnly) {
+  $args += @("--research-queue-only", "--request-id", $RequestId)
+}
 if (-not [string]::IsNullOrWhiteSpace($MasterGasApiUrl)) {
   $env:MF_MASTER_GAS_API_URL = $MasterGasApiUrl
   $env:MF_MASTER_WRITE_GAS_API_URL = $MasterGasApiUrl
