@@ -104,7 +104,44 @@ var MF_IMAGE_COLLECTOR_HYBRID_REFERENCE_PREFIXES = ['TFG', 'TJC', 'TA', 'TB', 'T
 
 /* PWA queue intake: bounded queue-only write; never creates sheets/columns. */
 var MF_RESEARCH_QUEUE_EXTRA_HEADERS = ['version_key', 'primary_reference', 'tea_reference', 'request_type', 'source', 'requested_at', 'missing_fields'];
-function mfImageCollectorResearchPlan_(payload, masterValues, queueValues) {
+/* Intake-only calendar policy. Collector discovery never decides re-enqueue eligibility. */
+function mfImageCollectorResearchCompletedAt_(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]') return isFinite(value.getTime()) ? new Date(value.getTime()) : null;
+  if (typeof value !== 'string') return null;
+  var match = value.trim().match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:\d{2})$/);
+  if (!match) return null; // No locale/host-dependent parsing of old timestamps.
+  var year=Number(match[1]),month=Number(match[2]),day=Number(match[3]);
+  if (year<1000 || month<1 || month>12 || day<1 || day>new Date(Date.UTC(year,month,0)).getUTCDate() ||
+      Number(match[4])>23 || Number(match[5])>59 || Number(match[6])>59 ||
+      (match[8]!=='Z' && (Number(match[8].slice(1,3))>23 || Number(match[8].slice(4))>59))) return null;
+  var date=new Date(value.trim());
+  return isFinite(date.getTime()) ? date : null;
+}
+function mfImageCollectorResearchAnniversary_(completed) {
+  // Application policy: Asia/Tokyo calendar, same wall-clock time; Feb29 clamps to Feb28.
+  var offset=9*60*60*1000,local=new Date(completed.getTime()+offset),year=local.getUTCFullYear()+1,month=local.getUTCMonth();
+  var day=Math.min(local.getUTCDate(),new Date(Date.UTC(year,month+1,0)).getUTCDate());
+  return new Date(Date.UTC(year,month,day,local.getUTCHours(),local.getUTCMinutes(),local.getUTCSeconds(),local.getUTCMilliseconds())-offset);
+}
+function mfImageCollectorResearchRecheckPolicy_(versionKey, queueValues, now) {
+  var headers=queueValues[0]||[],completed=[],invalid=false;
+  for(var i=1;i<queueValues.length;i++) {
+    var cells=queueValues[i],row={};headers.forEach(function(h,j){row[h]=String(cells[j]==null?'':cells[j]).trim();});
+    if(row.version_key!==versionKey) continue;
+    if(row.status!=='completed') return {status:'already_queued',requestId:row.request_id||'',reason:'unfinished_request'};
+    if(row.request_type && row.request_type!=='complete_card') continue;
+    var date=mfImageCollectorResearchCompletedAt_(cells[headers.indexOf('completed_at')]);
+    if(!date || !row.request_type || !row.request_id || date.getTime()>now.getTime()) invalid=true;
+    else completed.push({date:date,requestId:row.request_id});
+  }
+  if(invalid) return {status:'recently_completed',reason:'completion_history_unverifiable',nextEligibleAt:null};
+  if(!completed.length) return {status:'eligible',requeued:false};
+  completed.sort(function(a,b){return b.date.getTime()-a.date.getTime();});
+  var latest=completed[0],eligible=mfImageCollectorResearchAnniversary_(latest.date);
+  return {status:now.getTime()>=eligible.getTime()?'eligible':'recently_completed',requeued:true,
+    previousRequestId:latest.requestId,completedAt:latest.date.toISOString(),nextEligibleAt:eligible.toISOString(),policyTimezone:'Asia/Tokyo'};
+}
+function mfImageCollectorResearchPlan_(payload, masterValues, queueValues, serverNow) {
   function fail(status, reason) { return {ok:false,status:status,reason:reason,writePerformed:false}; }
   function text(value) { return String(value == null ? '' : value).trim(); }
   var fields = ['action','versionKey','primaryReference','teaReference','displayName','requestType','requestedAt','dryRun'];
@@ -123,6 +160,7 @@ function mfImageCollectorResearchPlan_(payload, masterValues, queueValues) {
   var matches=masterValues.slice(1).filter(function(r){return text(r[mh.indexOf('VersionKey')])===payload.versionKey;});
   if(matches.length!==1) return fail(matches.length?'conflict':'invalid_version',matches.length?'duplicate_key':'not_found');
   var row={};mh.forEach(function(h,j){row[h]=text(matches[0][j]);});
+  if(!row['Primary Reference'] || !row['Tリファレンス番号']) return fail('conflict','master_reference_missing');
   if((text(payload.primaryReference) && text(payload.primaryReference)!==row['Primary Reference']) ||
      (text(payload.teaReference) && text(payload.teaReference)!==row['Tリファレンス番号'])) return fail('conflict','reference_mismatch');
   var name=row['現在の公式名']||row['銘柄名（黒い本）'];
@@ -131,10 +169,12 @@ function mfImageCollectorResearchPlan_(payload, masterValues, queueValues) {
   var expected=base.concat(MF_RESEARCH_QUEUE_EXTRA_HEADERS);
   var schemaMissing=MF_RESEARCH_QUEUE_EXTRA_HEADERS.filter(function(h,j){return qh[12+j]!==h;});
   if(schemaMissing.length && qh.slice(12).some(Boolean)) return fail('conflict','queue_columns_occupied');
+  var now=serverNow || new Date();
+  var policy=mfImageCollectorResearchRecheckPolicy_(payload.versionKey,queueValues,now);
+  if(policy.status==='already_queued' || policy.status==='recently_completed') return Object.assign({ok:true,versionKey:payload.versionKey,writePerformed:false},policy);
   for(var n=1;n<queueValues.length;n++){
     var existing={};qh.forEach(function(h,j){existing[h]=text(queueValues[n][j]);});
     if(!existing.request_id || existing.status==='completed') continue;
-    if(existing.version_key===payload.versionKey) return {ok:true,status:'already_queued',requestId:existing.request_id,versionKey:payload.versionKey,writePerformed:false};
     // REF-only legacy requests are ambiguous, not a duplicate of an inferred Version.
     if(!existing.version_key && existing.target_ref && [row['Primary Reference'],row['Tリファレンス番号']].indexOf(existing.target_ref)>=0) return fail('conflict','legacy_request_without_version');
   }
@@ -142,12 +182,12 @@ function mfImageCollectorResearchPlan_(payload, masterValues, queueValues) {
   ['公式商品ページURL','公式掲載状態','現行ステータス','現在の公式名','現在の公式説明','茶種タグ','産地・国','産地・地域／茶園','香味大分類','香味詳細タグ','水出し用ブレンド','アイスティー推奨','ミルクティー推奨','テインフリー','茶葉画像URL','茶葉サムネイルURL','水色画像URL'].forEach(function(h){
     if(!row[h] || row[h]==='未確認') missing.push(h);
   });
-  var receivedAt=new Date().toISOString();
+  var receivedAt=now.toISOString();
   var values={created_at:receivedAt,target_name:name,target_ref:row['Tリファレンス番号'],target_url:row['公式商品ページURL']||'',status:'pending',
     message:'PWA complete_card: カード情報補完。Master更新は別途Review。',version_key:payload.versionKey,
     primary_reference:row['Primary Reference'],tea_reference:row['Tリファレンス番号'],request_type:'complete_card',source:'PWA',
     requested_at:receivedAt,missing_fields:JSON.stringify(missing)};
-  return {ok:true,status:'planned',versionKey:payload.versionKey,headers:expected,values:values,missingColumns:schemaMissing,
+  return {ok:true,status:'planned',versionKey:payload.versionKey,requeued:policy.requeued,history:policy,headers:expected,values:values,missingColumns:schemaMissing,
     plannedRangeWidth:19,plannedNonemptyCells:Object.keys(values).filter(function(k){return values[k]!=='';}).length+1,writePerformed:false};
 }
 function mfImageCollectorRequestResearch_(payload) {
@@ -171,7 +211,7 @@ function mfImageCollectorRequestResearch_(payload) {
     writeStarted=true;
     queue.getRange(next,1,1,19).setValues([cells]);
     SpreadsheetApp.flush(); // Flush before releasing the script lock.
-    return {ok:true,status:'queued',requestId:id,versionKey:plan.versionKey,writePerformed:true};
+    return {ok:true,status:plan.requeued?'requeued_after_expiry':'queued',requestId:id,versionKey:plan.versionKey,writePerformed:true};
   } catch(error) {
     return {ok:false,status:'error',reason:'受付結果を確認できません。再試行時もVersionKeyで重複確認します。',writePerformed:writeStarted?null:false};
   } finally {if(held)lock.releaseLock();}
@@ -2750,6 +2790,9 @@ function mfImageCollectorSetReviewDecisionValidation_(sheet, decisionCol, startR
 function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
   var candidateTargetColumn = String(candidate.target_column || '').trim();
   var candidateSuggestedValue = String(candidate.suggested_value || '').trim();
+  if (String(candidate.detection_type || '').trim() === 'structured_fact' && candidateTargetColumn === '香味詳細タグ') {
+    candidateSuggestedValue = mfImageCollectorMergeAromaDetailTags_(candidate.current_value, candidateSuggestedValue);
+  }
   if (String(candidate.detection_type || '').trim() === 'structured_fact' && mfImageCollectorIsVanillaTagColumn_(candidateTargetColumn)) {
     candidateSuggestedValue = mfImageCollectorNormalizeVanillaTagValue_(candidateSuggestedValue);
   }
@@ -2787,7 +2830,8 @@ function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
     official_page_verified: candidate.official_page_verified === true,
     master_absence_confirmed: candidate.master_absence_confirmed === true,
     similar_master_candidates: candidate.similar_master_candidates || [],
-    structured_fact: candidate.structured_fact || null,
+    structured_fact: candidate.structured_fact && candidateTargetColumn === '香味詳細タグ'
+      ? Object.assign({},candidate.structured_fact,{suggested_value:candidateSuggestedValue}) : candidate.structured_fact || null,
     card_research: candidate.card_research || null,
     target_provenance: ['human', 'resolver', 'legacy_unknown'].indexOf(String(candidate.target_provenance || '').trim()) >= 0
       ? String(candidate.target_provenance).trim()
@@ -2833,6 +2877,9 @@ function mfImageCollectorReviewCandidateToRow_(candidate, detectionId) {
     'confidence': String(candidate.confidence || '').trim()
   };
   row['確認内容'] = mfImageCollectorReviewConfirmationLabel_(row);
+  if (row['検出種別'] === 'structured_fact' && candidateTargetColumn === '香味詳細タグ' && candidateSuggestedValue !== String(candidate.suggested_value || '').trim()) {
+    row['差分概要'] = '香味詳細タグ（既存タグ保持）: "' + row['現在値'] + '" -> "' + candidateSuggestedValue + '"';
+  }
   return row;
 }
 
@@ -3107,7 +3154,7 @@ function mfImageCollectorApplyStructuredFact_(review, options) {
   var range = sheet ? sheet.getRange(targetRow, targetCol + 1) : null;
   var actualCurrentValue = String(values[targetRow - 1][targetCol] || '').trim();
   var sourceType = String(review['source_type'] || '').trim();
-  var evaluation = sourceType === 'tag_spelling_normalization' && mfImageCollectorIsVanillaTagColumn_(targetColumn)
+  var evaluation = sourceType === 'tag_spelling_normalization' && targetColumn !== '香味詳細タグ' && mfImageCollectorIsVanillaTagColumn_(targetColumn)
     ? mfImageCollectorEvaluateTagSpellingNormalization_(actualCurrentValue, candidateCurrentValue, suggestedValue)
     : mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurrentValue, candidateCurrentValue, suggestedValue, {
         replace_aroma_categories: targetColumn === '香味大分類' && /(?:^|_)normalization$/.test(sourceType)
@@ -3165,6 +3212,19 @@ function mfImageCollectorEvaluateStructuredFactChange_(targetColumn, actualCurre
   var incoming = targetColumn === '香味大分類'
     ? mfImageCollectorNormalizeApprovedAromaCategoryValue_(suggestedValue)
     : mfImageCollectorNormalizeApprovedStructuredFactCandidate_(targetColumn, suggestedValue);
+  if (targetColumn === '香味詳細タグ') {
+    var currentTags = mfImageCollectorCanonicalAromaDetailValues_(actual);
+    var expectedTags = mfImageCollectorCanonicalAromaDetailValues_(expected);
+    if (expectedTags.some(function(tag) { return currentTags.indexOf(tag)<0; })) {
+      throw new Error('Master value changed after structured_fact candidate was created: ' + targetColumn);
+    }
+    var next = mfImageCollectorMergeAromaDetailTags_(actual,incoming);
+    var represented = mfImageCollectorCanonicalAromaDetailValues_(incoming).every(function(tag) {
+      return currentTags.some(function(old) { return mfImageCollectorAromaDetailAlreadyRepresented_(old,tag); });
+    });
+    if (represented && actual === currentTags.join('、')) return {already_applied:true,next_value:actual};
+    return {already_applied:next === actual,next_value:next};
+  }
   if (targetColumn === '香味大分類') {
     if (mfImageCollectorAromaCategorySetsEqual_(actual, incoming)) {
       return { already_applied: true, next_value: actual };
@@ -3230,6 +3290,29 @@ function mfImageCollectorAromaCategorySetsEqual_(left, right) {
   return true;
 }
 
+function mfImageCollectorCanonicalAromaDetailTag_(value) {
+  var tag=String(value || '').normalize('NFKC').trim();
+  var aliases={'バニラ':'ヴァニラ','カラメル':'キャラメル','ノワゼット':'ヘーゼルナッツ','蜂蜜':'ハニー',
+    'バラ':'ローズ','薔薇':'ローズ','ショウガ':'ジンジャー','生姜':'ジンジャー','クローヴ':'クローブ',
+    '胡椒':'ペッパー','こしょう':'ペッパー','キク':'菊','クレーム・ブリュレ':'クレームブリュレ','ラベンダー':'ラヴェンダー'};
+  return aliases[tag] || tag;
+}
+function mfImageCollectorCanonicalAromaDetailValues_(value) {
+  var out=[];
+  (Array.isArray(value)?value:[value]).forEach(function(part) {
+    String(part || '').split(/[、,;；／/|\r\n]+/).forEach(function(token) {
+      var tag=mfImageCollectorCanonicalAromaDetailTag_(token);if(tag && out.indexOf(tag)<0)out.push(tag);
+    });
+  });
+  return out;
+}
+function mfImageCollectorMergeAromaDetailTags_(current, confirmed) {
+  var existing=mfImageCollectorCanonicalAromaDetailValues_(current);
+  var incoming=mfImageCollectorCanonicalAromaDetailValues_(confirmed).filter(function(tag) {
+    return !existing.some(function(old) {return old!==tag && mfImageCollectorAromaDetailAlreadyRepresented_(old,tag);});
+  });
+  return incoming.concat(existing).filter(function(tag,i,list){return list.indexOf(tag)===i;}).join('、');
+}
 function mfImageCollectorCanonicalAromaDetailTerm_(value) {
   return String(value || '')
     .normalize('NFKC')
@@ -3283,7 +3366,7 @@ function mfImageCollectorNormalizeStructuredFactValue_(targetColumn, value) {
     return mfImageCollectorNormalizeTeaTypeTagsForMaster_(value);
   }
   if (targetColumn === '香味詳細タグ') {
-    return mfImageCollectorNormalizeVanillaTagValue_(value);
+    return mfImageCollectorCanonicalAromaDetailValues_(value).join('、');
   }
   if (targetColumn === '水出し用リファレンス') {
     return String(value || '').trim().toUpperCase();

@@ -1298,6 +1298,26 @@ function normalizeConfiguredMasterProducts(products) {
   });
 }
 
+function canonicalAromaDetailTag(value) {
+  const tag = normalizeText(value).normalize('NFKC').trim();
+  const aliases = {'バニラ':'ヴァニラ','カラメル':'キャラメル','ノワゼット':'ヘーゼルナッツ','蜂蜜':'ハニー',
+    'バラ':'ローズ','薔薇':'ローズ','ショウガ':'ジンジャー','生姜':'ジンジャー','クローヴ':'クローブ',
+    '胡椒':'ペッパー','こしょう':'ペッパー','キク':'菊','クレーム・ブリュレ':'クレームブリュレ','ラベンダー':'ラヴェンダー'};
+  return aliases[tag] || tag;
+}
+
+function canonicalAromaDetailValues(value) {
+  return [...new Set((Array.isArray(value) ? value : [value]).flatMap(v => String(v || '').split(/[、,;；／/|\r\n]+/))
+    .map(canonicalAromaDetailTag).filter(Boolean))];
+}
+
+function mergeAromaDetailTags(current, confirmed) {
+  const existing = canonicalAromaDetailValues(current);
+  const incoming = canonicalAromaDetailValues(confirmed).filter(tag => !existing.some(old => old !== tag && aromaDetailAlreadyRepresented(old,tag)));
+  // Confirmed tags first, then retained-only tags. Unknown existing tags are never discarded.
+  return [...new Set([...incoming,...existing])].join('、');
+}
+
 function canonicalAromaDetailTerm(value) {
   return normalizeText(value)
     .normalize('NFKC')
@@ -1320,6 +1340,11 @@ function aromaDetailAlreadyRepresented(existingValue, candidateValue) {
 
 function structuredFactSuggestionAlreadyApplied(product, suggestion) {
   const column = normalizeText(suggestion?.column);
+  if (column === MASTER_COLUMNS.flavorTags) {
+    const actual = normalizeText(product?.master?.[column] || '');
+    const current = canonicalAromaDetailValues(actual), incoming = canonicalAromaDetailValues(suggestion?.suggested_value);
+    return incoming.length > 0 && actual === current.join('、') && incoming.every(tag => current.some(old => aromaDetailAlreadyRepresented(old,tag)));
+  }
   const currentValues = splitMasterListValue(product?.master?.[column] || '');
   const incomingValues = splitMasterListValue(suggestion?.suggested_value || '');
   if (!currentValues.length || !incomingValues.length) return false;
@@ -1391,6 +1416,7 @@ function conciseFlavorEvidence(text, pattern, maxLength = 260) {
 
 function includesVocabulary(vocabulary, column, value) {
   const set = vocabulary?.[column];
+  if (column === MASTER_COLUMNS.flavorTags && set?.size) return [...set].some(tag => canonicalAromaDetailTag(tag) === canonicalAromaDetailTag(value));
   return !set || set.size === 0 || set.has(value);
 }
 
@@ -1404,6 +1430,10 @@ function flavorRules() {
     { value: 'ミント', categories: ['ハーブ', 'ミント'], pattern: /\bmint\b|\bmenthe\b|ミント/i },
     { value: 'カカオ', category: 'カカオ', pattern: /\bcacao\b|\bcocoa\b|カカオ/i },
     { value: 'キャラメル', categories: ['甘香・菓子', 'キャラメル'], pattern: /\bcaramel\b|キャラメル/i },
+    { value: 'ヘーゼルナッツ', allow_new_detail_tag:true, pattern: /\bhazelnuts?\b|\bnoisettes?\b|ヘーゼルナッツ|ノワゼット/i,
+      rejectPattern: /\b(?:traces?\s+(?:de|of)|may contain|sans|without|no)\s+(?:hazelnuts?|noisettes?)\b/i },
+    { value: 'ハニー', allow_new_detail_tag:true, pattern: /\bhoney\b|\bmiel\b|ハニー|蜂蜜/i,
+      rejectPattern: /\b(?:sans|without|no|ni|nor)\s+(?:honey|miel)\b/i },
     { value: '柑橘', category: '柑橘', pattern: /\bcitrus\b|\bagrumes?\b|柑橘/i },
     { value: '果実', category: '果実', pattern: /\bfruits?\b|\bfruité(?:e|es|s)?\b|果実|フルーツ/i, rejectPattern: /\bfruits?\s+à\s+coque\b|\btraces?\s+de\s+fruits?\s+à\s+coque\b/i },
     { value: '花', category: '花', pattern: /\bflowers?\b|\bfleurs?\b|\bfloral(?:e|es|s)?\b|花/i },
@@ -1478,7 +1508,7 @@ function buildStructuredFactSuggestions({ product, facts, vocabulary }) {
       const evidence = conciseFlavorEvidence(context.text, rule.pattern);
       if (!evidence) continue;
       if (rule.rejectPattern && rule.rejectPattern.test(evidence)) continue;
-      if (includesVocabulary(vocabulary, MASTER_COLUMNS.flavorTags, rule.value)) {
+      if (includesVocabulary(vocabulary, MASTER_COLUMNS.flavorTags, rule.value) || rule.allow_new_detail_tag === true) {
         addStructuredSuggestion(suggestions, product, {
           column: MASTER_COLUMNS.flavorTags,
           suggested_value: rule.value,
@@ -1547,7 +1577,20 @@ function buildStructuredFactSuggestions({ product, facts, vocabulary }) {
     });
   }
 
-  return suggestions;
+  const details = suggestions.filter(item => item.column === MASTER_COLUMNS.flavorTags);
+  if (!details.length) return suggestions;
+  const confirmed = details.map(item => item.suggested_value);
+  const merged = {...details[0],suggested_value:mergeAromaDetailTags(product.master?.[MASTER_COLUMNS.flavorTags] || '',confirmed),
+    confirmed_values:canonicalAromaDetailValues(confirmed),
+    evidence_text:[...new Set(details.map(item => item.evidence_text))].join('\n'),
+    source_dom:[...new Set(details.map(item => item.source_dom).filter(Boolean))].join(' / '),
+    confidence:details.every(item => item.confidence === 'high') ? 'high' : 'medium'};
+  let inserted = false;
+  return suggestions.flatMap(item => {
+    if (item.column !== MASTER_COLUMNS.flavorTags) return [item];
+    if (inserted) return [];
+    inserted = true; return [merged];
+  });
 }
 
 function buildOfficialStructuredFacts({ product, facts, language, vocabulary, translationReviewCandidate }) {
@@ -1577,6 +1620,8 @@ function buildOfficialStructuredFacts({ product, facts, language, vocabulary, tr
 }
 
 function structuredFactReviewCandidate({ product, facts, suggestion }) {
+  if (suggestion.column === MASTER_COLUMNS.flavorTags) suggestion = {...suggestion,
+    suggested_value:mergeAromaDetailTags(product.master?.[suggestion.column] || '',suggestion.suggested_value)};
   const targetVersionKey = normalizeText(product.master?.versionKey || '');
   if (!targetVersionKey) return null;
   const currentValue = normalizeText(product.master?.[suggestion.column] || '');
@@ -3727,78 +3772,237 @@ function buildCardResearchPlan(request, pages) {
   return {mode:'existing_primary',version_key:request.version_key,effective_missing_fields:effective,candidates,unresolved,lookup_diagnostics:pages.lookup || []};
 }
 
-async function inspectCardResearchPages({context,config,request,debug}) {
-  const page = await context.newPage(), pages = [], seen = new Set();
-  pages.lookup = [];
-  const input = {reference:request.tea_reference,name:request.target['現在の公式名'] || request.target['銘柄名（黒い本）'] || request.target_name,url_reference:''};
-  // Only the complete_card reader uses this facade; legacy discovery is unchanged.
-  const reader = new Proxy(page, {get(target,key) {
-    if (key === 'goto') return async (url,options) => {
-      const response = await target.goto(url,options);
-      const status = response?.status();
-      const title = typeof target.title === 'function' ? await target.title() : '';
-      const text = await target.locator('body').innerText();
-      const blocked = [403,429,503].includes(status) || /cloudflare|verify you are human|just a moment|vérifiez que vous êtes humain/i.test(title + '\n' + text);
-      const reason = blocked ? 'official_access_blocked' : !status || status >= 400 ? 'official_lookup_inconclusive' : '';
-      const entry = {url,status:status || null,title,reason};
-      pages.lookup.push(entry);
-      if (reason) { const error = new Error(reason); error.lookupRecorded = true; throw error; }
-      return response;
-    };
-    const value = target[key];
-    return typeof value === 'function' ? value.bind(target) : value;
+function cardResearchSafeUrl(value) {
+  try {
+    const url = new URL(value);
+    for (const key of [...url.searchParams.keys()]) if (/^(?:__cf.*|token|.*_token|secret|auth|authorization|api_key|form_key|key)$/i.test(key)) url.searchParams.delete(key);
+    url.username = ''; url.password = ''; url.hash = '';
+    return url.href;
+  } catch { return ''; }
+}
+
+function cardResearchRegion(url) {
+  try { const u = new URL(url); return u.hostname.endsWith('.co.jp') ? 'JP' : u.pathname.startsWith('/en/') ? 'EN' : 'FR'; } catch { return ''; }
+}
+
+function cardResearchOfficialPage(url) {
+  try { const u = new URL(url); return u.protocol === 'https:' && ['www.mariagefreres.com','mariagefreres.com','www.mariagefreres.co.jp','mariagefreres.co.jp'].includes(u.hostname) && !u.username && !u.password; } catch { return false; }
+}
+
+function cardResearchAccessReason(status, title, body) {
+  if ([403,429,503].includes(status) || /cloudflare|verify you are human|just a moment|vérifiez que vous êtes humain/i.test(title + '\n' + body)) return 'official_access_blocked';
+  return status !== null && (!status || status >= 400) ? 'official_lookup_inconclusive' : '';
+}
+
+async function acquireCardResearchPages(context, request) {
+  const borrowed = (context.pages?.() || []).filter(page => cardResearchOfficialPage(page.url()));
+  // Reuse the established page-ownership contract, without its REF-only first-match selection.
+  const owned = await getProductPage({pages:() => borrowed,newPage:() => context.newPage()},
+    {reference:request.tea_reference,productUrl:request.target['公式商品ページURL'] || ''},{useExistingPages:false});
+  return {borrowed,owned,async release() { if (owned.shouldClose) await owned.page.close(); }};
+}
+
+async function captureCardResearchNavigation(page, diagnostics) {
+  // Unlike createCdpNetworkCapture, research observes metadata only, never image bodies/cookies.
+  const state = {transport:'cdp_navigation',stage:'',query:''};
+  const pending = new Set();
+  const listener = response => {
+    const job = (async () => {
+      const request = response.request();
+      const type = request.resourceType();
+      if (!['document','xhr','fetch'].includes(type) || !cardResearchOfficialPage(response.url())) return;
+      if (type !== 'document' && !/search|catalogsearch/i.test(response.url())) return;
+      if (type === 'document' && request.frame() !== page.mainFrame()) return;
+      const redirects = [];
+      for (let prior = request.redirectedFrom(); prior; prior = prior.redirectedFrom()) redirects.unshift(cardResearchSafeUrl(prior.url()));
+      diagnostics.push({transport:state.transport,stage:state.stage,submitted_query:state.query,
+        source_region:cardResearchRegion(response.url()),url:cardResearchSafeUrl(response.url()),status:response.status(),
+        resource_type:type,redirect_chain:redirects,observed_at:nowIso(),
+        reason:cardResearchAccessReason(response.status(),'','')});
+    })().catch(() => {});
+    pending.add(job); job.finally(() => pending.delete(job));
+  };
+  page.on?.('response',listener);
+  return {state,async close() { page.off?.('response',listener); await Promise.all([...pending]); }};
+}
+
+async function collectCardResearchProductExtras(page) {
+  return page.evaluate(() => {
+    const root = document.querySelector('.product-info-main');
+    const text = root ? [...root.querySelectorAll('button,a,[role="button"]')].filter(el => {
+      const style = getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden' && el.getBoundingClientRect().height > 0;
+    }).map(el => el.textContent.trim()).filter(t => /notify me|me prévenir|bientôt disponible|available soon/i.test(t)).join(' / ') : '';
+    const data = [...document.querySelectorAll('script[type="application/ld+json"]')].flatMap(el => {
+      try { return [JSON.parse(el.textContent)]; } catch { return []; }
+    });
+    return {researchAvailability:{source:'visible_product_controls',text},researchProductData:data};
+  });
+}
+
+function validateCardResearchInspected(inspected, currentUrl, input) {
+  if (!inspected.ok) return inspected;
+  const facts = inspected.facts || {};
+  try {
+    const current = new URL(normalizeOfficialTargetProductUrl(currentUrl)); current.search = '';
+    if (!facts.canonical) return {...inspected,ok:false,reject_reason:'canonical_unverified'};
+    const canonical = new URL(normalizeOfficialTargetProductUrl(facts.canonical)); canonical.search = '';
+    if (current.href !== canonical.href) return {...inspected,ok:false,reject_reason:'canonical_conflict'};
+    const productText = [facts.h1,facts.productSummary,facts.structuredProductData].join('\n');
+    if (!referenceRegex(input.reference).test(productText)) return {...inspected,ok:false,reject_reason:'no_verified_reference'};
+    if (!cardResearchName(input.name) || cardResearchName(input.name) !== cardResearchName(inspected.official_name)) return {...inspected,ok:false,reject_reason:'name_mismatch'};
+  } catch { return {...inspected,ok:false,reject_reason:'canonical_conflict'}; }
+  return inspected;
+}
+
+async function inspectRenderedCardResearchPage(page, input, config, debug) {
+  const url = page.url();
+  normalizeOfficialTargetProductUrl(url);
+  // The legacy verifier is reused as a read-only view: no real navigation or reload is possible.
+  const view = new Proxy(page,{get(target,key) {
+    if (['goto','waitForLoadState'].includes(key)) return async () => null;
+    if (['reload','close'].includes(key)) return async () => { throw new Error('Borrowed page mutation forbidden'); };
+    const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
   }});
-  async function attempt(url,action) {
-    try { return await action(); }
-    catch(error) {
-      if (!error.lookupRecorded) pages.lookup.push({url,reason:'official_lookup_inconclusive'});
-      return null;
+  const inspected = await inspectTargetedProductPage(view,url,input,{...config,settleDelayMs:1},debug,'cdp_existing_dom');
+  if (page.url() !== url) return {ok:false,url, reject_reason:'page_changed_during_read'};
+  return validateCardResearchInspected(inspected,url,input);
+}
+
+async function collectCardResearchSearchState(page, submittedQuery) {
+  return page.evaluate(submitted => {
+    const url = new URL(location.href);
+    const title = document.title;
+    const body = document.body?.innerText || '';
+    const noResult = /no results|no products|aucun résultat|aucun produit|検索(?:結果|条件).*(?:ありません|見つかりません)|該当.*(?:ありません|ございません)/i.test(body);
+    const queryInput = document.querySelector('input[name="q"],input[name="search_keyword"]');
+    const effective = url.searchParams.get('q') || url.searchParams.get('search_keyword') || queryInput?.value || submitted;
+    return {url:location.href,title,body:body.slice(0,50000),canonical:document.querySelector('link[rel="canonical"]')?.href || '',
+      effective_query:effective,query_corrected:effective.trim().toLowerCase() !== submitted.trim().toLowerCase(),no_result:noResult};
+  },submittedQuery);
+}
+
+async function searchCardResearchOfficialUi({page,region,queries,navigate,collect,diagnostics,config,network}) {
+  const start = {FR:'https://www.mariagefreres.com/fr/',EN:'https://www.mariagefreres.com/en/',JP:'https://www.mariagefreres.co.jp/'}[region];
+  for (const query of queries) {
+    network.state.transport = 'cdp_search_ui'; network.state.stage = 'search_ui'; network.state.query = query;
+    let phase = 'entry';
+    try {
+      await navigate(start);
+      await page.waitForLoadState('load',{timeout:config.researchUiTimeoutMs || 5000}).catch(() => {});
+      phase = 'open_panel';
+      const opener = page.locator(region === 'JP' ? 'button[data-menu-id="search"]:visible, a[href*="/view/search"]:visible' : 'a.minisearch-btn:visible').first();
+      const input = page.locator(region === 'JP' ? 'input[data-id="makeshop-search-keyword"]:visible, input[name="search_keyword"]:visible' : 'input[name="q"]:visible, input#search:visible').first();
+      if (!await input.isVisible()) { await opener.waitFor({state:'visible',timeout:config.researchUiTimeoutMs || 5000}); await opener.click({timeout:3000}); }
+      phase = 'input_ready';
+      await input.waitFor({state:'visible',timeout:config.researchUiTimeoutMs || 3000});
+      phase = 'validate_search_form';
+      const safe = await input.evaluate(el => {
+        const form = el.closest('form');
+        if (!form) return true;
+        const u = new URL(form.action,location.href);
+        return u.origin === location.origin && form.method.toLowerCase() === 'get' && /catalogsearch|\/view\/search/.test(u.pathname);
+      });
+      if (!safe) throw new Error('Not an official read-only search form');
+      phase = 'submit';
+      await input.fill(query);
+      if (region === 'JP') await page.locator('a[href="#makeshop-common-search-url"]:visible').first().click({timeout:3000,noWaitAfter:true});
+      else await input.press('Enter',{timeout:3000,noWaitAfter:true});
+      phase = 'results';
+      if (typeof page.waitForURL === 'function') await page.waitForURL(url => cardResearchOfficialPage(url.href) && /catalogsearch|\/view\/search/.test(url.pathname),
+        {waitUntil:'domcontentloaded',timeout:config.navigationTimeoutMs || 15000});
+      await page.waitForTimeout(config.researchUiSettleMs || 1500);
+      await collect(query,'cdp_search_ui','search_ui');
+    } catch {
+      if (diagnostics.some(d => d.transport === 'cdp_search_ui' && d.source_region === region && d.reason === 'official_access_blocked')) break;
+      diagnostics.push({transport:'cdp_search_ui',stage:'search_ui',source_region:region,submitted_query:query,
+        url:cardResearchSafeUrl(page.url()),status:null,reason:'official_lookup_inconclusive',failure_stage:phase,observed_at:nowIso()});
+      // A blocked popup/document is not retried with another query or bypass mechanism.
+      if (diagnostics.some(d => d.transport === 'cdp_search_ui' && d.source_region === region && d.reason === 'official_access_blocked')) break;
     }
+  }
+}
+
+async function inspectCardResearchPages({context,config,request,debug}) {
+  cardResearchIdentity(request);
+  const lease = await acquireCardResearchPages(context,request), page = lease.owned.page;
+  const pages = [], seen = new Set(), urls = new Set(); pages.lookup = [];
+  const network = await captureCardResearchNavigation(page,pages.lookup);
+  const input = {reference:request.tea_reference,name:request.target['現在の公式名'] || request.target['銘柄名（黒い本）'] || request.target_name,url_reference:''};
+  const diagnostic = entry => pages.lookup.push({transport:network.state.transport,stage:network.state.stage,
+    submitted_query:network.state.query,observed_at:nowIso(),...entry});
+  async function navigate(url,options={}) {
+    if (!cardResearchOfficialPage(url)) throw new Error('Unofficial navigation');
+    const response = await page.goto(url,{waitUntil:'domcontentloaded',timeout:config.navigationTimeoutMs || 15000,...options});
+    const status = response?.status() || null;
+    const title = await page.title(), body = await page.locator('body').innerText();
+    const reason = cardResearchAccessReason(status,title,body) || (!status ? 'official_lookup_inconclusive' : '');
+    diagnostic({url:cardResearchSafeUrl(url),final_url:cardResearchSafeUrl(page.url?.() || url),source_region:cardResearchRegion(url),status,title,reason});
+    if (reason || !cardResearchOfficialPage(page.url?.() || url)) { const error=new Error(reason || 'Unofficial redirect');error.lookupRecorded=true;throw error; }
+    return response;
+  }
+  const reader = new Proxy(page,{get(target,key) { if (key === 'goto') return navigate; const v=target[key];return typeof v === 'function'?v.bind(target):v; }});
+  async function retain(inspected, sourcePage, transport) {
+    const reason = inspected.reject_reason === 'browser_verification' ? 'official_access_blocked' :
+      /mismatch|no_verified_reference|canonical_conflict/.test(inspected.reject_reason || '') ? 'version_ambiguous' : inspected.ok ? '' : 'official_lookup_inconclusive';
+    diagnostic({transport,stage:transport === 'cdp_existing_dom' ? 'existing_dom' : 'product',url:cardResearchSafeUrl(inspected.url),source_region:cardResearchRegion(inspected.url),status:null,
+      canonical:cardResearchSafeUrl(inspected.facts?.canonical),references:inspected.refs || [],official_name:inspected.official_name || '',
+      reason,reject_reason:inspected.reject_reason || '',page_reused:transport === 'cdp_existing_dom'});
+    if (inspected.ok) {
+      const snapshotUrl = sourcePage.url?.();
+      Object.assign(inspected.facts,await collectCardResearchProductExtras(sourcePage));
+      if (sourcePage.url?.() !== snapshotUrl) inspected = {...inspected,ok:false,reject_reason:'page_changed_during_read'};
+    }
+    if (inspected.reject_reason !== 'browser_verification') pages.push(inspected);
   }
   async function inspect(url) {
     if (seen.size >= 12 || seen.has(url)) return;
-    await attempt(url,async () => {
-      normalizeOfficialTargetProductUrl(url);
-      seen.add(url);
+    try {
+      normalizeOfficialTargetProductUrl(url); seen.add(url);
+      network.state.transport='cdp_navigation';network.state.stage='product';network.state.query='';
       const inspected = await inspectTargetedProductPage(reader,url,input,config,debug,'complete_card');
-      if (!inspected.ok) {
-        if (inspected.reject_reason === 'browser_verification') pages.lookup.push({url,reason:'official_access_blocked'});
-        else pages.push(inspected);
-        return;
+      await retain(validateCardResearchInspected(inspected,page.url?.() || url,input),page,'cdp_navigation');
+    } catch(error) { if (!error.lookupRecorded) diagnostic({url:cardResearchSafeUrl(url),source_region:cardResearchRegion(url),status:null,reason:'official_lookup_inconclusive'}); }
+  }
+  async function collect(query,transport,stage) {
+    const state = await collectCardResearchSearchState(page,query);
+    const blocked = cardResearchAccessReason(null,state.title,state.body);
+    diagnostic({transport,stage,url:cardResearchSafeUrl(state.url),canonical:cardResearchSafeUrl(state.canonical),source_region:cardResearchRegion(state.url),
+      effective_query:state.effective_query,query_corrected:state.query_corrected,status:null,
+      reason:blocked || (state.no_result ? 'official_search_no_result' : 'official_lookup_inconclusive')});
+    if (blocked || state.no_result || !cardResearchOfficialPage(state.url)) return;
+    for (const item of await collectProductSearchCandidates(page)) {
+      const identity = item.href+'\n'+item.text+'\n'+item.closestText;
+      const urlReference = referenceCandidateFromOfficialProductUrl(item.href);
+      if (urlReference && urlReference !== input.reference) {
+        diagnostic({transport,stage,url:cardResearchSafeUrl(item.href),source_region:cardResearchRegion(item.href),status:null,reason:'',excluded_reference:urlReference});
+        continue;
       }
-      const extra = await page.evaluate(() => {
-        const root = document.querySelector('.product-info-main');
-        const text = root ? [...root.querySelectorAll('button,a,[role="button"]')].filter(el => {
-          const style = getComputedStyle(el);
-          return style.display !== 'none' && style.visibility !== 'hidden' && el.getBoundingClientRect().height > 0;
-        }).map(el => el.textContent.trim()).filter(t => /notify me|me prévenir|bientôt disponible|available soon/i.test(t)).join(' / ') : '';
-        const data = [...document.querySelectorAll('script[type="application/ld+json"]')].flatMap(el => {
-          try { return [JSON.parse(el.textContent)]; } catch { return []; }
-        });
-        return {researchAvailability:{source:'visible_product_controls',text},researchProductData:data};
-      });
-      Object.assign(inspected.facts,extra);
-      pages.push(inspected);
-    });
+      if (looksLikeProductUrl(item.href) && (referenceRegex(input.reference).test(identity) || targetedNameMatches(input.name,identity))) urls.add(item.href);
+    }
   }
   try {
-    const urls = new Set();
     if (request.target['公式商品ページURL']) await inspect(request.target['公式商品ページURL']);
-    for (const query of targetedSearchQueries({name:input.name,reference:input.reference}).slice(0,2)) {
-      for (const searchUrl of productSearchUrls(query)) await attempt(searchUrl,async () => {
-        await reader.goto(searchUrl,{waitUntil:'domcontentloaded',timeout:config.navigationTimeoutMs || 45000});
-        for (const item of await collectProductSearchCandidates(page)) {
-          const identity = item.href + '\n' + item.text + '\n' + item.closestText;
-          if (looksLikeProductUrl(item.href) && (referenceRegex(input.reference).test(identity) || targetedNameMatches(input.name,identity))) urls.add(item.href);
-        }
-        const entry = pages.lookup[pages.lookup.length - 1];
-        entry.reason = /no results|no products|aucun résultat|aucun produit|検索(?:結果|条件).*(?:ありません|見つかりません)|該当.*(?:ありません|ございません)/i.test(await page.locator('body').innerText())
-          ? 'official_search_no_result' : 'official_lookup_inconclusive';
-      });
+    for (const borrowed of lease.borrowed) {
+      const url = borrowed.url();
+      if (!looksLikeProductUrl(url) || !(referenceRegex(input.reference).test(url) || url === request.target['公式商品ページURL'] || cardResearchRegion(url)==='JP')) continue;
+      try {
+        const inspected = await inspectRenderedCardResearchPage(borrowed,input,config,debug);
+        // Unrelated JP item tabs have opaque URLs; do not turn them into conflicting target evidence.
+        if (cardResearchRegion(url)==='JP' && !(inspected.refs || []).includes(input.reference)) continue;
+        await retain(inspected,borrowed,'cdp_existing_dom');
+      } catch { diagnostic({transport:'cdp_existing_dom',url:cardResearchSafeUrl(url),status:null,reason:'official_lookup_inconclusive'}); }
     }
+    const queries = targetedSearchQueries(input).slice(0,2);
+    for (const query of queries) for (const url of productSearchUrls(query)) {
+      network.state.transport='cdp_navigation';network.state.stage='search';network.state.query=query;
+      try { await navigate(url); await collect(query,'cdp_navigation','search'); }
+      catch(error) { if (!error.lookupRecorded) diagnostic({url:cardResearchSafeUrl(url),source_region:cardResearchRegion(url),status:null,reason:'official_lookup_inconclusive'}); }
+    }
+    if (config.researchSearchUi !== false) for (const region of ['FR','EN','JP']) await searchCardResearchOfficialUi({page,region,queries,navigate,collect,diagnostics:pages.lookup,config,network});
     for (const url of urls) await inspect(url);
     return pages;
-  } finally { await page.close(); }
+  } finally { try { await network.close(); } finally { await lease.release(); } }
 }
 
 async function cardResearchApi({config,baseDir},payload) {
@@ -6752,7 +6956,7 @@ function structuredReviewCandidateFromPlan({ record, candidate, product }) {
   const rawSuggestedValue = normalizeText(candidate.normalized_value || candidate.suggested_value);
   const suggestedValue = column === MASTER_COLUMNS.flavorCategory
     ? normalizeWritebackAromaCategory(rawSuggestedValue).value
-    : rawSuggestedValue;
+    : column === MASTER_COLUMNS.flavorTags ? mergeAromaDetailTags(product.master?.[column] || '',rawSuggestedValue) : rawSuggestedValue;
   const currentValue = normalizeText(product.master?.[column] || '');
   const evidenceText = normalizeText(candidate.evidence || '');
   const sourceUrl = normalizeText(candidate.source_url || record.official_url || product.productUrl || '');

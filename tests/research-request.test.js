@@ -32,10 +32,10 @@ test('invalid/missing/duplicate key, reference/name mismatch, arbitrary fields f
  }
  const x=setup();x.master.push(x.master[2].slice());assert.equal(x.request(payload()).status,'conflict');assert.equal(x.writes.length,0);
 });
-test('only completed permits rerequest, error/unknown/pending are unfinished',()=>{
+test('completed without timestamp blocks rerequest; other states remain unfinished',()=>{
  for(const state of ['pending','processing','error','ambiguous','not_found','unexpected','completed']){
   const x=setup();x.request(payload());x.queue[1][5]=state;
-  assert.equal(x.request(payload()).status,state==='completed'?'queued':'already_queued');
+  assert.equal(x.request(payload()).status,state==='completed'?'recently_completed':'already_queued');
  }
 });
 test('dry-run, missing columns, disabled and busy never write',()=>{

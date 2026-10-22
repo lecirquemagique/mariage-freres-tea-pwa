@@ -1674,8 +1674,8 @@ function refreshResearchButtons(){
   document.querySelectorAll('.research-button').forEach(button=>{
     const state=researchStates.get(button.dataset.versionKey);
     if(!state)return;
-    button.disabled=state.kind==='pending'||state.kind==='done'||!button.dataset.versionKey||R.filter(row=>row.VersionKey===button.dataset.versionKey).length!==1;
-    button.textContent=state.kind==='pending'?'受付中…':state.kind==='done'?'✓ 調査依頼済み':state.kind==='dry_run'?'検証済み（未送信）':'再試行する';
+    button.disabled=state.kind==='pending'||state.kind==='done'||state.kind==='recent'||!button.dataset.versionKey||R.filter(row=>row.VersionKey===button.dataset.versionKey).length!==1;
+    button.textContent=state.kind==='pending'?'受付中…':state.kind==='done'?'✓ 調査依頼済み':state.kind==='recent'?(state.label||'最近調査済み'):state.kind==='dry_run'?'検証済み（未送信）':'再試行する';
     let message=button.closest('.body').querySelector('.research-feedback');
     if(!message){message=document.createElement('p');message.className='research-feedback';message.setAttribute('role','status');button.parentElement.before(message);}
     message.setAttribute('role',state.kind==='error'?'alert':'status');
@@ -1886,7 +1886,7 @@ $('list').addEventListener('click',event=>{
   const candidates=R.filter(row=>row.VersionKey===button.dataset.versionKey);
   if(candidates.length!==1 || !button.dataset.versionKey) return;
   const key=button.dataset.versionKey;
-  if(['pending','done'].includes(researchStates.get(key)?.kind))return;
+  if(['pending','done','recent'].includes(researchStates.get(key)?.kind))return;
   // Snapshot the Master row, never reconstruct references or names from card text.
   researchConfirmation={row:{...candidates[0]},button};
   const row=researchConfirmation.row;
@@ -1907,12 +1907,11 @@ $('confirmResearch').addEventListener('click',async()=>{
     researchStates.set(key,{kind:'error',message:'表示データが更新されました。カードを確認して再試行してください。'});
     refreshResearchButtons();return;
   }
-  if(['pending','done'].includes(researchStates.get(key)?.kind))return;
+  if(['pending','done','recent'].includes(researchStates.get(key)?.kind))return;
   researchStates.set(key,{kind:'pending'});refreshResearchButtons();
   try{
     const result=await MFResearchRequest.send(row,C);
-    const message=result.status==='queued'?'調査依頼を登録しました':result.status==='already_queued'?'この銘柄はすでに調査待ちです':'受付内容を検証しました。キューには書き込んでいません。';
-    researchStates.set(key,{kind:result.status==='dry_run'?'dry_run':'done',message});
+    researchStates.set(key,MFResearchRequest.feedback(result));
   }catch(error){researchStates.set(key,{kind:'error',message:error.message});}
   refreshResearchButtons();
 });

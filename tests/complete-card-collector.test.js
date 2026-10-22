@@ -3,7 +3,7 @@ const{test}=require('node:test'),assert=require('node:assert/strict'),fs=require
 const{setup,REQUEST_ID,URL}=require('./complete-card-queue.test.js');
 const source=fs.readFileSync(path.join(__dirname,'../collector/collector.js'),'utf8');
 function client(){const ctx={require,process:{env:{}},console,URL:global.URL,Buffer,__dirname:path.join(__dirname,'../collector')};vm.createContext(ctx);vm.runInContext(source.slice(0,source.lastIndexOf('\nmain().catch(')),ctx);return ctx;}
-function page(patch={}){return {ok:true,url:URL,refs:['T2306'],official_name:'GRAND PAI MU TAN',language:'EN',facts:{url:URL,h1:'GRAND PAI MU TAN',category:'White tea',productDescription:'Delicate white tea, harvested in China.',structuredProductData:JSON.stringify({'@type':'Product',sku:'T2306',name:'GRAND PAI MU TAN',offers:{availability:'https://schema.org/InStock'}})},...patch};}
+function page(patch={}){return {ok:true,url:URL,refs:['T2306'],official_name:'GRAND PAI MU TAN',language:'EN',facts:{url:URL,canonical:URL,productSummary:'REF T2306',h1:'GRAND PAI MU TAN',category:'White tea',productDescription:'Delicate white tea, harvested in China.',structuredProductData:JSON.stringify({'@type':'Product',sku:'T2306',name:'GRAND PAI MU TAN',offers:{availability:'https://schema.org/InStock'}})},...patch};}
 const plain=x=>JSON.parse(JSON.stringify(x));
 test('T2306 resolved-product success fixture: exact 169 claim -> Reviews -> completion, no Master/legacy writes',async()=>{const x=setup(),c=client(),master=JSON.stringify(x.master),legacy=JSON.stringify(x.queue[1]),calls=[];
  const args=c.parseArgs(['node','collector','--research-queue-only','--request-id',REQUEST_ID,'--connect-cdp','mock','--write-back']);let closed=0;
@@ -29,7 +29,7 @@ test('explicit Notify me is listed/waiting, and contradictory stock evidence is 
 test('negated recommendations cannot become positive feature flags',()=>{const c=client(),r=setup().claim(true).request,p=page();p.facts.productDescription='This tea is not caffeine-free. Do not serve iced. Do not add milk.';const plan=c.buildCardResearchPlan(r,[p]);for(const field of ['テインフリー','アイスティー推奨','ミルクティー推奨'])assert(!plan.candidates.some(c=>c.target_column===field),field);});
 test('explicit preparation evidence can create only requested feature proposals',()=>{const c=client(),r=setup().claim(true).request,p=page();p.facts.preparationText='Enjoy with milk. Serve iced. Caffeine-free.';const plan=c.buildCardResearchPlan(r,[p]);for(const field of ['テインフリー','アイスティー推奨','ミルクティー推奨'])assert(plan.candidates.some(c=>c.target_column===field),field);assert(!plan.candidates.some(c=>c.target_column==='水出し用ブレンド'));});
 test('a stale request/black-book name cannot override an existing official Version name',()=>{const c=client(),r=setup().claim(true).request;r.target['現在の公式名']='OTHER CURRENT VERSION';assert.equal(c.buildCardResearchPlan(r,[page()]).candidates.length,0);});
-test('official reader preserves verified known page when later searches are blocked and closes page',async()=>{const c=client(),r=setup().claim(true).request;r.target['公式商品ページURL']=URL;let closed=0,inspected=0;c.inspectTargetedProductPage=async()=>{inspected++;return page();};const result=await c.inspectCardResearchPages({request:r,config:{},context:{newPage:async()=>({evaluate:async()=>({researchAvailability:{source:'visible_product_controls',text:''},researchProductData:[]}),goto:async()=>{},locator:()=>({innerText:async()=>'Cloudflare verify you are human'}),close:async()=>closed++})}});assert.equal(result.length,1);assert.equal(inspected,1);assert.equal(closed,1);});
+test('official reader preserves verified known page when later searches are blocked and closes page',async()=>{const c=client(),r=setup().claim(true).request;r.target['公式商品ページURL']=URL;let closed=0,inspected=0;c.inspectTargetedProductPage=async()=>{inspected++;return page();};const result=await c.inspectCardResearchPages({request:r,config:{researchSearchUi:false},context:{newPage:async()=>({evaluate:async()=>({researchAvailability:{source:'visible_product_controls',text:''},researchProductData:[]}),goto:async()=>{},locator:()=>({innerText:async()=>'Cloudflare verify you are human'}),close:async()=>closed++})}});assert.equal(result.length,1);assert.equal(inspected,1);assert.equal(closed,1);});
 test('CDP connection failure cannot consume a pending request',async()=>{const c=client(),x=setup(),args=c.parseArgs(['node','collector','--research-queue-only','--request-id',REQUEST_ID,'--connect-cdp','mock','--write-back']);let calls=0;await assert.rejects(c.runResearchQueueOnly({args,config:{},call:async p=>{calls++;return x.call(p);},connect:async()=>{throw Error('CDP unavailable');}}),/CDP unavailable/);assert.equal(calls,0);assert.equal(x.writes.length,0);});
 
 // Failure fixture models discovery, rather than injecting a resolved product page.
@@ -37,6 +37,8 @@ function searchFailureBrowser({status=403,body='',title='',production=false}={})
  let current='',closed=0,navigations=0;
  return {get closed(){return closed;},get navigations(){return navigations;},context:{newPage:async()=>({
   goto:async url=>{current=url;navigations++;return {status:()=>production&&url.includes('.co.jp')?200:status};},
+  url:()=>current,
+  evaluate:async()=>({url:current,title:production&&!current.includes('.co.jp')?'Just a moment...':title,body:production&&current.includes('.co.jp')?'検索結果が見つかりません':body,no_result:/No products|検索結果/.test(production&&current.includes('.co.jp')?'検索結果が見つかりません':body),effective_query:new global.URL(current).searchParams.get('q') || new global.URL(current).searchParams.get('search_keyword'),query_corrected:false}),
   title:async()=>production&&!current.includes('.co.jp')?'Just a moment...':title,
   locator:()=>({innerText:async()=>production&&current.includes('.co.jp')?'検索結果が見つかりません':body}),
   close:async()=>closed++
@@ -55,18 +57,18 @@ for(const scenario of [
  c.collectProductSearchCandidates=async()=>[];
  let productCalls=0;c.inspectTargetedProductPage=async()=>{productCalls++;throw Error('must not inspect product');};
  const before=JSON.stringify({master:x.master,review:x.review,queue:x.queue});
- const result=await c.processCardResearchRequest({request,dryRun:true,inspect:()=>c.inspectCardResearchPages({context:browser.context,config:{},request}),call:async()=>{throw Error('no API writes');}});
+ const result=await c.processCardResearchRequest({request,dryRun:true,inspect:()=>c.inspectCardResearchPages({context:browser.context,config:{researchSearchUi:false},request}),call:async()=>{throw Error('no API writes');}});
  assert.equal(result.plan.candidates.length,0);assert.equal(result.master_writes,0);assert.equal(productCalls,0);
  assert.equal(Object.values(result.plan.unresolved).filter(reason=>reason===(scenario.reason||'official_access_blocked')).length,10);
  assert.equal(browser.navigations,6);assert.equal(browser.closed,1);
  assert.equal(JSON.stringify({master:x.master,review:x.review,queue:x.queue}),before);
- assert(result.plan.lookup_diagnostics.every(d=>d.status===scenario.status));
+ assert(result.plan.lookup_diagnostics.filter(d=>d.status!==null).every(d=>d.status===scenario.status));
 });
 test('T2306 production-equivalent search failure fixture: FR/EN403 + JP no results, no Reviews or Master writes',async()=>{
  const c=client(),x=setup(),request=x.claim().request,browser=searchFailureBrowser({production:true});
  c.collectProductSearchCandidates=async()=>[];
  const master=JSON.stringify(x.master),reviews=JSON.stringify(x.review),calls=[];
- const result=await c.processCardResearchRequest({request,inspect:()=>c.inspectCardResearchPages({context:browser.context,config:{},request}),call:async payload=>{calls.push(payload.action);return x.call(payload);}});
+ const result=await c.processCardResearchRequest({request,inspect:()=>c.inspectCardResearchPages({context:browser.context,config:{researchSearchUi:false},request}),call:async payload=>{calls.push(payload.action);return x.call(payload);}});
  assert.equal(result.plan.candidates.length,0);assert.equal(Object.keys(result.plan.unresolved).length,14);
  assert.equal(Object.values(result.plan.unresolved).filter(r=>r==='official_lookup_inconclusive').length,10);
  assert.equal(result.plan.lookup_diagnostics.filter(d=>d.reason==='official_access_blocked').length,4);
@@ -100,8 +102,8 @@ test('HTTP403 product page cannot become a verified candidate even with an optim
  const c=client(),r=setup().claim(true).request,browser=searchFailureBrowser({status:403});r.target['公式商品ページURL']=URL;
  c.inspectTargetedProductPage=async reader=>{await reader.goto(URL,{});return page();};
  c.collectProductSearchCandidates=async()=>[];
- const pages=await c.inspectCardResearchPages({context:browser.context,config:{},request:r});
- assert.equal(pages.length,0);assert.equal(pages.lookup.length,7);assert(pages.lookup.every(d=>d.reason==='official_access_blocked'));
+ const pages=await c.inspectCardResearchPages({context:browser.context,config:{researchSearchUi:false},request:r});
+ assert.equal(pages.length,0);assert.equal(pages.lookup.filter(d=>d.status===403).length,7);assert(pages.lookup.every(d=>d.reason==='official_access_blocked'));
  assert.equal(c.buildCardResearchPlan(r,pages).candidates.length,0);
 });
 
