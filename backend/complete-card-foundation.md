@@ -1,0 +1,11 @@
+# complete_card受付のソース管理補完
+
+基準: 1ee3e43e33bae6515b24cc86c0a0e4cd69c6c8e7。2026-10-22に正しい本番MF画像収集を新しい読取り専用タブで再取得。ソースSHA-256: 9da0a9d570f17f0b75af11bf5af5650fcdca49569b16697e505edbfafaa29932。
+
+GAS候補はその本番ソースと同一。Gitに欠けていたResearchPlan_/RequestResearch_/POST振分けと、既存target queue追加の共有ScriptLock wrapperを補完する。legacy処理本体は変更せず、既存Review/Primary/Hybrid/Version安全ガードを保持する。書込み先はキューだけで、Master/Reviewへ書かない。未完了Versionはalready_queued。completedのみならこの段階では従前どおり再依頼可能。1年ポリシー、CDP探索強化、香味mergeは含めない。
+
+公開PWAのindex.htmlは基準Gitと一致。公開inline complete-card-clientの同一バイト内容をresearch-request.jsへ抽出する。外部module化そのものは未公開の整理であり、既に本番公開されているという意味ではない。カード/確認dialog/検索/filterはそのまま。VersionKey/Primary/T/表示名/requestType/requestedAtのpayloadとtext/plain;charset=utf-8、既存GAS_API_URL、queued/already_queued/error表示は不変。SWは外部化した1ファイルをCOREへ追加するだけでCACHEキーは不変。app-configは変更しない。
+
+tests/research-harness.cjsは恒久的なin-memory GAS/queue/lock fixture。実Sheet/ネットワークアクセスなし。受付9テストと後続再調査テストで共用する。complete-card.test.jsは外部化先を読むだけ。
+
+候補作成とmockテストだけであり、Apps Script保存/deployment/Sheet write/stage/commit/pushは未実施。本番GASはこのファイル全体をローカルの古い版で上書きする運用にしない。

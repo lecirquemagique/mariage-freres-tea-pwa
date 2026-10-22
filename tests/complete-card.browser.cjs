@@ -16,7 +16,7 @@ const root=path.join(__dirname,'..');
   }
   if(u.pathname==='/app-config.js')return route.fulfill({contentType:'application/javascript',body:'window.MF_APP_CONFIG={GAS_API_URL:"https://mf.test/api"};'});
   const file=u.pathname==='/'?'index.html':u.pathname.slice(1);
-  if(['index.html','sales-state.js'].includes(file))return route.fulfill({path:path.join(root,file)});
+  if(['index.html','sales-state.js','research-request.js'].includes(file))return route.fulfill({path:path.join(root,file)});
   return route.fulfill({status:404,body:''});
  });
  await page.goto('https://mf.test');await page.waitForFunction(()=>document.querySelectorAll('.card').length===4);

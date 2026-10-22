@@ -4,6 +4,7 @@ const CORE = [
   './index.html',
   './app-config.js',
   './sales-state.js',
+  './research-request.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png'

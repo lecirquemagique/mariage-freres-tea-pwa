@@ -102,7 +102,80 @@ var MF_IMAGE_COLLECTOR_TARGET_QUEUE_HEADERS = [
 var MF_IMAGE_COLLECTOR_TARGET_QUEUE_STATUSES = ['pending', 'processing', 'completed', 'not_found', 'ambiguous', 'error'];
 var MF_IMAGE_COLLECTOR_HYBRID_REFERENCE_PREFIXES = ['TFG', 'TJC', 'TA', 'TB', 'TC', 'TE', 'TF', 'TP', 'TJ'];
 
+/* PWA queue intake: bounded queue-only write; never creates sheets/columns. */
 var MF_RESEARCH_QUEUE_EXTRA_HEADERS = ['version_key', 'primary_reference', 'tea_reference', 'request_type', 'source', 'requested_at', 'missing_fields'];
+function mfImageCollectorResearchPlan_(payload, masterValues, queueValues) {
+  function fail(status, reason) { return {ok:false,status:status,reason:reason,writePerformed:false}; }
+  function text(value) { return String(value == null ? '' : value).trim(); }
+  var fields = ['action','versionKey','primaryReference','teaReference','displayName','requestType','requestedAt','dryRun'];
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+      Object.keys(payload).some(function(k){return fields.indexOf(k)<0;})) return fail('invalid_request','unsupported_fields');
+  if (typeof payload.versionKey !== 'string' || !text(payload.versionKey) || payload.versionKey.length>300) return fail('invalid_version','missing_or_invalid_key');
+  if (payload.requestType !== 'complete_card') return fail('invalid_request_type','unsupported_type');
+  for (var i=0;i<4;i++) {
+    var key=['primaryReference','teaReference','displayName','requestedAt'][i];
+    if (typeof payload[key] !== 'undefined' && (typeof payload[key] !== 'string' || payload[key].length>300)) return fail('invalid_request','invalid_'+key);
+  }
+  if (typeof payload.dryRun !== 'undefined' && typeof payload.dryRun !== 'boolean') return fail('invalid_request','invalid_dry_run');
+  var mh=(masterValues[0]||[]).map(text), qh=(queueValues[0]||[]).map(text);
+  var requiredMaster=['VersionKey','Primary Reference','Tリファレンス番号','現在の公式名','銘柄名（黒い本）'];
+  if(requiredMaster.some(function(h){return mh.indexOf(h)<0 || mh.indexOf(h)!==mh.lastIndexOf(h);})) return fail('conflict','master_schema');
+  var matches=masterValues.slice(1).filter(function(r){return text(r[mh.indexOf('VersionKey')])===payload.versionKey;});
+  if(matches.length!==1) return fail(matches.length?'conflict':'invalid_version',matches.length?'duplicate_key':'not_found');
+  var row={};mh.forEach(function(h,j){row[h]=text(matches[0][j]);});
+  if((text(payload.primaryReference) && text(payload.primaryReference)!==row['Primary Reference']) ||
+     (text(payload.teaReference) && text(payload.teaReference)!==row['Tリファレンス番号'])) return fail('conflict','reference_mismatch');
+  var name=row['現在の公式名']||row['銘柄名（黒い本）'];
+  var base=MF_IMAGE_COLLECTOR_TARGET_QUEUE_HEADERS;
+  if(base.some(function(h,j){return qh[j]!==h;}) || new Set(qh.filter(Boolean)).size!==qh.filter(Boolean).length) return fail('conflict','queue_schema');
+  var expected=base.concat(MF_RESEARCH_QUEUE_EXTRA_HEADERS);
+  var schemaMissing=MF_RESEARCH_QUEUE_EXTRA_HEADERS.filter(function(h,j){return qh[12+j]!==h;});
+  if(schemaMissing.length && qh.slice(12).some(Boolean)) return fail('conflict','queue_columns_occupied');
+  for(var n=1;n<queueValues.length;n++){
+    var existing={};qh.forEach(function(h,j){existing[h]=text(queueValues[n][j]);});
+    if(!existing.request_id || existing.status==='completed') continue;
+    if(existing.version_key===payload.versionKey) return {ok:true,status:'already_queued',requestId:existing.request_id,versionKey:payload.versionKey,writePerformed:false};
+    // REF-only legacy requests are ambiguous, not a duplicate of an inferred Version.
+    if(!existing.version_key && existing.target_ref && [row['Primary Reference'],row['Tリファレンス番号']].indexOf(existing.target_ref)>=0) return fail('conflict','legacy_request_without_version');
+  }
+  var missing=[];
+  ['公式商品ページURL','公式掲載状態','現行ステータス','現在の公式名','現在の公式説明','茶種タグ','産地・国','産地・地域／茶園','香味大分類','香味詳細タグ','水出し用ブレンド','アイスティー推奨','ミルクティー推奨','テインフリー','茶葉画像URL','茶葉サムネイルURL','水色画像URL'].forEach(function(h){
+    if(!row[h] || row[h]==='未確認') missing.push(h);
+  });
+  var receivedAt=new Date().toISOString();
+  var values={created_at:receivedAt,target_name:name,target_ref:row['Tリファレンス番号'],target_url:row['公式商品ページURL']||'',status:'pending',
+    message:'PWA complete_card: カード情報補完。Master更新は別途Review。',version_key:payload.versionKey,
+    primary_reference:row['Primary Reference'],tea_reference:row['Tリファレンス番号'],request_type:'complete_card',source:'PWA',
+    requested_at:receivedAt,missing_fields:JSON.stringify(missing)};
+  return {ok:true,status:'planned',versionKey:payload.versionKey,headers:expected,values:values,missingColumns:schemaMissing,
+    plannedRangeWidth:19,plannedNonemptyCells:Object.keys(values).filter(function(k){return values[k]!=='';}).length+1,writePerformed:false};
+}
+function mfImageCollectorRequestResearch_(payload) {
+  var lock=LockService.getScriptLock(),held=false,writeStarted=false;
+  try {
+    if(!lock.tryLock(10000)) return {ok:false,status:'busy',writePerformed:false};
+    held=true;
+    var ss=mfImageCollectorOpenSpreadsheet_();
+    var master=ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME), queue=ss.getSheetByName(MF_IMAGE_COLLECTOR_TARGET_QUEUE_SHEET_NAME);
+    if(!master || !queue) return {ok:false,status:'conflict',reason:'missing_sheet',writePerformed:false};
+    var plan=mfImageCollectorResearchPlan_(payload,master.getDataRange().getValues(),queue.getDataRange().getValues());
+    if(plan.status!=='planned') return plan;
+    if(payload.dryRun===true) return {ok:true,status:'dry_run',versionKey:plan.versionKey,plan:plan,writePerformed:false};
+    if(plan.missingColumns.length) return {ok:false,status:'schema_required',columns:plan.missingColumns,writePerformed:false};
+    if(PropertiesService.getScriptProperties().getProperty('MF_PWA_RESEARCH_WRITE_ENABLED')!=='true') return {ok:false,status:'disabled',writePerformed:false};
+    var next=queue.getLastRow()+1;
+    if(next>queue.getMaxRows()) return {ok:false,status:'conflict',reason:'queue_capacity',writePerformed:false};
+    var id=Utilities.getUuid();plan.values.request_id=id;
+    // Reject formulas even if a future Master value begins with "=".
+    var cells=plan.headers.map(function(h){var v=plan.values[h]||'';return typeof v==='string'&&/^[=+@-]/.test(v)?"'"+v:v;});
+    writeStarted=true;
+    queue.getRange(next,1,1,19).setValues([cells]);
+    SpreadsheetApp.flush(); // Flush before releasing the script lock.
+    return {ok:true,status:'queued',requestId:id,versionKey:plan.versionKey,writePerformed:true};
+  } catch(error) {
+    return {ok:false,status:'error',reason:'受付結果を確認できません。再試行時もVersionKeyで重複確認します。',writePerformed:writeStarted?null:false};
+  } finally {if(held)lock.releaseLock();}
+}
 
 /* Version-targeted research worker. No Master/Drive writes, no legacy queue calls. */
 var MF_CARD_RESEARCH_FIELDS = ['公式商品ページURL','公式掲載状態','現行ステータス','現在の公式名','現在の公式説明','茶種タグ','産地・国','産地・地域／茶園','香味大分類','香味詳細タグ','水出し用ブレンド','アイスティー推奨','ミルクティー推奨','テインフリー','茶葉画像URL','茶葉サムネイルURL','水色画像URL'];
@@ -279,7 +352,6 @@ function mfImageCollectorCardResearchWorker_(payload) {
   } finally { lock.releaseLock(); }
 }
 
-
 function doPost(e) {
   return mfImageCollectorDoPost(e);
 }
@@ -318,6 +390,9 @@ function mfImageCollectorDoPost(e) {
     var payload = JSON.parse((e && e.postData && e.postData.contents) || '{}');
     if (['claimCardResearchRequest', 'recordCardResearchCandidate', 'completeCardResearchRequest'].indexOf(payload.action) >= 0) {
       return mfImageCollectorJson_(mfImageCollectorCardResearchWorker_(payload));
+    }
+    if (payload.action === 'requestResearch') {
+      return mfImageCollectorJson_(mfImageCollectorRequestResearch_(payload));
     }
     if (payload.action === 'uploadImageResults') {
       return mfImageCollectorJson_(mfImageCollectorUploadImageResults_(payload));
@@ -1398,6 +1473,16 @@ function mfImageCollectorOpenTargetRequestQueue() {
 }
 
 function mfImageCollectorCreateTargetDiscoveryRequest(form) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    return mfImageCollectorCreateTargetDiscoveryRequestLocked_(form);
+  } finally {
+    try { SpreadsheetApp.flush(); } finally { lock.releaseLock(); }
+  }
+}
+
+function mfImageCollectorCreateTargetDiscoveryRequestLocked_(form) {
   var input = mfImageCollectorNormalizeTargetRequestInput_(form || {});
   if (!input.target_name && !input.target_ref && !input.target_url) {
     throw new Error('公式商品URL、REF、銘柄名のいずれかは必須です。');

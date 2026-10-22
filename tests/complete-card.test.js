@@ -1,8 +1,5 @@
 'use strict';
-const {test}=require('node:test'),assert=require('node:assert/strict'),fs=require('fs'),path=require('path'),vm=require('vm');
-const html=fs.readFileSync(path.join(__dirname,'../index.html'),'utf8'),code=html.match(/<script id="complete-card-client">([\s\S]*?)<\/script>/)[1];
-const context={module:{exports:{}},URL,AbortController,setTimeout,clearTimeout,fetch,TypeError,SyntaxError};vm.createContext(context);vm.runInContext(code,context);
-const {payload,send}=context.module.exports;
+const {test}=require('node:test'),assert=require('node:assert/strict'),{payload,send}=require('../research-request');
 const row={VersionKey:'T700-B01','Primary Reference':'T700','Tリファレンス番号':'T700','現在の公式名':'<img src=x onerror="alert(1)">','銘柄名（黒い本）':'OLD'},config={GAS_API_URL:'https://script.google.com/macros/s/test/exec'};
 const response=(status,extra={})=>({ok:true,json:async()=>({ok:['queued','already_queued'].includes(status),status,versionKey:row.VersionKey,...extra})});
 test('complete_card payload uses exact Master values with timestamp and no server-owned fields',()=>{
