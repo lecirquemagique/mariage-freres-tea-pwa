@@ -3718,6 +3718,70 @@ function cardResearchLookupReason(pages) {
   return 'official_lookup_inconclusive';
 }
 
+function cardResearchLanguageRoute(value, reference) {
+  const url = new URL(normalizeOfficialTargetProductUrl(value));
+  if (url.username || url.password || url.search) return null;
+  const host = url.hostname.replace(/^www\./,'');
+  if (host === 'mariagefreres.co.jp' && /^\/view\/item\/\d+$/.test(url.pathname)) return {language:'JP',family:'opaque_jp',host};
+  const path = url.pathname.match(/^\/(fr|en|it)(?:\/(?:the|tea|te))?\/([^/]+)\.html$/i);
+  if (!path || referenceCandidateFromOfficialProductUrl(url.href) !== reference) return null;
+  const families = [/-(?:thes-au-poids|tea-by-the-weight|te-al-peso)$/i,
+    /-(?:boites-icones|iconic-tea-tins)$/i];
+  const family = families.findIndex(re => re.test(path[2]));
+  return family < 0 ? null : {language:path[1].toUpperCase(),family:String(family),host};
+}
+
+function groupCardResearchLanguagePages(request, pages) {
+  const distinct = [...new Set(pages.map(p => p.url))];
+  if (distinct.length < 2) return {ok:true,language_variants:false,pages};
+  const routes = [], byLanguage = new Map(), categories = new Set();
+  const expectedName = cardResearchName(request.target['現在の公式名'] || request.target['銘柄名（黒い本）'] || request.target_name);
+  try {
+    for (const page of pages) {
+      const route = cardResearchLanguageRoute(page.url,request.tea_reference), facts = page.facts || {};
+      const refs = [...new Set(page.refs || [])];
+      if (!route || page.language !== route.language || request.primary_reference !== request.tea_reference ||
+          refs.length !== 1 || refs[0] !== request.tea_reference || cardResearchName(page.official_name) !== expectedName ||
+          (page.target_version_key && page.target_version_key !== request.version_key) ||
+          normalizeOfficialTargetProductUrl(facts.canonical) !== normalizeOfficialTargetProductUrl(page.url) ||
+          !referenceRegex(request.tea_reference).test([facts.h1,facts.productSummary,facts.structuredProductData].join('\n'))) return {ok:false,reason:'language_identity_unverified'};
+      if (byLanguage.has(route.language) && byLanguage.get(route.language) !== page.url) return {ok:false,reason:'multiple_products_in_one_language'};
+      byLanguage.set(route.language,page.url);routes.push(route);
+      if (facts.category) categories.add(normalizeTeaTypeTagsForMaster(normalizeOfficialCategoryForMaster(facts.category)));
+      // An explicit Product SKU/name must not contradict the visible identity.
+      let data; try { data = facts.researchProductData || JSON.parse(facts.structuredProductData || 'null'); } catch { data = null; }
+      const visit = value => {
+        if (Array.isArray(value)) return value.forEach(visit);
+        if (!value || typeof value !== 'object') return;
+        if ([value['@type']].flat().includes('Product') &&
+            ((value.sku && value.sku !== request.tea_reference) || (value.name && cardResearchName(value.name) !== expectedName))) throw new Error('Contradictory Product identity');
+        if (value['@graph']) visit(value['@graph']);
+      };
+      visit(data);
+    }
+    if (categories.size > 1) return {ok:false,reason:'conflicting_product_category'};
+    if (routes.some(route => route.family === 'opaque_jp')) {
+      // Opaque JP IDs cannot be inferred from a T number. Require reciprocal official language links.
+      for (const page of pages) for (const other of pages) {
+        if (page.url === other.url) continue;
+        if (!(page.facts?.researchLanguageLinks || []).some(link => {
+          try { return normalizeOfficialTargetProductUrl(link.url) === other.url &&
+            String(link.language || '').toUpperCase().split('-')[0].replace(/^JA$/,'JP') === other.language; } catch { return false; }
+        })) return {ok:false,reason:'language_url_relationship_unverified'};
+      }
+    } else if (new Set(routes.map(route => route.host+'|'+route.family)).size !== 1) return {ok:false,reason:'different_product_presentation'};
+  } catch { return {ok:false,reason:'language_identity_unverified'}; }
+  return {ok:true,language_variants:true,pages,official_urls_by_language:Object.fromEntries(byLanguage)};
+}
+
+function cardResearchLanguageEvidence(page, reference) {
+  const facts = page.facts || {}, stock = cardResearchStock(facts,reference);
+  return {evidence_language:page.language || sourceLanguageFromUrl(page.url),source_url:page.url,
+    canonical:facts.canonical || '',name:page.official_name,description:facts.productDescription || '',category:facts.category || '',
+    availability:stock?.value || null,availability_evidence:stock?.evidence || '',
+    acquisition_method:page.acquisition_method || null};
+}
+
 function buildCardResearchPlan(request, pages) {
   cardResearchIdentity(request);
   const target = request.target;
@@ -3729,10 +3793,10 @@ function buildCardResearchPlan(request, pages) {
     try { return page.ok === true && normalizeOfficialTargetProductUrl(page.url) &&
       (page.refs || []).includes(request.tea_reference) && names.includes(cardResearchName(page.official_name)); } catch { return false; }
   });
-  // Multiple distinct verified page identities are not resolved by array order.
-  const multiple = new Set(verified.map(page => page.url)).size > 1;
+  const grouping = groupCardResearchLanguagePages(request,verified);
+  const multiple = !grouping.ok;
   const rejectedIdentity = pages.some(page => (page.ok === true && !verified.includes(page)) ||
-    /mismatch|no_verified_reference|canonical_conflict/.test(page.reject_reason || ''));
+    /mismatch|no_verified_reference|canonical_conflict|canonical_unverified|unofficial_url/.test(page.reject_reason || ''));
   const lookupReason = multiple || rejectedIdentity ? 'version_ambiguous' : cardResearchLookupReason(pages);
   if (multiple || rejectedIdentity) verified = [];
   const product = {reference:request.primary_reference,name:target['現在の公式名'] || target['銘柄名（黒い本）'],
@@ -3740,9 +3804,12 @@ function buildCardResearchPlan(request, pages) {
   const vocabulary = structuredFactVocabulary([product]);
   // Existing vocabulary is only an allowlist, never proof of a fact.
   for (const field of Object.keys(vocabulary)) vocabulary[field] = new Set([...vocabulary[field],...(request.vocabulary?.[field] || [])]);
+  const proposals = [], conflicts = [];
+  const languageEvidence = verified.map(page => cardResearchLanguageEvidence(page,request.tea_reference));
   function add(field, value, evidence, page) {
-    if (!effective.includes(field) || !value || !String(evidence || '').trim() || candidates.some(c => c.target_column === field)) return;
-    candidates.push({target_column:field,current_value:target[field],suggested_value:String(value),evidence_text:String(evidence),
+    if (!effective.includes(field) || !value || !String(evidence || '').trim()) return;
+    if (!grouping.language_variants && proposals.some(c => c.target_column === field)) return;
+    proposals.push({target_column:field,current_value:target[field],suggested_value:String(value),evidence_text:String(evidence),
       evidence_url:page.url,evidence_language:page.language || sourceLanguageFromUrl(page.url),official_name:page.official_name,
       verified_references:[request.tea_reference]});
   }
@@ -3764,12 +3831,40 @@ function buildCardResearchPlan(request, pages) {
       add(suggestion.column,suggestion.suggested_value,suggestion.evidence_text,page);
     }
   }
+  for (const field of new Set(proposals.map(p => p.target_column))) {
+    const items = proposals.filter(p => p.target_column === field).sort((a,b) =>
+      Number(b.evidence_url === target['公式商品ページURL'])-Number(a.evidence_url === target['公式商品ページURL']) ||
+      a.evidence_language.localeCompare(b.evidence_language) || a.evidence_url.localeCompare(b.evidence_url));
+    const values = [...new Set(items.map(p => p.suggested_value))];
+    let value = items[0].suggested_value;
+    if (values.length > 1 && grouping.language_variants) {
+      if (field === '香味詳細タグ') value = mergeAromaDetailTags(target[field],values.join('、'));
+      else if (field !== '公式商品ページURL' && !(field === '現在の公式名' && new Set(values.map(cardResearchName)).size === 1)) {
+        conflicts.push({target_column:field,reason:'conflicting_official_values',values:items});
+        unresolved[field] = 'version_ambiguous';continue;
+      }
+    }
+    const candidate = {...items[0],suggested_value:value};
+    if (grouping.language_variants) {
+      candidate.language_evidence = languageEvidence;
+      candidate.official_urls_by_language = grouping.official_urls_by_language;
+      candidate.human_review_required = true;
+      // Existing GAS accepts evidence_text verbatim; keep provenance there as well as in the plan.
+      candidate.evidence_text = items.map(p => `[${p.evidence_language}] ${p.evidence_url}\n${p.evidence_text}`).join('\n\n') +
+        '\n\n[language_variant_provenance; human review required]\n' + JSON.stringify(languageEvidence);
+    }
+    candidates.push(candidate);
+  }
   for (const field of effective) {
     if (candidates.some(c => c.target_column === field)) continue;
-    unresolved[field] = ['茶葉画像URL','茶葉サムネイルURL','水色画像URL'].includes(field)
-      ? 'image_review_pipeline_required' : field === '水出し用ブレンド' ? 'unsupported' : verified.length ? 'no_official_evidence' : lookupReason;
+    unresolved[field] = unresolved[field] || (['茶葉画像URL','茶葉サムネイルURL','水色画像URL'].includes(field)
+      ? 'image_review_pipeline_required' : field === '水出し用ブレンド' ? 'unsupported' : verified.length ? 'no_official_evidence' : lookupReason);
   }
-  return {mode:'existing_primary',version_key:request.version_key,effective_missing_fields:effective,candidates,unresolved,lookup_diagnostics:pages.lookup || []};
+  return {mode:'existing_primary',version_key:request.version_key,effective_missing_fields:effective,candidates,unresolved,lookup_diagnostics:pages.lookup || [],
+    product_group:{status:multiple || rejectedIdentity ? 'version_ambiguous' : verified.length ? 'verified' : 'unverified',
+      language_variants:!!(grouping.language_variants && verified.length),product_count:verified.length ? 1 : 0,
+      reason:grouping.reason || '',official_urls_by_language:verified.length ? grouping.official_urls_by_language || {} : {}},
+    language_evidence:languageEvidence,review_conflicts:conflicts};
 }
 
 function cardResearchSafeUrl(value) {
@@ -3792,6 +3887,28 @@ function cardResearchOfficialPage(url) {
 function cardResearchAccessReason(status, title, body) {
   if ([403,429,503].includes(status) || /cloudflare|verify you are human|just a moment|vérifiez que vous êtes humain/i.test(title + '\n' + body)) return 'official_access_blocked';
   return status !== null && (!status || status >= 400) ? 'official_lookup_inconclusive' : '';
+}
+
+// Observe natural browser completion only. No navigation, challenge interaction or retries.
+async function waitForCardResearchProductDom(page, input, config) {
+  const configured = Number(config.researchProductReadyTimeoutMs);
+  const timeout = Number.isFinite(configured) && configured >= 0 ? Math.min(configured, 30000) : 12000;
+  const started = Date.now(), deadline = started + timeout;
+  let inspected = null;
+  do {
+    try {
+      const productRoot = await page.evaluate(() => Boolean(document.querySelector('.product-info-main, [itemtype$="/Product"], .item-detail')));
+      if (productRoot === true) {
+        inspected = await inspectRenderedCardResearchPage(page,input,config,false);
+        if (inspected.ok) return {verified:true,waited_ms:Date.now()-started,validation:{ok:true,reject_reason:''}};
+      }
+    } catch { /* A document replacement during natural loading is not evidence. */ }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await page.waitForTimeout(Math.min(250, remaining));
+  } while (Date.now() <= deadline);
+  return {verified:false,waited_ms:Date.now()-started,
+    validation:{ok:false,reject_reason:inspected?.reject_reason || 'product_dom_unverified'}};
 }
 
 async function acquireCardResearchPages(context, request) {
@@ -3836,7 +3953,9 @@ async function collectCardResearchProductExtras(page) {
     const data = [...document.querySelectorAll('script[type="application/ld+json"]')].flatMap(el => {
       try { return [JSON.parse(el.textContent)]; } catch { return []; }
     });
-    return {researchAvailability:{source:'visible_product_controls',text},researchProductData:data};
+    const researchLanguageLinks = [...document.querySelectorAll('link[rel="alternate"][hreflang]')]
+      .map(el => ({url:el.href,language:el.hreflang}));
+    return {researchAvailability:{source:'visible_product_controls',text},researchProductData:data,researchLanguageLinks};
   });
 }
 
@@ -3933,21 +4052,45 @@ async function inspectCardResearchPages({context,config,request,debug}) {
     submitted_query:network.state.query,observed_at:nowIso(),...entry});
   async function navigate(url,options={}) {
     if (!cardResearchOfficialPage(url)) throw new Error('Unofficial navigation');
-    const response = await page.goto(url,{waitUntil:'domcontentloaded',timeout:config.navigationTimeoutMs || 15000,...options});
-    const status = response?.status() || null;
-    const title = await page.title(), body = await page.locator('body').innerText();
-    const reason = cardResearchAccessReason(status,title,body) || (!status ? 'official_lookup_inconclusive' : '');
-    diagnostic({url:cardResearchSafeUrl(url),final_url:cardResearchSafeUrl(page.url?.() || url),source_region:cardResearchRegion(url),status,title,reason});
-    if (reason || !cardResearchOfficialPage(page.url?.() || url)) { const error=new Error(reason || 'Unofficial redirect');error.lookupRecorded=true;throw error; }
-    return response;
+    let lastDocument = null;
+    const observeDocument = response => {
+      const req = response.request();
+      if (req.resourceType() === 'document' && req.frame() === page.mainFrame()) lastDocument = response;
+    };
+    page.on?.('response',observeDocument);
+    try {
+      const response = await page.goto(url,{waitUntil:'domcontentloaded',timeout:config.navigationTimeoutMs || 15000,...options});
+      const status = response?.status() || null;
+      const mitigated = await response?.headerValue?.('cf-mitigated') || '';
+      let title = await page.title(), body = await page.locator('body').innerText();
+      let reason = cardResearchAccessReason(status,title,body) || (!status ? 'official_lookup_inconclusive' : '');
+      let ready = null;
+      // This function navigates the owned page only; search/UI and borrowed pages never wait here.
+      if (network.state.stage === 'product' && (status === 403 || mitigated === 'challenge' ||
+          (reason === 'official_access_blocked' && ![429,503].includes(status)))) {
+        ready = await waitForCardResearchProductDom(page,input,config);
+        title = await page.title();
+        if (ready.verified) reason = '';
+        else reason = 'official_access_blocked';
+      }
+      let finalStatus = (lastDocument || response)?.status() || null;
+      if (ready?.verified && finalStatus === 403) finalStatus = null; // DOM success is not an invented HTTP200.
+      diagnostic({url:cardResearchSafeUrl(url),final_url:cardResearchSafeUrl(page.url?.() || url),source_region:cardResearchRegion(url),
+        status,initial_http_status:status,cf_mitigated:mitigated,waited_ms:ready?.waited_ms || 0,
+        final_http_status:finalStatus,final_dom_validation:ready?.validation || null,title,reason});
+      if (reason || !cardResearchOfficialPage(page.url?.() || url)) { const error=new Error(reason || 'Unofficial redirect');error.lookupRecorded=true;throw error; }
+      return response;
+    } finally { page.off?.('response',observeDocument); }
   }
   const reader = new Proxy(page,{get(target,key) { if (key === 'goto') return navigate; const v=target[key];return typeof v === 'function'?v.bind(target):v; }});
   async function retain(inspected, sourcePage, transport) {
+    inspected.acquisition_method = transport;
     const reason = inspected.reject_reason === 'browser_verification' ? 'official_access_blocked' :
       /mismatch|no_verified_reference|canonical_conflict/.test(inspected.reject_reason || '') ? 'version_ambiguous' : inspected.ok ? '' : 'official_lookup_inconclusive';
     diagnostic({transport,stage:transport === 'cdp_existing_dom' ? 'existing_dom' : 'product',url:cardResearchSafeUrl(inspected.url),source_region:cardResearchRegion(inspected.url),status:null,
       canonical:cardResearchSafeUrl(inspected.facts?.canonical),references:inspected.refs || [],official_name:inspected.official_name || '',
-      reason,reject_reason:inspected.reject_reason || '',page_reused:transport === 'cdp_existing_dom'});
+      reason,reject_reason:inspected.reject_reason || '',page_reused:transport === 'cdp_existing_dom',
+      final_dom_validation:{ok:inspected.ok === true,reject_reason:inspected.reject_reason || ''}});
     if (inspected.ok) {
       const snapshotUrl = sourcePage.url?.();
       Object.assign(inspected.facts,await collectCardResearchProductExtras(sourcePage));
@@ -5295,7 +5438,13 @@ async function collectDiscoveryPageFacts(page, pageUrl) {
     const ingredientsText = clean(document.querySelector('.product-info-main [data-role="content"]')?.innerText || '') || sectionText(['Ingredients', 'Ingrédients', '原材料']);
     const preparationText = sectionText(['BREWING TIPS', "CONSEILS D'INFUSION", '淹れ方', '抽出']);
     const title = clean(document.title);
-    const h1 = clean(document.querySelector('h1')?.textContent);
+    // Product headings precede generic page/logo headings; ignore empty matches.
+    let h1 = '';
+    for (const selector of ['h1.page-title [itemprop="name"]','h1.page-title .base','h1.page-title',
+      '.product-info-main [itemprop="name"]','.page-title-wrapper h1 span','.page-title-wrapper h1','.product-info-main h1','h1']) {
+      h1 = [...document.querySelectorAll(selector)].map(node => clean(node.textContent)).find(Boolean) || '';
+      if (h1) break;
+    }
     const bodyText = clean(document.body?.innerText || document.body?.textContent || '');
     const metaDescription = clean(document.querySelector('meta[name="description"]')?.content || '');
     const description = isCommonDescription(metaDescription) ? '' : metaDescription;

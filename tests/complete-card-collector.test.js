@@ -41,6 +41,7 @@ function searchFailureBrowser({status=403,body='',title='',production=false}={})
   evaluate:async()=>({url:current,title:production&&!current.includes('.co.jp')?'Just a moment...':title,body:production&&current.includes('.co.jp')?'検索結果が見つかりません':body,no_result:/No products|検索結果/.test(production&&current.includes('.co.jp')?'検索結果が見つかりません':body),effective_query:new global.URL(current).searchParams.get('q') || new global.URL(current).searchParams.get('search_keyword'),query_corrected:false}),
   title:async()=>production&&!current.includes('.co.jp')?'Just a moment...':title,
   locator:()=>({innerText:async()=>production&&current.includes('.co.jp')?'検索結果が見つかりません':body}),
+  waitForTimeout:async ms=>new Promise(resolve=>setTimeout(resolve,Math.min(ms,1))),
   close:async()=>closed++
  })}};
 }
@@ -76,7 +77,7 @@ test('T2306 production-equivalent search failure fixture: FR/EN403 + JP no resul
  assert.deepEqual(calls,['completeCardResearchRequest']);assert.equal(result.master_writes,0);assert.equal(result.normal_image_products,0);
  assert.equal(JSON.stringify(x.master),master);assert.equal(JSON.stringify(x.review),reviews);
 });
-test('multiple distinct verified pages fail closed instead of selecting first',()=>{
+test('multiple URL candidates without matching own canonicals fail closed instead of selecting first',()=>{
  const c=client(),r=setup().claim(true).request;
  const plan=c.buildCardResearchPlan(r,[page(),page({url:URL.replace('/en/','/fr/')})]);
  assert.equal(plan.candidates.length,0);assert.equal(Object.values(plan.unresolved).filter(r=>r==='version_ambiguous').length,10);
@@ -102,7 +103,7 @@ test('HTTP403 product page cannot become a verified candidate even with an optim
  const c=client(),r=setup().claim(true).request,browser=searchFailureBrowser({status:403});r.target['公式商品ページURL']=URL;
  c.inspectTargetedProductPage=async reader=>{await reader.goto(URL,{});return page();};
  c.collectProductSearchCandidates=async()=>[];
- const pages=await c.inspectCardResearchPages({context:browser.context,config:{researchSearchUi:false},request:r});
+ const pages=await c.inspectCardResearchPages({context:browser.context,config:{researchSearchUi:false,researchProductReadyTimeoutMs:5},request:r});
  assert.equal(pages.length,0);assert.equal(pages.lookup.filter(d=>d.status===403).length,7);assert(pages.lookup.every(d=>d.reason==='official_access_blocked'));
  assert.equal(c.buildCardResearchPlan(r,pages).candidates.length,0);
 });
@@ -115,4 +116,17 @@ test('completion accepts new diagnostic reasons only within the existing missing
  }
  const x=setup(),request=x.claim().request;
  assert.throws(()=>x.call(x.owned(request,'completeCardResearchRequest',{unresolved:{'公式商品ページURL':'invented_reason'}})),/Invalid unresolved result/);
+});
+
+test('language evidence survives the existing GAS record API into Review without Master changes',()=>{
+ const x=setup(),c=client(),r=x.claim().request,before=JSON.stringify(x.master),en=page();
+ en.acquisition_method='cdp_existing_dom';en.facts.productDescription='EN description: white tea harvested in China.';
+ const url=URL.replace('/en/','/fr/'),fr=page({url,language:'FR',acquisition_method:'cdp_navigation',
+  facts:{...en.facts,url,canonical:url,category:'Thé blanc',productDescription:'FR description: thé blanc de Chine.'}});
+ const plan=c.buildCardResearchPlan(r,[fr,en]);assert.equal(plan.product_group.language_variants,true);
+ const candidate=plan.candidates.find(p=>p.target_column==='現在の公式説明');assert(candidate);
+ const result=x.call(x.owned(r,'recordCardResearchCandidate',{candidate:plain(candidate)}));assert.equal(result.status,'recorded');
+ const headers=x.review[0],saved=x.review[1][headers.indexOf('根拠原文')];
+ for(const text of ['FR description','EN description',fr.url,en.url,'cdp_navigation','cdp_existing_dom'])assert(saved.includes(text),text);
+ assert.equal(x.review[1][headers.indexOf('人間判定')],'');assert.equal(JSON.stringify(x.master),before);
 });
