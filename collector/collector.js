@@ -1385,13 +1385,20 @@ function addStructuredSuggestion(suggestions, product, suggestion) {
   if (!suggestion?.column || !suggestion?.suggested_value) return;
   const normalizedSuggestion = { ...suggestion };
   if (normalizedSuggestion.column === MASTER_COLUMNS.flavorCategory) {
-    const normalizedCategories = normalizeAromaCategoriesForMaster(normalizedSuggestion.suggested_value, '').categories;
-    if (normalizedCategories.length !== 1) return;
-    normalizedSuggestion.suggested_value = normalizedCategories[0];
+    const normalized = normalizeAromaCategoriesForMaster(normalizedSuggestion.suggested_value, '');
+    if (!normalized.categories.length || normalized.unknown.length) return;
+    normalizedSuggestion.suggested_value = normalized.value;
   }
   if (!normalizedSuggestion.suggested_value) return;
   const key = `${normalizedSuggestion.column}|${normalizedSuggestion.suggested_value}`;
-  if (suggestions.some((item) => `${item.column}|${item.suggested_value}` === key)) return;
+  const duplicate = suggestions.find((item) => `${item.column}|${item.suggested_value}` === key);
+  if (duplicate) {
+    if (normalizedSuggestion.column === MASTER_COLUMNS.flavorCategory) {
+      duplicate.evidence_text = [...new Set([duplicate.evidence_text,normalizedSuggestion.evidence_text].filter(Boolean))].join('\n');
+      duplicate.source_dom = [...new Set([duplicate.source_dom,normalizedSuggestion.source_dom].filter(Boolean))].join(' / ');
+    }
+    return;
+  }
   suggestions.push({
     confidence: 'medium',
     requires_human_review: true,
@@ -1435,13 +1442,19 @@ function includesVocabulary(vocabulary, column, value) {
 function flavorRules() {
   return [
     { value: 'ベルガモット', category: '柑橘', pattern: /\bbergamot(?:te)?\b|ベルガモット/i },
-    { value: 'ヴァニラ', category: '甘香・菓子', pattern: /\bvanilla\b|\bvanille\b|ヴァニラ|バニラ/i },
+    // Unicode word boundaries exclude compounds, while retaining explicit FR adjective forms.
+    { value: 'チョコレート', category: 'カカオ', pattern: /(?<![\p{L}\p{N}_])(?:chocolat(?:[ée]e?s?|s)?|chocolates?)(?![\p{L}\p{N}_])|チョコレート/iu },
+    { value: 'ヴァニラ', category: '甘香・菓子', pattern: /(?<![\p{L}\p{N}_])(?:vanilla|vanill[ée]e?s?)(?![\p{L}\p{N}_])|ヴァニラ|バニラ/iu },
     { value: 'ジャスミン', category: '花', pattern: /\bjasmine\b|\bjasmin\b|ジャスミン/i },
     { value: 'ローズ', category: '花', pattern: /\brose\b|\broses\b|ローズ|薔薇|バラ/i },
     { value: 'ジンジャー', category: 'スパイス', pattern: /\bginger\b|\bgingembre\b|ジンジャー|生姜/i },
     { value: 'ミント', categories: ['ハーブ', 'ミント'], pattern: /\bmint\b|\bmenthe\b|ミント/i },
     { value: 'カカオ', category: 'カカオ', pattern: /\bcacao\b|\bcocoa\b|カカオ/i },
     { value: 'キャラメル', categories: ['甘香・菓子', 'キャラメル'], pattern: /\bcaramel\b|キャラメル/i },
+    { value: '木質', category: 'ウッディ', pattern: /(?<![\p{L}\p{N}_])(?:boisée?s?|woody)(?![\p{L}\p{N}_])|木質/iu },
+    // Category evidence only: these words do not authorize new detail tags or inferred nuts/cocoa.
+    { category: 'スパイス', pattern: /(?<![\p{L}\p{N}_])(?:muscade|nutmeg)(?![\p{L}\p{N}_])/iu },
+    { category: '甘香・菓子', pattern: /(?<![\p{L}\p{N}_])pralin[ée]e?s?(?![\p{L}\p{N}_])/iu },
     { value: 'ヘーゼルナッツ', allow_new_detail_tag:true, pattern: /\bhazelnuts?\b|\bnoisettes?\b|ヘーゼルナッツ|ノワゼット/i,
       rejectPattern: /\b(?:traces?\s+(?:de|of)|may contain|sans|without|no)\s+(?:hazelnuts?|noisettes?)\b/i },
     { value: 'ハニー', allow_new_detail_tag:true, pattern: /\bhoney\b|\bmiel\b|ハニー|蜂蜜/i,
@@ -1461,7 +1474,7 @@ function flavorContextTexts(facts) {
 }
 
 function isFlavorContext(text) {
-  return /ingredient|ingrédient|ingredients|ar[oô]me|aroma|flavou?r|parfum|notes?|go[uû]t|taste|blend|composition|素材|香り|香味|フレーバー/i.test(text || '');
+  return /ingredient|ingrédient|ingredients|ar[oô]me|aroma|flavou?r|parfum|fragrance|voile\s+boisé|notes?|go[uû]t|taste|blend|composition|素材|香り|香味|フレーバー/i.test(text || '');
 }
 
 function buildStructuredFactSuggestions({ product, facts, vocabulary }) {
@@ -1520,7 +1533,7 @@ function buildStructuredFactSuggestions({ product, facts, vocabulary }) {
       const evidence = conciseFlavorEvidence(context.text, rule.pattern);
       if (!evidence) continue;
       if (rule.rejectPattern && rule.rejectPattern.test(evidence)) continue;
-      if (includesVocabulary(vocabulary, MASTER_COLUMNS.flavorTags, rule.value) || rule.allow_new_detail_tag === true) {
+      if (rule.value && (includesVocabulary(vocabulary, MASTER_COLUMNS.flavorTags, rule.value) || rule.allow_new_detail_tag === true)) {
         addStructuredSuggestion(suggestions, product, {
           column: MASTER_COLUMNS.flavorTags,
           suggested_value: rule.value,
@@ -1589,20 +1602,27 @@ function buildStructuredFactSuggestions({ product, facts, vocabulary }) {
     });
   }
 
-  const details = suggestions.filter(item => item.column === MASTER_COLUMNS.flavorTags);
-  if (!details.length) return suggestions;
-  const confirmed = details.map(item => item.suggested_value);
-  const merged = {...details[0],suggested_value:mergeAromaDetailTags(product.master?.[MASTER_COLUMNS.flavorTags] || '',confirmed),
-    confirmed_values:canonicalAromaDetailValues(confirmed),
-    evidence_text:[...new Set(details.map(item => item.evidence_text))].join('\n'),
-    source_dom:[...new Set(details.map(item => item.source_dom).filter(Boolean))].join(' / '),
-    confidence:details.every(item => item.confidence === 'high') ? 'high' : 'medium'};
-  let inserted = false;
-  return suggestions.flatMap(item => {
-    if (item.column !== MASTER_COLUMNS.flavorTags) return [item];
-    if (inserted) return [];
-    inserted = true; return [merged];
-  });
+  let result = suggestions;
+  for (const column of [MASTER_COLUMNS.flavorTags, MASTER_COLUMNS.flavorCategory]) {
+    const items = result.filter(item => item.column === column);
+    if (!items.length) continue;
+    const confirmed = items.map(item => item.suggested_value);
+    const detail = column === MASTER_COLUMNS.flavorTags;
+    const merged = {...items[0],suggested_value:detail
+      ? mergeAromaDetailTags(product.master?.[column] || '',confirmed)
+      : normalizeAromaCategoriesForMaster(confirmed.join('、'), '').value,
+      ...(detail ? {confirmed_values:canonicalAromaDetailValues(confirmed)} : {}),
+      evidence_text:[...new Set(items.map(item => item.evidence_text))].join('\n'),
+      source_dom:[...new Set(items.map(item => item.source_dom).filter(Boolean))].join(' / '),
+      confidence:items.every(item => item.confidence === 'high') ? 'high' : 'medium'};
+    let inserted = false;
+    result = result.flatMap(item => {
+      if (item.column !== column) return [item];
+      if (inserted) return [];
+      inserted = true; return [merged];
+    });
+  }
+  return result;
 }
 
 function buildOfficialStructuredFacts({ product, facts, language, vocabulary, translationReviewCandidate }) {
@@ -3858,6 +3878,8 @@ function buildCardResearchPlan(request, pages, options) {
     let value = items[0].suggested_value;
     if (values.length > 1 && grouping.language_variants) {
       if (field === '香味詳細タグ') value = mergeAromaDetailTags(target[field],values.join('、'));
+      // Positive aroma classifications are a set, not contradictory scalar product facts.
+      else if (field === '香味大分類') value = normalizeAromaCategoriesForMaster(values.join('、'), '').value;
       else if (field !== '公式商品ページURL' && !(field === '現在の公式名' && new Set(values.map(cardResearchName)).size === 1)) {
         conflicts.push({target_column:field,reason:'conflicting_official_values',values:items});
         unresolved[field] = 'version_ambiguous';continue;

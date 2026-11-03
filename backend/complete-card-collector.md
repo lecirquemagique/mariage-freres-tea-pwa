@@ -204,3 +204,13 @@ Collectorは1商品ページの香味詳細タグ候補を1件に集約し、個
 通常Review builder、保存済み調査planからのReview builder、GASのReview serializer、GAS apply評価にも同じ保持ルールを適用する。古い部分候補やtag_spelling_normalizationでも既存詳細タグを削除しない。apply時は最新Masterを使ってマージし、候補生成時に存在したタグが現在消えていればfail closed。候補作成後に増えたタグは保持する。semanticな再適用は無変更だが、canonical表記の修正だけが必要なら正規化候補として扱う。香味大分類・産地・真偽値・他列の既存処理は維持。
 
 PHÉNIX fixture：ヴァニラ、カラメル、ハニー＋vanille Bourbon, caramel, noisette, miel → ヴァニラ、キャラメル、ヘーゼルナッツ、ハニー。tests/aroma-detail-merge.test.jsで候補生成・Review表示・GAS評価・再適用・古い値の拒否を検証する。今回は本番への保存、既存Review修復、Master反映は実施しない。
+
+## FR香味表現と複数大分類（2026-11-03、ローカル候補生成のみ）
+
+既存詳細語彙にチョコレート・ヴァニラ・木質が存在する場合、chocolat/chocolaté/chocolatée、vanille/vanillé/vanillée、boisé/boiséeを明示的な香味表現として抽出する。Unicode文字境界でchocolaterie、vanilline、framboisée等への部分一致を防ぐ。caroube自体からカカオやチョコレートを推定しない。muscadeはスパイス、praline/pralinesは甘香・菓子の分類根拠にだけ使い、ナツメグ・プラリネ・キャロブ等の未承認詳細タグは作らない。
+
+addStructuredSuggestionは、既存14分類への正規化結果が複数でも保持する。空値・未知分類を含む提案は採用しない。1ページの香味大分類はcanonical順の集合として1列候補へ集約し、各分類の根拠を保持する。検証済みの同一商品に属する言語別ページ間も、明示的に確認した正の分類を集合としてまとめる。販売状態・名称等のscalar衝突、REF/Version/canonicalの安全条件は従来どおり停止する。
+
+香味詳細タグは既存のcanonical unionを維持し、確認済みルールの順、次に保持だけの既存タグの順に並べる。HOJICHAの空欄からの候補はチョコレート、ヴァニラ、キャラメル、木質。大分類はスパイス、甘香・菓子、カカオ、キャラメル、ウッディ。既存タグの削除・他列への一律merge・自動Master反映は追加しない。公式説明翻訳の処理も変更しない。
+
+tests/structured-aroma-extraction.test.jsが保存済みFR/EN本文で候補再生成、FR形態・境界・未承認語彙・集合保持・PHÉNIX・complete_card書込み0・同一性のfail-closedを確認する。既存Review616〜618、Master、queue、本番GAS/deploymentは変更しない。
