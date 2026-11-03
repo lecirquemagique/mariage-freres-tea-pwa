@@ -4154,7 +4154,13 @@ async function cardResearchApi({config,baseDir},payload) {
   const response = await fetch(settings.gasApiUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
     body:JSON.stringify({...payload,secret:settings.secret})});
   const result = await response.json();
-  if (!response.ok || result.ok !== true) throw new Error(result.error || result.reason || 'Research API failed');
+  if (!response.ok || result.ok !== true) {
+    const error = new Error(result.error || result.reason || 'Research API failed');
+    if (result.code) error.code = result.code;
+    if (Number.isInteger(result.expected)) error.expected = result.expected;
+    if (Number.isInteger(result.persisted)) error.persisted = result.persisted;
+    throw error;
+  }
   return result;
 }
 
@@ -4165,14 +4171,49 @@ async function processCardResearchRequest({request,inspect,call,dryRun=false}) {
   const plan = buildCardResearchPlan(request,pages);
   if (dryRun) return {ok:true,status:'dry_run',plan,normal_image_products:0,master_writes:0};
   if (!request.claim_token) throw new Error('Research claim token is missing');
-  for (const candidate of plan.candidates) {
-    // Failures leave ownership in processing. Never report completed after uncertain Review writes.
-    const result = await call({action:'recordCardResearchCandidate',...identity,claim_token:request.claim_token,candidate});
-    if (!['recorded','already_recorded'].includes(result.status)) throw new Error('Review candidate not acknowledged');
+  const receipts = [], expected = plan.candidates.length;
+  try {
+    for (const candidate of plan.candidates) {
+      const result = await call({action:'recordCardResearchCandidate',...identity,claim_token:request.claim_token,
+        candidate,expected_candidates:plan.candidates});
+      let value = candidate.target_column === '香味詳細タグ'
+        ? mergeAromaDetailTags(candidate.current_value,candidate.suggested_value)
+        : String(candidate.suggested_value || '').trim();
+      if (candidate.target_column === '香味大分類') value = value.replace(/バニラ/g,'ヴァニラ');
+      if (result.ok !== true || !['recorded','already_recorded'].includes(result.status) || result.verified !== true ||
+          Object.entries(identity).some(([k,v]) => result[k] !== v) || result.field !== candidate.target_column ||
+          result.detection_type !== (candidate.target_column === '現在の公式説明' ? 'official_description_translation' : 'structured_fact') ||
+          result.suggested_value !== value || result.evidence_url !== candidate.evidence_url ||
+          !Number.isInteger(result.review_row) || result.review_row < 2 || !/^[a-f0-9]{40}$/.test(result.fingerprint || '') ||
+          !String(result.detection_id || '').startsWith(`card-${identity.request_id}-`) ||
+          receipts.some(r => r.detection_id === result.detection_id || r.review_row === result.review_row)) {
+        throw new Error('review_verification_failed: Review persistence receipt is missing or inconsistent');
+      }
+      receipts.push({field:result.field,detection_id:result.detection_id,review_row:result.review_row,fingerprint:result.fingerprint,verified:true});
+    }
+    if (receipts.length !== expected) throw new Error('review_persistence_partial: expected candidate receipts are missing');
+    const result = await call({action:'completeCardResearchRequest',...identity,claim_token:request.claim_token,
+      expected_candidates:plan.candidates,unresolved:plan.unresolved});
+    const proposed = result.result?.proposed;
+    if (result.ok !== true || result.status !== 'completed' || result.verified !== true || result.expected !== expected || result.persisted !== expected ||
+        !Array.isArray(proposed) || proposed.length !== expected || receipts.some(r => !proposed.some(p =>
+          p.verified === true && p.field === r.field && p.detection_id === r.detection_id && p.fingerprint === r.fingerprint))) {
+      throw new Error('review_verification_failed: completion did not confirm every persisted Review');
+    }
+    return {...result,persistence:{expected,persisted:receipts.length,receipts},plan,normal_image_products:0,master_writes:0};
+  } catch(cause) {
+    const code = receipts.length && receipts.length < expected ? 'review_persistence_partial'
+      : /^review_(?:persistence_failed|persistence_partial|verification_failed)/.exec(String(cause.message))?.[0] || 'review_persistence_failed';
+    const counts = /expected=(\d+) persisted=(\d+)/.exec(String(cause.message));
+    const persisted = Number.isInteger(cause.persisted) ? cause.persisted : counts ? Number(counts[2]) : null;
+    const error = new Error(`${code}: expected=${expected} acknowledged=${receipts.length} persisted=${persisted ?? 'unknown'}; ${cause.message}`);
+    error.code = code;
+    // An ACK proves a past read-back, not current persistence after a later failure.
+    error.persistence = {expected,acknowledged:receipts.length,
+      persisted,receipts};
+    // Keep processing ownership. Do not complete, retry other work, or relabel this as missing official evidence.
+    throw error;
   }
-  const result = await call({action:'completeCardResearchRequest',...identity,claim_token:request.claim_token,unresolved:plan.unresolved});
-  if (!['completed','already_completed'].includes(result.status)) throw new Error('Research completion not acknowledged');
-  return {...result,plan,normal_image_products:0,master_writes:0};
 }
 
 async function runResearchQueueOnly({args,config,baseDir,call,connect=connectBrowser,inspect=inspectCardResearchPages}) {

@@ -27,7 +27,11 @@ function setup(){
  const call=p=>JSON.parse(JSON.stringify(ctx.mfImageCollectorCardResearchWorker_({secret:'fixture-secret',request_id:REQUEST_ID,...p})));
  const claim=(dryRun=false)=>call({action:'claimCardResearchRequest',dryRun});
  const candidate=(field='公式商品ページURL',value=URL)=>({target_column:field,current_value:target[field],suggested_value:value,evidence_url:URL,evidence_text:'GRAND PAI MU TAN REF T2306 official product',evidence_language:'EN',official_name:'GRAND PAI MU TAN',verified_references:['T2306']});
- const owned=(request,action,extra={})=>({action,version_key:request.version_key,primary_reference:request.primary_reference,tea_reference:request.tea_reference,claim_token:request.claim_token,...extra});
+ // Direct API tests supply the same explicit completion manifest as the real Collector.
+ const expectedCandidates=new Map();
+ const owned=(request,action,extra={})=>{if(action==='recordCardResearchCandidate'&&extra.candidate)expectedCandidates.set(extra.candidate.target_column,extra.candidate);
+  return {action,version_key:request.version_key,primary_reference:request.primary_reference,tea_reference:request.tea_reference,claim_token:request.claim_token,
+   ...(action==='completeCardResearchRequest'?{expected_candidates:[...expectedCandidates.values()]}:{}),...extra};};
  return {ctx,master,queue,review,writes,validations,props,sheets,headers,qh,target,missing,call,claim,candidate,owned,get locks(){return locks;}};
 }
 module.exports={setup,REQUEST_ID,URL};

@@ -1,5 +1,46 @@
 # complete_card Collector接続（ローカル実装・未導入）
 
+## Review永続化確認とHOJICHA復旧計画（2026-11-03、今回分はローカルのみ）
+
+以下を今回の保存・完了プロトコルとする。後段の過去の実装記録より優先する。HOJICHAで実際に保存が欠落した直接原因は未確定であり、この変更を原因確定の根拠にはしない。
+
+### 保存と完了
+
+- Collectorは各recordとcompleteに `expected_candidates`（生成した全候補）を送る。最初のrecordでGASは全候補を既存builder/validatorに通し、検出ID・対象列・内容fingerprintのmanifestをclaim所有情報へ保存してからappendする。証拠全文をScript Propertiesへ入れない。明示manifestは後続で変更・縮小・拡大できない。
+- 低水準record APIは単体候補も扱えるが、その候補をclaim manifestへ先に記録する。completeには常に明示manifestが必要で、既知候補を省略できない。旧Collectorがmanifestなしでcompleteしようとした場合は停止するため、将来の反映ではGAS/Collectorの両方を揃える。本作業では反映しない。
+- append後にflushして実Reviewを再読する。検出IDの一意性と、request_id、VersionKey、Primary/T、検出種別、対象列、旧値・候補値、公式名、根拠本文・言語・URL、source_type/confidence、reference_resolutionとcard_research来歴を比較する。DataValidation設定後にも再確認する。
+- 成功時のみ `recorded` / `already_recorded` と `verified:true, review_row, sheet_row, detection_id, fingerprint`、対象識別情報・列・候補値・根拠URLを返す。既存同IDでも内容不一致や来歴欠落なら成功扱いしない。人間が編集する承認状態・判定・承認済み日本語説明・コメントはfingerprintから除外する。
+- FR/EN等のlanguage_evidenceとofficial_urls_by_languageもcard_research内へ保持し、fingerprintへ含める。通常のReference resolverや汎用Review serializerの規則は変更しない。
+- Collectorはreceiptの対象・列・値・URL・行番号・ID・検証フラグを確認し、期待数のreceiptが揃うまでcompleteしない。返却値に `persistence.expected/persisted/receipts` を残す。
+- completeはmanifestをclaimと照合し、実Reviewを再読する。期待0/実0の正当な探索完了は許可する。期待N/実Nで、内容・来歴一致かつ余分なrequest紐付きReviewがない場合だけcompletedにする。proposedにはverified/fingerprintを含め、完了応答にもexpected/persisted/verifiedを返す。
+
+### 失敗の表現と再試行
+
+新しいqueue statusは追加しない。失敗時は既存 `processing` とclaim所有権を保持し、completedにしない。Masterは更新しない。APIは `ok:false,status:persistence_error` と次のcodeを返す。
+
+- `review_persistence_failed`: 保存確認対象の行がない。completeで0/Nの場合もこれ。
+- `review_persistence_partial`: completeで1〜N-1/Nだけ保存確認できた。
+- `review_verification_failed`: 対象・内容・来歴・manifest・receiptに不整合がある。
+
+確認できた場合のみexpected/persistedを返す。不明な保存結果を0件と断定しない。Collectorの失敗情報ではacknowledged（過去に検証済みreceiptを受け取った数）とpersisted（今回のサーバー確認値。不明ならnull）を分ける。生成した候補の保存欠落を `no_official_evidence` へ変換しない。
+
+同じ所有token・同じrequest/Version/列/候補内容を再送すると、検出ID・fingerprintを確認して同じReviewを返す。ネットワーク結果不明後のAPI再送はこれを使う。CLIでprocessingを無断reclaimする機能や、completed履歴を再利用する機能は追加しない。PWAはprocessingを既存のalready_queuedとして扱うため、再調査の1年ルールやstatus体系の変更は不要。
+
+### queue211復旧dry-run
+
+`scripts/complete-card-recovery-dry-run.cjs <snapshot.json>` はローカルの読み取り専用planner。通信・token・Sheet書込み・status遷移を持たない。対象をrequest `76c49d5c-9fd2-4385-9ab4-34a9dc6116cd` / row211 / T425-B01 / T425に限定する。
+
+fresh readしたMaster/Review/queueと保存済みbaselineを入力し、Version一意性、Primary/T、元missing_fields、completed/review_only/proposed=[]履歴、主要根拠列の不変性、既存同候補・request紐付きReviewの不存在を確認する。証拠は2026-11-03の検証済みFR/EN planをhash付きで再構成したものと明記し、新たな公式アクセス成功とは扱わない。既存builderで「現在の公式説明=翻訳レビュー候補」「香味詳細タグ=キャラメル」「香味大分類=甘香・菓子」の3候補を作る。翻訳の承認済み日本語説明は空欄のまま。対象情報が変われば停止する。Master/Review/queue書込みは常に0。
+
+### 将来の実復旧方式の比較（実装・実行は未承認）
+
+1. 同じrequestの別recovery ledgerを作って復旧する案：元行の保存は可能だが、completedの通常ガードを別経路で扱う必要があり、通常のclaim/completionとの状態管理が複雑になる。
+2. **別のrecovery request行を新UUIDで作り、元row211を全セル保持する案を推奨。** 新行のmessageへrecovery_of、元の結果・時刻・manifest hash、承認者、復旧理由を記録し、同じrecovery operation IDを再登録しない。既存pending/processing/completedを使用でき、列追加は不要。対象をfresh readし、不足Reviewだけをbuilder＋read-back検証APIで作成し、全件照合後に新行へ復旧結果を記録する。
+
+第2案でも現行の通常APIをそのまま使うことはできない。PWAの1年制限を無断で迂回せず、将来承認された管理者専用の作成・所有権検証が必要。sourceはPWAを偽装せずHuman等、request_typeは明示的なrecovery用途として区別する案とし、許可値・限定APIは実復旧前に別途レビューする。現在の通常workerの `source=PWA/request_type=complete_card` ガードは維持する。dry-run内の元request由来の検出IDは照合用で、新requestを採用するなら新IDで再生成する。通常の再調査受付・既存履歴を変更しない。
+
+今回は復旧の作成API、状態変更API、実Review生成経路を追加しない。queue211、Master、Review、本番GAS/deployment、Git commit/pushは変更しない。
+
 対象request_idは `2a855a7a-a012-449b-ab9a-393639ace1a2`、VersionKeyは `T2306-B01`。
 本番169行を実行する承認ではない。今回の実行はメモリ内mockのみ。本番GAS保存・deployment・Sheets変更・commit/pushは未実施。
 
