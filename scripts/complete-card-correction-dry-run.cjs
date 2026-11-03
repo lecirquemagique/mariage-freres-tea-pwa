@@ -1,7 +1,7 @@
 'use strict';
 // Offline only. There is no fetch, credential loading, or production writer in this script.
 const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),crypto=require('node:crypto'),assert=require('node:assert/strict');
-function dryRun(snapshot,request,originalRows,reason,rule){
+function dryRun(snapshot,request,originalRows,reason,rule,operationId){
  const root=path.resolve(__dirname,'..'),before=JSON.stringify({snapshot,request});
  const ctx={Set,Date,JSON};vm.createContext(ctx);
  for(const name of ['mf-image-collector.gs','card-research-recovery.gs','card-research-correction.gs'])vm.runInContext(fs.readFileSync(path.join(root,'backend',name),'utf8'),ctx);
@@ -36,7 +36,7 @@ function dryRun(snapshot,request,originalRows,reason,rule){
  const plan=collector.buildCardResearchPlan(request,pages,{recovery:true});
  assert.equal(plan.review_conflicts.length,0);assert.equal(plan.product_group.status,'verified');
  const payload={admin_secret:'offline-fixture',approved:true,parent_request_id:meta.recovery.parent_request_id,recovery_request_id:meta.request_id,
-  operation_id:'offline-correction-preview',version_key:request.version_key,primary_reference:request.primary_reference,tea_reference:request.tea_reference,
+  operation_id:operationId,version_key:request.version_key,primary_reference:request.primary_reference,tea_reference:request.tea_reference,
   correction_reason:reason,corrected_by_rule_version:rule,corrections:originals.map(o=>{
    const candidates=plan.candidates.filter(c=>c.target_column===o.row['対象列']);assert.equal(candidates.length,1);
    return {original_detection_id:o.row['検出ID'],original_review_row:o.n,expected_original_fingerprint:ctx.mfImageCollectorCardResearchReceipt_(o.row,o.n).fingerprint,candidate:candidates[0]};
@@ -44,15 +44,15 @@ function dryRun(snapshot,request,originalRows,reason,rule){
  const result=JSON.parse(JSON.stringify(ctx.mfImageCollectorCardCorrectionApply_(payload)));
  // Input originals, Master and queue must remain byte-equivalent in memory.
  assert.equal(JSON.stringify({snapshot,request:JSON.parse(before).request}),before);
- return {input:'Saved production snapshot and FR/EN evidence; not a fresh live read',status:result.status,manifest:result.manifest,
+ return {input:'Saved production snapshot and FR/EN evidence; not a fresh live read',operation_id:operationId,status:result.status,manifest:result.manifest,
   formula_results_source:'Saved server-evaluated recovery preview target (historical, not recalculated)',formula_fields:formulaFields,
   original_rows_unchanged:true,master_writes:0,review_writes:0,queue_writes:0,items:result.items};
 }
 module.exports={dryRun};
 if(require.main===module){
- const [snapshotFile,requestFile,rows,output]=process.argv.slice(2);
- if(!snapshotFile||!requestFile||!rows)throw Error('Usage: node scripts/complete-card-correction-dry-run.cjs snapshot.json request.json 617,618 [output.json]');
+ const [snapshotFile,requestFile,rows,operationId,output]=process.argv.slice(2);
+ if(!snapshotFile||!requestFile||!rows||!operationId)throw Error('Usage: node scripts/complete-card-correction-dry-run.cjs snapshot.json request.json 617,618 local-operation-id [output.json]');
  const result=dryRun(JSON.parse(fs.readFileSync(snapshotFile)),JSON.parse(fs.readFileSync(requestFile)).request,rows.split(',').map(Number),
-  'FR活用形と複数香味分類の抽出改善による訂正。旧候補は当時正常保存された履歴として保持。','structured-aroma-v2');
+  'FR活用形と複数香味分類の抽出改善による訂正。旧候補は当時正常保存された履歴として保持。','structured-aroma-v2',operationId);
  const json=JSON.stringify(result,null,2);if(output)fs.writeFileSync(output,json);else console.log(json);
 }

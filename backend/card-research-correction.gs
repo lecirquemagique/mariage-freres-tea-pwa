@@ -60,8 +60,8 @@ function mfImageCollectorCardCorrectionPlan_(ss, payload, actor) {
     var correction = {supersedes_detection_id:receipt.detection_id,original_review_row:matches[0].n,
       original_fingerprint:receipt.fingerprint,correction_reason:reason,corrected_by_rule_version:rule,
       correction_source:'admin_review_correction',approved_by:actor,
-      original_recovery_child_id:child.request_id,parent_request_id:payload.parent_request_id};
-    // Stable identity excludes timestamps and operation IDs: retries cannot fork a correction.
+      original_recovery_child_id:child.request_id,parent_request_id:payload.parent_request_id,operation_id:payload.operation_id};
+    // Bind identity to the supplied operation ID; timestamps remain excluded for stable retries.
     var key = mfImageCollectorRecoveryHash_([correction,mfImageCollectorCardResearchStoredContent_(row)]);
     info.card_research.request_id = 'correction-' + key;
     info.card_research.correction = correction;
