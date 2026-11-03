@@ -95,6 +95,9 @@ function parseArgs(argv) {
     dryRun: false,
     writeBack: null,
     researchQueueOnly: false,
+    researchRecoveryOnly: false,
+    recoveryParentId: '', recoveryOperationId: '', approveRecovery: false, recoveryReason: '', recoveryFields: [],
+    recoveryVersionKey: '', recoveryPrimary: '', recoveryRef: '',
     requestId: '',
     useConfigProducts: false,
     discoverUrlsOnly: false,
@@ -171,6 +174,15 @@ function parseArgs(argv) {
     else if (arg === '--report-enrichment-data-issues') args.reportEnrichmentDataIssues = argv[++i] || '';
     else if (arg.startsWith('--report-enrichment-data-issues=')) args.reportEnrichmentDataIssues = arg.slice('--report-enrichment-data-issues='.length);
     else if (arg === '--research-queue-only') args.researchQueueOnly = true;
+    else if (arg === '--research-recovery-only') args.researchRecoveryOnly = true;
+    else if (arg === '--parent-request-id') args.recoveryParentId = argv[++i] || '';
+    else if (arg === '--operation-id') args.recoveryOperationId = argv[++i] || '';
+    else if (arg === '--approve-recovery') args.approveRecovery = true;
+    else if (arg === '--recovery-reason') args.recoveryReason = argv[++i] || '';
+    else if (arg === '--recovery-fields') args.recoveryFields = (argv[++i] || '').split(',').map(s=>s.trim()).filter(Boolean);
+    else if (arg === '--recovery-version-key') args.recoveryVersionKey = argv[++i] || '';
+    else if (arg === '--recovery-primary') args.recoveryPrimary = argv[++i] || '';
+    else if (arg === '--recovery-ref') args.recoveryRef = argv[++i] || '';
     else if (arg === '--request-id') args.requestId = argv[++i] || '';
     else if (arg.startsWith('--request-id=')) args.requestId = arg.slice('--request-id='.length);
     else if (arg === '--write-review') args.writeReview = true;
@@ -3675,9 +3687,16 @@ async function writeBackReviewCandidates({ config, baseDir, candidates, debug })
 // This path never calls legacy discovery, image writeback, or normal Collector selection.
 const CARD_RESEARCH_FIELDS = ['公式商品ページURL','公式掲載状態','現行ステータス','現在の公式名','現在の公式説明','茶種タグ','産地・国','産地・地域／茶園','香味大分類','香味詳細タグ','水出し用ブレンド','アイスティー推奨','ミルクティー推奨','テインフリー','茶葉画像URL','茶葉サムネイルURL','水色画像URL'];
 
-function cardResearchIdentity(request) {
+function cardResearchIdentity(request, {recovery=false}={}) {
   const target = request?.target;
-  if (request?.request_type !== 'complete_card' || request.source !== 'PWA' || !request.request_id ||
+  const kindValid = recovery === true
+    ? request?.request_type === 'complete_card_recovery' && request.source === 'Human' && request.recovery?.approved_by_admin === true &&
+      !!request.recovery.parent_request_id && !!request.recovery.operation_id && !!request.recovery.approved_by && !!request.recovery.approved_at &&
+      request.recovery.version_key === request.version_key && request.recovery.primary_reference === request.primary_reference &&
+      request.recovery.tea_reference === request.tea_reference && (request.recovery.recovery_request_id === request.request_id ||
+        request.request_id === 'recovery-preview' && request.recovery.recovery_request_id === null)
+    : request?.request_type === 'complete_card' && request.source === 'PWA';
+  if (!kindValid || !request.request_id ||
       !request.version_key || target?.VersionKey !== request.version_key || !request.primary_reference || !request.tea_reference ||
       target['Primary Reference'] !== request.primary_reference || target['Tリファレンス番号'] !== request.tea_reference) {
     throw new Error('complete_card VersionKey/Primary/T identity mismatch');
@@ -3782,8 +3801,8 @@ function cardResearchLanguageEvidence(page, reference) {
     acquisition_method:page.acquisition_method || null};
 }
 
-function buildCardResearchPlan(request, pages) {
-  cardResearchIdentity(request);
+function buildCardResearchPlan(request, pages, options) {
+  cardResearchIdentity(request,options);
   const target = request.target;
   const effective = request.missing_fields.filter(field => !String(target[field] || '').trim() || target[field] === '未確認');
   const candidates = [], unresolved = {};
@@ -4042,8 +4061,8 @@ async function searchCardResearchOfficialUi({page,region,queries,navigate,collec
   }
 }
 
-async function inspectCardResearchPages({context,config,request,debug}) {
-  cardResearchIdentity(request);
+async function inspectCardResearchPages({context,config,request,debug,recovery=false}) {
+  cardResearchIdentity(request,{recovery});
   const lease = await acquireCardResearchPages(context,request), page = lease.owned.page;
   const pages = [], seen = new Set(), urls = new Set(); pages.lookup = [];
   const network = await captureCardResearchNavigation(page,pages.lookup);
@@ -4148,11 +4167,11 @@ async function inspectCardResearchPages({context,config,request,debug}) {
   } finally { try { await network.close(); } finally { await lease.release(); } }
 }
 
-async function cardResearchApi({config,baseDir},payload) {
-  const settings = getWriteBackSettings({...config,writeBack:{...config.writeBack,enabled:true}},baseDir);
+async function cardResearchApi({config,baseDir,admin=false},payload) {
+  const settings = getWriteBackSettings({...config,writeBack:{...config.writeBack,enabled:true,...(admin?{secretEnv:'MF_CARD_RECOVERY_ADMIN_SECRET'}:{})}},baseDir);
   if (!settings) throw new Error('Research API settings required');
   const response = await fetch(settings.gasApiUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body:JSON.stringify({...payload,secret:settings.secret})});
+    body:JSON.stringify({...payload,...(admin?{admin_secret:settings.secret}:{secret:settings.secret})})});
   const result = await response.json();
   if (!response.ok || result.ok !== true) {
     const error = new Error(result.error || result.reason || 'Research API failed');
@@ -4164,11 +4183,11 @@ async function cardResearchApi({config,baseDir},payload) {
   return result;
 }
 
-async function processCardResearchRequest({request,inspect,call,dryRun=false}) {
-  const identity = cardResearchIdentity(request);
+async function processCardResearchRequest({request,inspect,call,dryRun=false,recovery=false}) {
+  const identity = cardResearchIdentity(request,{recovery});
   let pages = [];
   try { pages = await inspect(request); } catch { pages.lookup = [{reason:'official_lookup_inconclusive'}]; }
-  const plan = buildCardResearchPlan(request,pages);
+  const plan = buildCardResearchPlan(request,pages,{recovery});
   if (dryRun) return {ok:true,status:'dry_run',plan,normal_image_products:0,master_writes:0};
   if (!request.claim_token) throw new Error('Research claim token is missing');
   const receipts = [], expected = plan.candidates.length;
@@ -4217,7 +4236,7 @@ async function processCardResearchRequest({request,inspect,call,dryRun=false}) {
 }
 
 async function runResearchQueueOnly({args,config,baseDir,call,connect=connectBrowser,inspect=inspectCardResearchPages}) {
-  if (!args.researchQueueOnly || !/^[A-Za-z0-9-]{1,100}$/.test(args.requestId || '') || !args.connectCdp ||
+  if (!args.researchQueueOnly || args.researchRecoveryOnly || !/^[A-Za-z0-9-]{1,100}$/.test(args.requestId || '') || !args.connectCdp ||
       args.targetName || args.targetRef || args.targetUrl || args.refs?.length || args.versionKeys?.length || args.useConfigProducts ||
       args.discoverNewReferences || args.discoverUrlsOnly || args.backfillOfficialDescriptions || args.enrichIncompleteRecords ||
       args.auditIncompleteRecords || args.taxonomyDryRun || args.statusJson || args.authSetup || args.writeMaster || args.writeReview ||
@@ -4239,6 +4258,58 @@ async function runResearchQueueOnly({args,config,baseDir,call,connect=connectBro
     return await processCardResearchRequest({request:claim.request,call:api,dryRun,
       inspect:request => inspect({context:connection.context,config,request,debug:args.debug})});
   } finally { if (connection) await connection.browser.close(); }
+}
+
+async function runCardRecoveryOnly({args,config,baseDir,call,connect=connectBrowser,inspect=inspectCardResearchPages}) {
+  if (!args.researchRecoveryOnly || args.researchQueueOnly || !args.approveRecovery || !args.connectCdp ||
+      !/^[A-Za-z0-9-]{1,100}$/.test(args.recoveryParentId || '') || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(args.recoveryOperationId || '') ||
+      !args.recoveryVersionKey || !args.recoveryPrimary || !args.recoveryRef ||
+      args.requestId && !/^[A-Za-z0-9-]{1,100}$/.test(args.requestId) ||
+      args.targetName || args.targetRef || args.targetUrl || args.refs?.length || args.versionKeys?.length || args.useConfigProducts ||
+      args.discoverNewReferences || args.discoverUrlsOnly || args.backfillOfficialDescriptions || args.enrichIncompleteRecords ||
+      args.auditIncompleteRecords || args.taxonomyDryRun || args.statusJson || args.authSetup || args.writeMaster || args.writeReview ||
+      args.writeStructuredReviewCandidates || args.auditPrimaryReferenceBackfill || args.planPrimaryReferenceColumn || args.ensurePrimaryReferenceColumn ||
+      args.planPrimaryReferenceBackfill || args.applyPrimaryReferenceBackfill || args.planEnrichmentReviewWriteback || args.applyEnrichmentReviewPlan || args.reportEnrichmentDataIssues) {
+    throw new Error('Use explicit administrator-approved --research-recovery-only without normal Collector work');
+  }
+  if (!call && !process.env.MF_CARD_RECOVERY_ADMIN_SECRET) throw new Error('MF_CARD_RECOVERY_ADMIN_SECRET is required; do not put secrets on the command line');
+  const api = call || (payload => cardResearchApi({config,baseDir,admin:true},payload));
+  const common = {parent_request_id:args.recoveryParentId,operation_id:args.recoveryOperationId,approved:true,
+    version_key:args.recoveryVersionKey,primary_reference:args.recoveryPrimary,tea_reference:args.recoveryRef};
+  const dryRun = args.writeBack !== true || args.dryRun === true;
+  let connection;
+  try {
+    // Check the browser before any real child creation/claim. Parent is never writable.
+    connection = await connect(args);
+    let id = args.requestId;
+    if (!id) {
+      const input = {...common,action:'createCardResearchRecoveryRequest',target_columns:args.recoveryFields,recovery_reason:args.recoveryReason};
+      const preview = await api({...input,dryRun:true});
+      if (preview.status === 'already_exists') id = preview.recovery_request_id;
+      else {
+        if (preview.status !== 'recovery_preview' || preview.writePerformed !== false || preview.recovery_request_id !== null) throw new Error('Invalid recovery preview');
+        cardResearchIdentity(preview.request,{recovery:true});
+        const pages = await inspect({context:connection.context,config,request:preview.request,debug:args.debug,recovery:true});
+        const plan = buildCardResearchPlan(preview.request,pages,{recovery:true});
+        if (dryRun) return {ok:true,status:'dry_run',recovery_request_id:null,parent_request_id:common.parent_request_id,plan,
+          recovery:preview.request.recovery,writes:{queue:0,review:0,master:0},normal_image_products:0,master_writes:0};
+        if (plan.candidates.length !== args.recoveryFields.length || args.recoveryFields.some(f=>!plan.candidates.some(c=>c.target_column===f))) throw new Error('Recovery research is incomplete; child request was not created');
+        const created = await api({...input,apply:true,dryRun:false,expected_target_hash:preview.request.recovery.target_snapshot_hash});
+        if (!['recovery_created','already_exists'].includes(created.status) || !created.recovery_request_id) throw new Error('Recovery child creation not confirmed');
+        id = created.recovery_request_id;
+      }
+    }
+    const claim = await api({...common,action:'claimCardResearchRecoveryRequest',request_id:id,dryRun});
+    if (!['preview','claimed','busy','already_completed'].includes(claim.status)) throw new Error('Invalid recovery claim response');
+    if (!claim.request) return {...claim,normal_image_products:0,master_writes:0};
+    if (claim.request.request_id !== id || claim.request.recovery?.parent_request_id !== common.parent_request_id ||
+        claim.request.recovery?.operation_id !== common.operation_id) throw new Error('Recovery claim scope mismatch');
+    cardResearchIdentity(claim.request,{recovery:true});
+    const actions={recordCardResearchCandidate:'recordCardResearchRecoveryCandidate',completeCardResearchRequest:'completeCardResearchRecoveryRequest'};
+    return await processCardResearchRequest({request:claim.request,recovery:true,dryRun,
+      inspect:request=>inspect({context:connection.context,config,request,debug:args.debug,recovery:true}),
+      call:payload=>{if(!actions[payload.action])throw new Error('Unexpected recovery worker action');return api({...payload,...common,action:actions[payload.action],dryRun:false});}});
+  } finally {if(connection)await connection.browser.close();}
 }
 
 async function claimTargetDiscoveryRequest({ config, baseDir, debug }) {
@@ -7697,6 +7768,11 @@ async function main() {
   if (args.writeBack !== null) {
     config.writeBack = { ...(config.writeBack || {}), enabled: args.writeBack };
   }
+  if (args.researchRecoveryOnly) {
+    console.log(JSON.stringify(await runCardRecoveryOnly({args,config,baseDir}),null,2));
+    return;
+  }
+  if (args.recoveryParentId || args.recoveryOperationId || args.approveRecovery) throw new Error('Recovery arguments require --research-recovery-only');
   if (args.researchQueueOnly) {
     console.log(JSON.stringify(await runResearchQueueOnly({args,config,baseDir}),null,2));
     return;

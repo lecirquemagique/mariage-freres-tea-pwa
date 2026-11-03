@@ -368,6 +368,7 @@ function mfImageCollectorCardResearchBuildReview_(c, input) {
       tea_reference:c.request.tea_reference,verified_references:[c.request.tea_reference],
       language_evidence:input.language_evidence || [],official_urls_by_language:input.official_urls_by_language || {}},
     status:'要確認',human_decision:'',target_provenance:'resolver',diff_summary:'complete_card: ' + field};
+  if (c.recovery) candidate.card_research.recovery = c.recovery;
   var id = mfImageCollectorReviewDedupeKey_(candidate);
   // Dedicated identity cannot overwrite legacy/human-reviewed candidates.
   id = 'card-' + c.request.request_id + '-' + id;
@@ -377,35 +378,40 @@ function mfImageCollectorCardResearchBuildReview_(c, input) {
   return {field:field,id:id,row:row};
 }
 
-function mfImageCollectorCardResearchWorker_(payload) {
-  mfImageCollectorAssertSecret_(payload);
+function mfImageCollectorCardResearchWorker_(payload, recovery) {
+  if (recovery === true) mfImageCollectorRecoveryAdmin_(payload);
+  else mfImageCollectorAssertSecret_(payload);
   var lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
-    var ss = mfImageCollectorOpenSpreadsheet_(), c = mfImageCollectorCardResearchContext_(ss, payload.request_id);
+    var ss = mfImageCollectorOpenSpreadsheet_(), c = recovery === true
+      ? mfImageCollectorRecoveryContext_(ss,payload) : mfImageCollectorCardResearchContext_(ss, payload.request_id);
     ['version_key','primary_reference','tea_reference'].forEach(function(k) {
       if (typeof payload[k] !== 'undefined' && payload[k] !== c.request[k]) throw new Error(k + ' mismatch.');
     });
-    var props = PropertiesService.getScriptProperties(), tokenKey = 'MF_CARD_RESEARCH_CLAIM_' + payload.request_id;
+    var props = PropertiesService.getScriptProperties(), tokenKey = (recovery === true ? 'MF_CARD_RECOVERY_CLAIM_' : 'MF_CARD_RESEARCH_CLAIM_') + payload.request_id;
     var storedClaim = props.getProperty(tokenKey), owner = storedClaim ? JSON.parse(storedClaim) : null, token;
     if (payload.action === 'claimCardResearchRequest') {
       if (c.request.status === 'completed') return {ok:true,status:'already_completed',request:null};
       if (c.request.status !== 'pending') return {ok:true,status:'busy',request:null};
-      var request = {request_id:c.request.request_id, request_type:'complete_card', source:'PWA', version_key:c.request.version_key,
+      var request = {request_id:c.request.request_id, request_type:c.recovery ? 'complete_card_recovery' : 'complete_card', source:c.recovery ? 'Human' : 'PWA', version_key:c.request.version_key,
         primary_reference:c.request.primary_reference, tea_reference:c.request.tea_reference, target_name:c.request.target_name,
         missing_fields:c.fields, effective_missing_fields:c.effective, target:c.target, vocabulary:c.vocabulary};
+      if (c.recovery) request.recovery = c.recovery;
       if (payload.dryRun === true) return {ok:true,status:'preview',request:request,writePerformed:false};
       // Store ownership before queue writes. Uncertain writes are never silently reclaimed.
       if (owner) throw new Error('Prior claim requires recovery; no automatic reclaim.');
       token = Utilities.getUuid();
       props.setProperty(tokenKey, JSON.stringify({token:token,version_key:c.request.version_key,
-        primary_reference:c.request.primary_reference,tea_reference:c.request.tea_reference,missing_fields:c.request.missing_fields}));
+          primary_reference:c.request.primary_reference,tea_reference:c.request.tea_reference,missing_fields:c.request.missing_fields,
+          recovery_hash:c.recovery ? mfImageCollectorRecoveryHash_(c.recovery) : null}));
       c.queue.getRange(c.row, 6, 1, 2).setValues([['processing',new Date().toISOString()]]);
       SpreadsheetApp.flush();
       request.claim_token = token;
       return {ok:true,status:'claimed',request:request,writePerformed:true};
     }
     if (!owner || !payload.claim_token || payload.claim_token !== owner.token) throw new Error('Invalid claim ownership.');
+    if (c.recovery && owner.recovery_hash !== mfImageCollectorRecoveryHash_(c.recovery)) throw new Error('recovery_claim_scope_changed');
     ['version_key','primary_reference','tea_reference'].forEach(function(k) {
       if (payload[k] !== c.request[k] || owner[k] !== c.request[k]) throw new Error('Claim target changed: ' + k);
     });
@@ -450,6 +456,9 @@ function mfImageCollectorCardResearchWorker_(payload) {
     }
     if (payload.action !== 'completeCardResearchRequest') throw new Error('Unsupported research action.');
     var manifest = mfImageCollectorCardResearchManifest_(c, payload.expected_candidates);
+    if (c.recovery && (manifest.entries.length !== c.fields.length || c.fields.some(function(f) {
+      return !manifest.entries.some(function(e) { return e.field === f; });
+    }))) throw new Error('review_verification_failed: recovery expected scope is incomplete');
     var known = owner.review_manifest || [];
     if (known.length !== manifest.entries.length || known.some(function(e) {
       return !manifest.entries.some(function(n) { return n.field === e.field && n.detection_id === e.detection_id && n.fingerprint === e.fingerprint; });
@@ -473,6 +482,13 @@ function mfImageCollectorCardResearchWorker_(payload) {
     var result = {mode:'review_only',version_key:c.request.version_key,proposed:proposed,
       unresolved:c.effective.filter(function(k) { return !proposed.some(function(p) { return p.field === k; }); }).map(function(k) { return {field:k,reason:reasons[k] || 'no_official_evidence'}; }),
       already_filled:c.fields.filter(function(k) { return c.effective.indexOf(k) < 0; })};
+    if (c.recovery) {
+      result.recovery = c.recovery;
+      result.recovery_request_id = c.request.request_id;
+      result.parent_request_id = c.recovery.parent_request_id;
+      result.recovery_result = {expected:manifest.entries.length,persisted:proposed.length,verified:true,
+        persisted_review_ids:proposed.map(function(p) { return p.detection_id; })};
+    }
     var message = JSON.stringify(result);
     if (message.length > 45000) throw new Error('Research result is too large.');
     // A single range write cannot leave completed without its result message. Preserve started_at.
@@ -519,6 +535,9 @@ function mfImageCollectorDoGet(e) {
 function mfImageCollectorDoPost(e) {
   try {
     var payload = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+    if (['createCardResearchRecoveryRequest','claimCardResearchRecoveryRequest','recordCardResearchRecoveryCandidate','completeCardResearchRecoveryRequest'].indexOf(payload.action) >= 0) {
+      return mfImageCollectorJson_(mfImageCollectorRecoveryApi_(payload));
+    }
     if (['claimCardResearchRequest', 'recordCardResearchCandidate', 'completeCardResearchRequest'].indexOf(payload.action) >= 0) {
       return mfImageCollectorJson_(mfImageCollectorCardResearchWorker_(payload));
     }
