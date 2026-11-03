@@ -1,0 +1,49 @@
+'use strict';
+const {test}=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),path=require('node:path');
+const {setupRecovery}=require('./recovery-harness.cjs');
+function fixture(){
+ const f=setupRecovery(),child=f.claim(f.create().recovery_request_id).request;
+ for(let i=0;i<3;i++)f.record(child,i);f.complete(child);
+ const x=f.x;vm.runInContext(fs.readFileSync(path.join(__dirname,'../backend/card-research-correction.gs'),'utf8'),x.ctx);
+ const corrections=[1,2].map(i=>{const row=Object.fromEntries(x.review[0].map((h,j)=>[h,x.review[i+1][j]]));return{
+  original_detection_id:row['検出ID'],original_review_row:i+2,expected_original_fingerprint:x.ctx.mfImageCollectorCardResearchReceipt_(row,i+2).fingerprint,
+  candidate:{...f.candidates[i],suggested_value:i===1?'チョコレート、ヴァニラ、キャラメル、木質':'スパイス、甘香・菓子、カカオ、キャラメル、ウッディ'}};});
+ const payload={...f.common,recovery_request_id:child.request_id,operation_id:'correction-fixture-1',correction_reason:'Official aroma extraction improved',corrected_by_rule_version:'structured-aroma-v2',corrections};
+ const call=p=>x.ctx.mfImageCollectorCardCorrectionApply_({...payload,...p});
+ const apply=p=>call({apply:true,expected_manifest:call().manifest,...p});
+ return{f,x,payload,call,apply};
+}
+test('correction preview preserves original Reviews, queue, Master, ledger and creates two canonical candidates',()=>{
+ const {x,call}=fixture(),before=JSON.stringify([x.master,x.queue,x.review,[...x.props]]),n=x.writes.length,p=call();
+ assert.equal(p.status,'correction_preview');assert.equal(p.items.length,2);assert.equal(x.writes.length,n);assert.equal(JSON.stringify([x.master,x.queue,x.review,[...x.props]]),before);
+ assert.equal(p.items[0].row['候補値'],'チョコレート、ヴァニラ、キャラメル、木質');assert.equal(p.items[1].row['候補値'],'スパイス、甘香・菓子、カカオ、キャラメル、ウッディ');
+ for(const i of p.items){assert.notEqual(i.expected.detection_id,i.supersedes.supersedes_detection_id);assert.notEqual(i.expected.fingerprint,i.supersedes.original_fingerprint);assert.notEqual(i.expected.request_id,i.supersedes.original_recovery_child_id);assert.equal(JSON.parse(i.row['公式情報JSON']).card_research.correction.original_review_row,i.supersedes.original_review_row);}
+});
+test('verified append preserves originals and completed child manifest; replays append zero',()=>{
+ const {x,apply}=fixture(),before=JSON.stringify([x.master,x.queue,x.review.slice(0,4)]),p=apply();
+ assert.equal(p.persisted.length,2);assert(p.persisted.every(r=>r.verified));assert.equal(x.review.length,6);assert.equal(JSON.stringify([x.master,x.queue,x.review.slice(0,4)]),before);
+ assert.equal(apply().writePerformed,false);assert.equal(x.review.length,6);assert(p.retirement_plan.every(r=>r.status==='却下'));
+});
+test('same content under another operation also reuses same corrected Reviews',()=>{const f=fixture();f.apply();f.payload.operation_id='another-operation';assert.equal(f.apply().writePerformed,false);assert.equal(f.x.review.length,6);});
+test('AK and human approval do not change original translation fingerprint',()=>{const {x}=fixture(),r=Object.fromEntries(x.review[0].map((h,i)=>[h,x.review[1][i]])),a=x.ctx.mfImageCollectorCardResearchReceipt_(r,2);r['承認済み日本語説明']='人間が確認した日本語訳';r['人間判定']='既存銘柄を更新';r['ステータス']='承認';assert.equal(x.ctx.mfImageCollectorCardResearchReceipt_(r,2).fingerprint,a.fingerprint);assert.equal(x.ctx.mfImageCollectorPreflightReviewRow_(2,r,{master_snapshot:{values:x.master,headers:x.headers}}).process,true);});
+test('translation still requires approved Japanese text',()=>{const {x}=fixture(),r=Object.fromEntries(x.review[0].map((h,i)=>[h,x.review[1][i]]));r['人間判定']='既存銘柄を更新';assert.throws(()=>x.ctx.mfImageCollectorPreflightReviewRow_(2,r,{master_snapshot:{values:x.master,headers:x.headers}}),/承認済み日本語説明/);});
+for(const [label,patch] of [
+ ['unapproved',f=>f.payload.approved=false],['wrong Version',f=>f.payload.version_key='T425-C01'],
+ ['wrong original fingerprint',f=>f.payload.corrections[0].expected_original_fingerprint='bad'],
+ ['wrong row',f=>f.payload.corrections[0].original_review_row=99],
+ ['foreign REF evidence',f=>f.payload.corrections[0].candidate.verified_references=['T999']],
+ ['stale Master',f=>f.x.master[1][f.x.headers.indexOf('香味詳細タグ')]='ローズ'],
+ ['unsupported field',f=>f.payload.corrections[0].candidate.target_column='現在の公式説明']
+])test(label+' fails closed without writes',()=>{const f=fixture();patch(f);const before=JSON.stringify([f.x.master,f.x.queue,f.x.review]),n=f.x.writes.length;assert.throws(()=>f.call());assert.equal(f.x.writes.length,n);assert.equal(JSON.stringify([f.x.master,f.x.queue,f.x.review]),before);});
+test('missing persistence cannot report success and retry recovers without duplicate',()=>{const f=fixture(),append=f.x.sheets['変更候補レビュー'].appendRow;f.x.sheets['変更候補レビュー'].appendRow=()=>{};assert.throws(()=>f.apply(),/persistence_failed/);f.x.sheets['変更候補レビュー'].appendRow=append;assert.equal(f.apply().persisted.length,2);});
+test('partial persistence stops, retains history, and retries only the missing Review',()=>{const f=fixture(),append=f.x.sheets['変更候補レビュー'].appendRow;let n=0;f.x.sheets['変更候補レビュー'].appendRow=r=>{if(++n===2)throw Error('network interrupted');append(r);};assert.throws(()=>f.apply(),/interrupted/);assert.equal(f.x.review.length,5);f.x.sheets['変更候補レビュー'].appendRow=append;assert.equal(f.apply().persisted.length,2);assert.equal(f.x.review.length,6);});
+test('correction provenance tampering invalidates fingerprint and blocks retry',()=>{const f=fixture();f.apply();const j=f.x.review[0].indexOf('公式情報JSON'),v=JSON.parse(f.x.review[4][j]);v.card_research.correction.correction_reason='tampered';f.x.review[4][j]=JSON.stringify(v);assert.throws(()=>f.apply(),/verification_failed/);});
+test('operation ID cannot be reused for different correction scope',()=>{const f=fixture();f.apply();f.payload.corrections.pop();assert.throws(()=>f.apply(),/operation_changed/);});
+test('apply requires a preview manifest',()=>{const f=fixture();assert.throws(()=>f.call({apply:true}),/manifest_required/);});
+test('script lock failure writes nothing',()=>{const f=fixture(),n=f.x.writes.length;f.x.ctx.LockService={getScriptLock:()=>({waitLock(){throw Error('busy');}})};assert.throws(()=>f.call(),/busy/);assert.equal(f.x.writes.length,n);});
+test('unchanged candidate cannot create a fake superseding Review',()=>{const f=fixture();f.payload.corrections[0].candidate.suggested_value='キャラメル';assert.throws(()=>f.call(),/no_value_change/);});
+test('applied original cannot be superseded through the unapproved-candidate flow',()=>{const f=fixture();f.x.review[2][f.x.review[0].indexOf('ステータス')]='反映済み';assert.throws(()=>f.call(),/already_applied/);});
+test('different correction fork requires reconciliation rather than another append',()=>{const f=fixture();f.apply();f.payload.operation_id='new-operation';f.payload.correction_reason='different correction';assert.throws(()=>f.call(),/fork_requires_reconciliation/);assert.equal(f.x.review.length,6);});
+test('corrected rows retain all language provenance and remain ordinary human-approval candidates',()=>{const f=fixture(),p=f.call();for(const item of p.items){const info=JSON.parse(item.row['公式情報JSON']);assert.equal(info.card_research.language_evidence[0].acquisition_method,'cdp_existing_dom');assert.equal(item.row['人間判定'],'');assert.equal(item.row['ステータス'],'要確認');const row={...item.row,'人間判定':'既存銘柄を更新'};assert.equal(f.x.ctx.mfImageCollectorPreflightReviewRow_(7,row,{master_snapshot:{values:f.x.master,headers:f.x.headers}}).process,true);}});
+test('POST preview forces zero writes; create and record default to preview; unsupported action denied',()=>{const f=fixture(),before=JSON.stringify([f.x.master,f.x.queue,f.x.review,[...f.x.props]]);for(const action of ['previewCardResearchCorrection','createCardResearchCorrections','recordCardResearchCorrections']){const p={...f.payload,action,...(action==='previewCardResearchCorrection'?{apply:true}:{})};assert.equal(f.x.ctx.mfImageCollectorCardCorrectionApi_(p).status,'correction_preview');}assert.equal(JSON.stringify([f.x.master,f.x.queue,f.x.review,[...f.x.props]]),before);assert.throws(()=>f.x.ctx.mfImageCollectorCardCorrectionApi_({...f.payload,action:'other'}),/action_not_allowed/);});
+test('POST correction requires administrator approval even for preview',()=>{const f=fixture();assert.throws(()=>f.x.ctx.mfImageCollectorCardCorrectionApi_({...f.payload,action:'previewCardResearchCorrection',admin_secret:undefined}),/approval_required/);assert.throws(()=>f.x.ctx.mfImageCollectorCardCorrectionApi_({...f.payload,action:'recordCardResearchCorrections',approved:false}),/approval_required/);});
