@@ -2135,7 +2135,9 @@ function mfImageCollectorApplyReviewDecisionLocked_(rowNumber, decision, key, co
     return { ok: true, status: '反映済み', row_number: row, finished: true, already_applied: true, verified: true };
   }
   if (['要確認','保留','承認','反映済み'].indexOf(review['ステータス']) < 0) throw new Error('Review has been finalized or cannot be applied.');
-  if (p.record && p.record.record_kind === 'completed') throw new Error('Completed receipt conflicts with unfinished Review.');
+  if (p.record && p.record.record_kind === 'completed') {
+    return mfImageCollectorReconcileCompletedApply_(sheet.getParent().getId(), target, decision, key, approved, p.record);
+  }
   mfImageCollectorAssertReviewDecisionAllowed_(review, decision, plan.version_key,
     review['検出種別'] === 'official_description_translation' ? review['承認済み日本語説明'] : approved, { master_snapshot: p.snapshot });
   if (action === '保留' || action === '誤検出') {
@@ -2166,6 +2168,88 @@ function mfImageCollectorApplyReviewDecisionLocked_(rowNumber, decision, key, co
   mfImageCollectorVerifyReviewApplyCompletion_(sheet, selected.row, selected.review, plan, new Date(plan.processed_at));
   mfImageCollectorFinishApply_(sheet, review, plan, options);
   return { ok: true, row_number: selected.row, status: '反映済み', decision: decision, already_applied: already, verified: true };
+}
+
+// Only called for completed/unfinished conflicts, while the caller holds ScriptLock.
+// Do not use SpreadsheetApp's earlier value reads as the reconciliation snapshot.
+function mfImageCollectorReconcileCompletedApply_(spreadsheetId, target, decision, key, approved, receipt) {
+  for (var attempt = 0; attempt < 2; attempt += 1) {
+    if (attempt) Utilities.sleep(150);
+    // Commit this execution's pending work; flush is NOT a read-cache invalidator.
+    SpreadsheetApp.flush();
+    var fresh = mfImageCollectorReadApplyReconciliation_(spreadsheetId, target.detection_id);
+    var p = mfImageCollectorPrepareApply_(fresh.sheet, fresh.selected, decision, key, approved, fresh.snapshot);
+    if (!p.record || p.record.record_kind !== 'completed' || p.record.detection_id !== target.detection_id ||
+        !mfImageCollectorReviewApplyEqual_(receipt, p.record) ||
+        !mfImageCollectorReviewApplyEqual_(target, mfImageCollectorApplyTarget_(p.plan))) {
+      throw new Error('Completed reconciliation identity / receipt changed.');
+    }
+    mfImageCollectorRequireAppliedMaster_(p.plan, fresh.snapshot);
+    var review = fresh.selected.review;
+    if (review['ステータス'] === '反映済み' && review['処理日時']) {
+      if (!mfImageCollectorReviewApplyEqual_(review['処理日時'], new Date(p.record.processed_at))) {
+        throw new Error('Completed reconciliation processing time mismatch.');
+      }
+      return { ok:true, verified:true, finished:true, already_applied:true, status:'反映済み', row_number:fresh.selected.row };
+    }
+    if (['要確認','保留','承認','反映済み'].indexOf(review['ステータス']) < 0) {
+      throw new Error('Completed reconciliation Review has been finalized differently.');
+    }
+  }
+  throw new Error('Completed receipt conflicts with unfinished Review after independent reconciliation.');
+}
+
+function mfImageCollectorReadApplyReconciliation_(spreadsheetId, detectionId) {
+  var ss = SpreadsheetApp.openById(spreadsheetId);
+  var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_REVIEW_SHEET_NAME);
+  var master = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
+  if (!sheet || !master) throw new Error('Reconciliation sheet not found.');
+  var ranges = [sheet, master].map(function(s) {
+    var n = s.getLastColumn(), letters = '';
+    while (n > 0) { n -= 1; letters = String.fromCharCode(65 + n % 26) + letters; n = Math.floor(n / 26); }
+    if (!letters) throw new Error('Reconciliation headers are missing.');
+    return "'" + s.getName().replace(/'/g, "''") + "'!A1:" + letters + s.getMaxRows();
+  });
+  var fields = 'properties(timeZone),sheets(properties(sheetId),data(startRow,startColumn,rowData(values(effectiveValue,effectiveFormat(numberFormat(type))))))';
+  var url = 'https://sheets.googleapis.com/v4/spreadsheets/' + encodeURIComponent(spreadsheetId) +
+    '?includeGridData=true&fields=' + encodeURIComponent(fields) + ranges.map(function(r) { return '&ranges=' + encodeURIComponent(r); }).join('');
+  // A read-only Sheets API request is independent of SpreadsheetApp's value cache.
+  var response = UrlFetchApp.fetch(url, { method:'get', headers:{Authorization:'Bearer ' + ScriptApp.getOAuthToken()}, muteHttpExceptions:true });
+  if (response.getResponseCode() !== 200) throw new Error('Independent reconciliation read failed: HTTP ' + response.getResponseCode());
+  var data = JSON.parse(response.getContentText());
+  if (!data.properties || !data.properties.timeZone || !Array.isArray(data.sheets)) throw new Error('Invalid reconciliation snapshot.');
+  function values(s) {
+    var matches = data.sheets.filter(function(x) { return x.properties && x.properties.sheetId === s.getSheetId(); });
+    if (matches.length !== 1 || !matches[0].data || matches[0].data.length !== 1) throw new Error('Reconciliation sheet snapshot is missing / duplicated.');
+    var grid = matches[0].data[0];
+    if (grid.startRow || grid.startColumn || !grid.rowData || !grid.rowData.length) throw new Error('Invalid reconciliation grid.');
+    return grid.rowData.map(function(row) {
+      // GridData omits trailing blank cells; preserve getValues() header/row width.
+      var cells = row.values || [];
+      return Array.apply(null, Array(s.getLastColumn())).map(function(_, column) {
+        var cell = cells[column] || {};
+        var value = cell.effectiveValue || {}, format = cell.effectiveFormat && cell.effectiveFormat.numberFormat;
+        if (value.errorValue) throw new Error('Reconciliation cell contains an error.');
+        if (Object.prototype.hasOwnProperty.call(value, 'numberValue')) {
+          if (format && ['DATE','DATE_TIME','TIME'].indexOf(format.type) >= 0) {
+            var local = new Date(Math.round((value.numberValue - 25569) * 86400000));
+            return Utilities.parseDate(Utilities.formatDate(local, 'UTC', 'yyyy-MM-dd HH:mm:ss.SSS'), data.properties.timeZone, 'yyyy-MM-dd HH:mm:ss.SSS');
+          }
+          return value.numberValue;
+        }
+        if (Object.prototype.hasOwnProperty.call(value, 'boolValue')) return value.boolValue;
+        return Object.prototype.hasOwnProperty.call(value, 'stringValue') ? value.stringValue : '';
+      });
+    });
+  }
+  var reviewValues = values(sheet), masterValues = values(master);
+  var headers = reviewValues[0].map(function(h) { return String(h).trim(); });
+  var idColumn = headers.indexOf('検出ID'), rows = [];
+  if (idColumn < 0 || idColumn !== headers.lastIndexOf('検出ID')) throw new Error('Reconciliation detection ID header is missing / duplicated.');
+  reviewValues.forEach(function(row, i) { if (i && row[idColumn] === detectionId) rows.push(i); });
+  if (rows.length !== 1) throw new Error('Reconciliation detection ID not found or not unique.');
+  return { sheet:sheet, selected:{row:rows[0] + 1, review:mfImageCollectorReviewObject_(headers, reviewValues[rows[0]])},
+    snapshot:{headers:masterValues[0].map(function(h) { return String(h).trim(); }), values:masterValues} };
 }
 
 function mfImageCollectorReviewApplyValue_(v) {

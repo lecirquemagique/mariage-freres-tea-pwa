@@ -61,6 +61,58 @@ human decision and translation AK to be stored on the Review already.
 
 ## Resume schema and identity
 
+### Concurrent completed/unfinished reconciliation
+
+Only when the locked apply observes a valid completed receipt but its initial Review
+read is not `反映済み` with a processing timestamp, it enters read-only reconciliation.
+The conflict guard is retained: it becomes a bounded independent verification, not
+an unconditional success or a second apply. Normal first apply and normal finished
+replays do not use this reader or sleep.
+
+Each attempt flushes pending work, reopens the Spreadsheet by ID, and reacquires the
+Review and Master sheets. `flush()` is not treated as a cache invalidator. A single
+read-only Sheets API `spreadsheets.get` request retrieves bounded GridData ranges for
+both sheets, bypassing the earlier SpreadsheetApp value reads. The reader locates a
+unique detection ID, reconstructs a new Review and Master snapshot, and the existing
+planner resolves the exact unique VersionKey and Primary/REF again. Dates are decoded
+from effective numeric values/number formats using the spreadsheet timezone, so
+processing time is compared at the same millisecond precision as the saved receipt.
+No previous Review/Master objects or row-number-only identification are used.
+
+The receipt is freshly loaded from Script Properties and must still be the identical
+completed receipt, with matching detection ID, schema/checksum, identity, approved
+content, expected-value and final hashes. Reconstructed target/column/type/decision/
+approved final value must match the pinned descriptor. All Master final values must
+match, and the newly read Review must be reflected with a timestamp equal to the
+receipt's original `processed_at`. Only then return `ok/verified/finished/already_applied`.
+No Master/Review write, timestamp write, new resume, receipt update or cleanup occurs.
+
+At most **two** independent reads are allowed, with one fixed **150ms** sleep, only
+if Review completion is still invisible while all other checks pass. Changed identity,
+corrupt/missing/changed receipt, Master third value, different terminal Review state,
+timestamp mismatch or API/parse failure abort immediately without retry. Persistent
+unfinished state after both reads remains an explicit conflict. Tests demonstrate
+why the second read is useful when the first independent read is also stale; there
+is no claim that waiting alone proves freshness or fixes the original duplicate's cause.
+
+The GET uses the project's existing OAuth/UrlFetch capabilities; no new API action,
+advanced-service dependency, Sheet columns or manifest change is introduced. A future
+deployment must verify Sheets API read access for the execution identity; denied
+access fails closed. This local change does not call the production endpoint.
+
+Concurrency acceptance: identical approved A/B executions converge to `applied` then
+verified `finished`, including an old first locked read; two finished replays both
+perform zero writes. Permanent tests call the real apply entry point with mocked
+Google services and deterministic scheduling, including the Review621 CARAMEL RICHE
+blank → キャラメル scenario. They do not run production apply or simulate network
+cache behavior as an established diagnosis.
+
+Recommended later, separately scoped improvements: immediate UI disable and stable
+detection-ID in-flight guard; structured request/server correlation and lock/read/
+verification event logs without secrets. Neither UI nor logging changes are included.
+
+## Resume record fields
+
 Active records contain:
 
 - `schema_version=2`, `record_kind=active`, `property_key`, `apply_id`, `state`;
