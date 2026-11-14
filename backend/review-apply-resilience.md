@@ -69,15 +69,14 @@ The conflict guard is retained: it becomes a bounded independent verification, n
 an unconditional success or a second apply. Normal first apply and normal finished
 replays do not use this reader or sleep.
 
-Each attempt flushes pending work, reopens the Spreadsheet by ID, and reacquires the
-Review and Master sheets. `flush()` is not treated as a cache invalidator. A single
-read-only Sheets API `spreadsheets.get` request retrieves bounded GridData ranges for
-both sheets, bypassing the earlier SpreadsheetApp value reads. The reader locates a
-unique detection ID, reconstructs a new Review and Master snapshot, and the existing
-planner resolves the exact unique VersionKey and Primary/REF again. Dates are decoded
-from effective numeric values/number formats using the spreadsheet timezone, so
-processing time is compared at the same millisecond precision as the saved receipt.
-No previous Review/Master objects or row-number-only identification are used.
+Each attempt calls `SpreadsheetApp.flush()`, `SpreadsheetApp.openById()` and
+`getSheetByName()` for both Review and Master. Newly acquired `getDataRange()` objects
+read both tables through `getValues()`; no previous Sheet/Range, Review or Master
+snapshot is reused. The reader locates one unique detection ID, reconstructs a new
+Review and Master snapshot, and the existing planner resolves the exact unique
+VersionKey and Primary/REF again. Native Date values retain their millisecond
+precision without serial-date or timezone conversion. `flush()` and repeated opens
+are not claimed to invalidate Apps Script's read cache or guarantee fresh values.
 
 The receipt is freshly loaded from Script Properties and must still be the identical
 completed receipt, with matching detection ID, schema/checksum, identity, approved
@@ -87,18 +86,25 @@ match, and the newly read Review must be reflected with a timestamp equal to the
 receipt's original `processed_at`. Only then return `ok/verified/finished/already_applied`.
 No Master/Review write, timestamp write, new resume, receipt update or cleanup occurs.
 
-At most **two** independent reads are allowed, with one fixed **150ms** sleep, only
+At most **three** independent reads are allowed: immediate, then a **150ms** sleep,
+then a **300ms** sleep (450ms total explicit delay), only
 if Review completion is still invisible while all other checks pass. Changed identity,
 corrupt/missing/changed receipt, Master third value, different terminal Review state,
-timestamp mismatch or API/parse failure abort immediately without retry. Persistent
-unfinished state after both reads remains an explicit conflict. Tests demonstrate
-why the second read is useful when the first independent read is also stale; there
-is no claim that waiting alone proves freshness or fixes the original duplicate's cause.
+timestamp mismatch or SpreadsheetApp read failure abort immediately without retry.
+If the receipt and Master validate on all three attempts but Review completion is
+still invisible, throw `Completed receipt is valid but Review freshness could not be
+confirmed. Retry the same Review.` with code `review_freshness_inconclusive`,
+`retryable=true` and `inconclusive=true`. This is not a corruption diagnosis and
+does not repair data. GAS UI transports may expose only the error message, so its
+wording also identifies the retryable outcome. Tests demonstrate second/third-read
+convergence; waiting alone does not prove freshness or explain duplicate execution.
 
-The GET uses the project's existing OAuth/UrlFetch capabilities; no new API action,
-advanced-service dependency, Sheet columns or manifest change is introduced. A future
-deployment must verify Sheets API read access for the execution identity; denied
-access fails closed. This local change does not call the production endpoint.
+This supersedes the REST reader introduced by `f967b2e`: reconciliation uses only
+SpreadsheetApp for spreadsheet access, and needs no UrlFetchApp, OAuth token,
+`script.external_request`, Google Sheets Cloud API enablement, advanced-service
+dependency, manifest change or Cloud-project change. Other modules' external requests
+are separate from this apply contract. No production endpoint is called by this
+local implementation or its tests.
 
 Concurrency acceptance: identical approved A/B executions converge to `applied` then
 verified `finished`, including an old first locked read; two finished replays both

@@ -2171,10 +2171,10 @@ function mfImageCollectorApplyReviewDecisionLocked_(rowNumber, decision, key, co
 }
 
 // Only called for completed/unfinished conflicts, while the caller holds ScriptLock.
-// Do not use SpreadsheetApp's earlier value reads as the reconciliation snapshot.
+// Reacquire all Sheet/Range objects; repeated reads do not guarantee cache freshness.
 function mfImageCollectorReconcileCompletedApply_(spreadsheetId, target, decision, key, approved, receipt) {
-  for (var attempt = 0; attempt < 2; attempt += 1) {
-    if (attempt) Utilities.sleep(150);
+  for (var attempt = 0; attempt < 3; attempt += 1) {
+    if (attempt) Utilities.sleep(attempt * 150);
     // Commit this execution's pending work; flush is NOT a read-cache invalidator.
     SpreadsheetApp.flush();
     var fresh = mfImageCollectorReadApplyReconciliation_(spreadsheetId, target.detection_id);
@@ -2196,7 +2196,11 @@ function mfImageCollectorReconcileCompletedApply_(spreadsheetId, target, decisio
       throw new Error('Completed reconciliation Review has been finalized differently.');
     }
   }
-  throw new Error('Completed receipt conflicts with unfinished Review after independent reconciliation.');
+  var error = new Error('Completed receipt is valid but Review freshness could not be confirmed. Retry the same Review.');
+  error.code = 'review_freshness_inconclusive';
+  error.retryable = true;
+  error.inconclusive = true;
+  throw error;
 }
 
 function mfImageCollectorReadApplyReconciliation_(spreadsheetId, detectionId) {
@@ -2204,45 +2208,13 @@ function mfImageCollectorReadApplyReconciliation_(spreadsheetId, detectionId) {
   var sheet = ss.getSheetByName(MF_IMAGE_COLLECTOR_REVIEW_SHEET_NAME);
   var master = ss.getSheetByName(MF_IMAGE_COLLECTOR_SHEET_NAME);
   if (!sheet || !master) throw new Error('Reconciliation sheet not found.');
-  var ranges = [sheet, master].map(function(s) {
-    var n = s.getLastColumn(), letters = '';
-    while (n > 0) { n -= 1; letters = String.fromCharCode(65 + n % 26) + letters; n = Math.floor(n / 26); }
-    if (!letters) throw new Error('Reconciliation headers are missing.');
-    return "'" + s.getName().replace(/'/g, "''") + "'!A1:" + letters + s.getMaxRows();
-  });
-  var fields = 'properties(timeZone),sheets(properties(sheetId),data(startRow,startColumn,rowData(values(effectiveValue,effectiveFormat(numberFormat(type))))))';
-  var url = 'https://sheets.googleapis.com/v4/spreadsheets/' + encodeURIComponent(spreadsheetId) +
-    '?includeGridData=true&fields=' + encodeURIComponent(fields) + ranges.map(function(r) { return '&ranges=' + encodeURIComponent(r); }).join('');
-  // A read-only Sheets API request is independent of SpreadsheetApp's value cache.
-  var response = UrlFetchApp.fetch(url, { method:'get', headers:{Authorization:'Bearer ' + ScriptApp.getOAuthToken()}, muteHttpExceptions:true });
-  if (response.getResponseCode() !== 200) throw new Error('Independent reconciliation read failed: HTTP ' + response.getResponseCode());
-  var data = JSON.parse(response.getContentText());
-  if (!data.properties || !data.properties.timeZone || !Array.isArray(data.sheets)) throw new Error('Invalid reconciliation snapshot.');
-  function values(s) {
-    var matches = data.sheets.filter(function(x) { return x.properties && x.properties.sheetId === s.getSheetId(); });
-    if (matches.length !== 1 || !matches[0].data || matches[0].data.length !== 1) throw new Error('Reconciliation sheet snapshot is missing / duplicated.');
-    var grid = matches[0].data[0];
-    if (grid.startRow || grid.startColumn || !grid.rowData || !grid.rowData.length) throw new Error('Invalid reconciliation grid.');
-    return grid.rowData.map(function(row) {
-      // GridData omits trailing blank cells; preserve getValues() header/row width.
-      var cells = row.values || [];
-      return Array.apply(null, Array(s.getLastColumn())).map(function(_, column) {
-        var cell = cells[column] || {};
-        var value = cell.effectiveValue || {}, format = cell.effectiveFormat && cell.effectiveFormat.numberFormat;
-        if (value.errorValue) throw new Error('Reconciliation cell contains an error.');
-        if (Object.prototype.hasOwnProperty.call(value, 'numberValue')) {
-          if (format && ['DATE','DATE_TIME','TIME'].indexOf(format.type) >= 0) {
-            var local = new Date(Math.round((value.numberValue - 25569) * 86400000));
-            return Utilities.parseDate(Utilities.formatDate(local, 'UTC', 'yyyy-MM-dd HH:mm:ss.SSS'), data.properties.timeZone, 'yyyy-MM-dd HH:mm:ss.SSS');
-          }
-          return value.numberValue;
-        }
-        if (Object.prototype.hasOwnProperty.call(value, 'boolValue')) return value.boolValue;
-        return Object.prototype.hasOwnProperty.call(value, 'stringValue') ? value.stringValue : '';
-      });
-    });
+  // These Range objects are acquired only from this attempt's newly opened sheets.
+  // getValues preserves native Date/boolean/number values, with no REST decoding.
+  var reviewValues = sheet.getDataRange().getValues();
+  var masterValues = master.getDataRange().getValues();
+  if (!reviewValues.length || !reviewValues[0].length || !masterValues.length || !masterValues[0].length) {
+    throw new Error('Reconciliation headers are missing.');
   }
-  var reviewValues = values(sheet), masterValues = values(master);
   var headers = reviewValues[0].map(function(h) { return String(h).trim(); });
   var idColumn = headers.indexOf('検出ID'), rows = [];
   if (idColumn < 0 || idColumn !== headers.lastIndexOf('検出ID')) throw new Error('Reconciliation detection ID header is missing / duplicated.');
