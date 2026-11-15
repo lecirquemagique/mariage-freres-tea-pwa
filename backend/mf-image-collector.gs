@@ -2463,6 +2463,12 @@ function mfImageCollectorFinishApply_(sheet, review, plan, options) {
 function mfImageCollectorCheckReviewApplyPlan_(plan, context) {
   if (plan.no_master_change) return { row:0, pending:[] };
   if (!plan.cells.length) throw new Error('Empty apply cells rejected.');
+  plan.cells.forEach(function(cell) {
+    if (cell.column === '茶種タグ') {
+      var value = mfImageCollectorDecodeApplyValue_(cell.expected_value);
+      if (mfImageCollectorAssertTeaTypes_(value) !== String(value || '')) throw new Error('Noncanonical tea tag apply value.');
+    }
+  });
   plan.cells.forEach(function(c) { if (context.headers.indexOf(c.column) < 0 || context.headers.indexOf(c.column) !== context.headers.lastIndexOf(c.column)) throw new Error('Apply column missing / duplicated.'); });
   if (plan.result.sales_sku && mfImageCollectorSalesSkuRegistrations_(context.values, context.headers, plan.result.sales_sku).some(function(r) { return r.primary_reference !== plan.primary_reference; })) throw new Error('Sales SKU is registered to another Primary.');
   var keys = context.values.filter(function(r,i) { return i && r[context.headers.indexOf('VersionKey')] === plan.version_key; });
@@ -3910,12 +3916,9 @@ function mfImageCollectorNormalizeApprovedStructuredFactCandidate_(targetColumn,
     return category.value;
   }
   if (targetColumn === '茶種タグ') {
-    var allowedTeaTypes = ['黒茶', '青茶', '緑茶', '白茶', '黄茶', '後発酵茶', 'プーアル茶', '抹茶', 'ルイボス', 'ティザン', 'マテ', 'インフュージョン'];
-    var teaTypes = mfImageCollectorDelimitedValues_(normalized);
-    if (!teaTypes.length || teaTypes.some(function(teaType) { return allowedTeaTypes.indexOf(teaType) < 0; })) {
-      throw new Error('茶種タグ candidate is not in the canonical taxonomy: ' + String(value || ''));
-    }
-    return teaTypes.join('、');
+    var teaTypes = mfImageCollectorAssertTeaTypes_(value);
+    if (!teaTypes) throw new Error('茶種タグ candidate is empty.');
+    return teaTypes;
   }
   if (targetColumn === '水出し用ブレンド') {
     if (normalized !== 'はい') throw new Error('水出し用ブレンド candidate must be はい.');
@@ -3986,10 +3989,8 @@ function mfImageCollectorBuildApprovedNewTeaRow_(headers, review, referenceInfo,
   var info = mfImageCollectorReviewOfficialInfo_(review);
   var officialCategory = mfImageCollectorNormalizeClassificationValueForMaster_(mfImageCollectorReviewOfficialCategory_(review));
   if (mfImageCollectorIsTfbfReference_(reference)) officialCategory = 'ティザン';
-  var normalizedInfoTeaType = mfImageCollectorNormalizeCurrentCategory_(mfImageCollectorNormalizeTeaTypeTagsForMaster_(info.tea_type_tag));
-  var teaTypeTag = normalizedInfoTeaType.known
-    ? normalizedInfoTeaType.value
-    : mfImageCollectorTeaTypeTagFromCategory_(info.tea_type_tag) || mfImageCollectorTeaTypeTagFromCategory_(officialCategory);
+  var explicitTeaType = String(info.tea_type_tag || '').trim();
+  var teaTypeTag = explicitTeaType ? mfImageCollectorAssertTeaTypes_(explicitTeaType) : mfImageCollectorTeaTypeTagFromCategory_(officialCategory);
   if (mfImageCollectorIsTfbfReference_(reference)) teaTypeTag = 'ティザン';
   var canonicalCategory = mfImageCollectorNormalizeCurrentCategory_(officialCategory);
   if (canonicalCategory.known) officialCategory = canonicalCategory.value;
@@ -4052,6 +4053,8 @@ function mfImageCollectorFindMasterAppendRow_(sheet, headers) {
 }
 
 function mfImageCollectorAppendMasterRow_(sheet, headers, rowValues) {
+  var teaCol = headers.indexOf('茶種タグ');
+  if (teaCol >= 0 && mfImageCollectorAssertTeaTypes_(rowValues[teaCol]) !== String(rowValues[teaCol] || '')) throw new Error('Noncanonical tea tag row value.');
   var versionCol = headers.indexOf('VersionKey');
   if (versionCol < 0) throw new Error('VersionKey column is missing.');
   var appendRow = mfImageCollectorFindMasterAppendRow_(sheet, headers);
@@ -4138,14 +4141,8 @@ function mfImageCollectorReviewOfficialDescriptionForMaster_(review) {
 
 function mfImageCollectorTeaTypeTagFromCategory_(category) {
   var normalized = mfImageCollectorNormalizeClassificationValueForMaster_(category);
-  if (!normalized) return '';
-  var direct = ['黒茶', '青茶', '緑茶', '白茶', '黄茶', '後発酵茶', 'プーアル茶', '抹茶', 'ルイボス', 'ティザン', 'マテ', 'インフュージョン'];
-  for (var i = 0; i < direct.length; i += 1) {
-    if (normalized.indexOf(direct[i]) === 0 || normalized.indexOf(direct[i] + '／') === 0 || normalized.indexOf(direct[i] + ',') === 0) {
-      return direct[i];
-    }
-  }
-  return '';
+  var parsed = mfImageCollectorParseTeaTypes_(normalized);
+  return parsed.unknown.length ? '' : parsed.tags.join('、');
 }
 
 function mfImageCollectorApplySalesSku_(review, targetVersionKey, options) {
@@ -4420,6 +4417,7 @@ function mfImageCollectorSalesSkuEvidence_(review) {
 }
 
 function mfImageCollectorSetCellByHeader_(sheet, headers, row, header, value) {
+  if (header === '茶種タグ') value = mfImageCollectorAssertTeaTypes_(value);
   var col = headers.indexOf(header);
   if (col < 0) throw new Error('Required sales SKU column is missing: ' + header);
   sheet.getRange(row, col + 1).setValue(value);
@@ -4434,7 +4432,9 @@ function mfImageCollectorAppendDelimitedCellByHeader_(sheet, headers, row, heade
   if (!incoming) return;
   var values = existing ? existing.split(/[、,;／|\n]+/).map(function(part) { return String(part).trim(); }).filter(Boolean) : [];
   if (values.indexOf(incoming) < 0) values.push(incoming);
-  range.setValue(values.join('、'));
+  var next = values.join('、');
+  if (header === '茶種タグ') next = mfImageCollectorAssertTeaTypes_(next);
+  range.setValue(next);
 }
 
 function mfImageCollectorFindMasterRowByVersionOrReference_(values, headers, versionKey, reference) {
@@ -5255,6 +5255,7 @@ function mfImageCollectorQueueBlankCellUpdate_(sheet, values, headers, rowIndex,
   var before = String(values[rowIndex][col] || '').trim();
   if (before) return;
   var after = String(value).trim();
+  if (header === '茶種タグ') after = mfImageCollectorAssertTeaTypes_(after);
   changes.push({
     row_number: rowIndex + 1,
     column: header,
@@ -5288,7 +5289,8 @@ function mfImageCollectorNormalizeTeaTypeTags_(payload) {
     if (tagCol >= 0) {
       var tagBefore = String(values[i][tagCol] || '').trim();
       var tagAfter = mfImageCollectorNormalizeTeaTypeTagsForMaster_(tagBefore);
-      if (tagBefore !== tagAfter) {
+      if (!mfImageCollectorParseTeaTypes_(tagBefore).unknown.length && tagBefore !== tagAfter) {
+        tagAfter = mfImageCollectorAssertTeaTypes_(tagAfter);
         changes.push({
           row_number: i + 1,
           reference: reference,
@@ -5528,6 +5530,10 @@ function mfImageCollectorRollbackTaxonomyInternal_(payload) {
       conflicts.push({ change: change, current_value: currentValue, error: 'after value mismatch' });
       continue;
     }
+    if (change.column === '茶種タグ') {
+      try { if (mfImageCollectorAssertTeaTypes_(change.before) !== change.before) throw new Error('Noncanonical tea tag rollback value.'); }
+      catch (error) { conflicts.push({change:change,error:String(error.message)}); continue; }
+    }
     toRollback.push(change);
   }
   if (dryRun) {
@@ -5627,6 +5633,10 @@ function mfImageCollectorValidateTaxonomyApply_(values, headers, summary, change
     }
     if ((change.column === '茶種タグ' || change.column === '現在のカテゴリ') && String(change.after || '').indexOf('紅茶') >= 0) {
       conflicts.push({ change: change, error: '紅茶 remains in classification value' });
+    }
+    if (change.column === '茶種タグ') {
+      try { if (mfImageCollectorAssertTeaTypes_(change.after) !== change.after) throw new Error('Noncanonical tea tag representation.'); }
+      catch (error) { conflicts.push({ change:change, error:String(error.message) }); }
     }
     if (change.column === '香味大分類') {
       var invalid = mfImageCollectorDelimitedValues_(change.after).filter(function(token) {
@@ -6300,27 +6310,38 @@ function mfImageCollectorHasOpenTagSpellingReview_(values, headers, versionKey, 
   return false;
 }
 
-function mfImageCollectorNormalizeTeaTypeTagsForMaster_(value) {
-  var parts = String(value || '').split(/[、,;／|\n]+/);
-  var out = [];
-  for (var i = 0; i < parts.length; i += 1) {
-    var normalized = mfImageCollectorNormalizeTeaTypeTagTokenForMaster_(parts[i]);
-    if (normalized && out.indexOf(normalized) < 0) out.push(normalized);
-  }
-  return out.join('、');
+// Tea tags have their own grammar. Never split the middle dot used by other taxonomies.
+function mfImageCollectorTeaTypeVocabulary() { return ["黒茶","青茶","緑茶","白茶","黄茶","後発酵茶","プーアル茶","抹茶","ルイボス","ティザン","マテ","インフュージョン"]; }
+function mfImageCollectorCanonicalTeaType_(value) {
+  var raw = String(value || '').trim();
+  var key = raw.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ');
+  var aliases = {"紅茶":"黒茶","black tea":"黒茶","thé noir":"黒茶","the noir":"黒茶","smoky tea":"黒茶","smoky teas":"黒茶","oolong":"青茶","烏龍茶":"青茶","ウーロン茶":"青茶","blue tea":"青茶","thé bleu":"青茶","the bleu":"青茶","green tea":"緑茶","thé vert":"緑茶","white tea":"白茶","thé blanc":"白茶","yellow tea":"黄茶","thé jaune":"黄茶","rooibos":"ルイボス","チザン":"ティザン","tisane":"ティザン","fruit tea":"ティザン","fruit teas":"ティザン","フルーツティー":"ティザン","ハーブティー":"ティザン","ハーブ":"ティザン","maté":"マテ","mate":"マテ","infusion":"インフュージョン","herbal tea":"インフュージョン"};
+  if (mfImageCollectorTeaTypeVocabulary().indexOf(raw) >= 0) return raw;
+  return Object.prototype.hasOwnProperty.call(aliases, key) ? aliases[key] : '';
+}
+function mfImageCollectorParseTeaTypes_(value) {
+  var tags = [], unknown = [];
+  String(value || '').split(/[、,;／|\n]+/).forEach(function(part) {
+    var raw = part.trim(); if (!raw) return;
+    var tag = mfImageCollectorCanonicalTeaType_(raw), list = tag ? tags : unknown, item = tag || raw;
+    if (list.indexOf(item) < 0) list.push(item);
+  });
+  return { tags: tags, unknown: unknown };
+}
+function mfImageCollectorAssertTeaTypes_(value) {
+  var parsed = mfImageCollectorParseTeaTypes_(value);
+  if (parsed.unknown.length) throw new Error('茶種タグ is not in the canonical taxonomy: ' + parsed.unknown.join('、'));
+  return parsed.tags.join('、');
 }
 
 function mfImageCollectorNormalizeTeaTypeTagTokenForMaster_(token) {
-  var raw = String(token || '').trim();
-  if (!raw) return '';
-  var normalized = raw.replace(/™/g, '').toLowerCase();
-  if (/^(?:iced tea|th[ée] glac[ée]e?|cold brew|french summer tea)$/.test(normalized)) return '';
-  if (raw === '紅茶') return '黒茶';
-  if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir' || normalized === 'smoky tea' || normalized === 'smoky teas') return '黒茶';
-  if (raw === 'チザン') return 'ティザン';
-  if (normalized === 'tisane' || normalized === 'fruit tea' || normalized === 'fruit teas') return 'ティザン';
-  if (normalized === 'maté' || normalized === 'mate') return 'マテ';
-  return raw;
+  return mfImageCollectorCanonicalTeaType_(token) || String(token || '').trim();
+}
+function mfImageCollectorNormalizeTeaTypeTagsForMaster_(value) {
+  // Preserve unknown input for diagnostics/dry-run; writers must call AssertTeaTypes_.
+  var parts = String(value || '').split(/[、,;／|\n]+/), out = [];
+  parts.forEach(function(part) { var tag = mfImageCollectorNormalizeTeaTypeTagTokenForMaster_(part); if (tag && out.indexOf(tag) < 0) out.push(tag); });
+  return out.join('、');
 }
 
 function mfImageCollectorNormalizeClassificationValueForMaster_(value) {

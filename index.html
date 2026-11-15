@@ -763,17 +763,7 @@ let timeSel='';
 const MAJOR_REGIONS=['ダージリン','アッサム'];
 const TIME_OPTIONS=['朝','昼','午後','夜'];
 
-const TEA_TYPE_ORDER=[
-  '黒茶',
-  '青茶',
-  '緑茶',
-  '白茶',
-  '黄茶',
-  'プーアル茶',
-  'ルイボス',
-  'ティザン',
-  'マテ'
-];
+const TEA_TYPE_ORDER=["黒茶","青茶","緑茶","白茶","黄茶","後発酵茶","プーアル茶","抹茶","ルイボス","ティザン","マテ","インフュージョン"];
 
 const C=window.MF_APP_CONFIG||{};
 
@@ -931,61 +921,34 @@ function fill(id,a){
 }
 
 
-function normalizeTeaType(value){
-  const raw=String(value||'').trim();
-  const v=n(raw);
-
-  if(raw==='紅茶'){
-    return '黒茶';
-  }
-
-  if(
-    v.includes('ティザン') ||
-    v.includes('チザン') ||
-    v.includes('tisane') ||
-    v.includes('fruittea') ||
-    v.includes('フルーツティー') ||
-    v.includes('ハーブティー') ||
-    v==='ハーブ'
-  ){
-    return 'ティザン';
-  }
-
-  if(
-    v.includes('マテ') ||
-    v.includes('mate') ||
-    v.includes('maté')
-  ){
-    return 'マテ';
-  }
-
-  return raw;
+// Tea tags have their own grammar. Never split the middle dot used by other taxonomies.
+function teaTypeVocabulary() { return ["黒茶","青茶","緑茶","白茶","黄茶","後発酵茶","プーアル茶","抹茶","ルイボス","ティザン","マテ","インフュージョン"]; }
+function normalizeTeaType(value) {
+  var raw = String(value || '').trim();
+  var key = raw.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ');
+  var aliases = {"紅茶":"黒茶","black tea":"黒茶","thé noir":"黒茶","the noir":"黒茶","smoky tea":"黒茶","smoky teas":"黒茶","oolong":"青茶","烏龍茶":"青茶","ウーロン茶":"青茶","blue tea":"青茶","thé bleu":"青茶","the bleu":"青茶","green tea":"緑茶","thé vert":"緑茶","white tea":"白茶","thé blanc":"白茶","yellow tea":"黄茶","thé jaune":"黄茶","rooibos":"ルイボス","チザン":"ティザン","tisane":"ティザン","fruit tea":"ティザン","fruit teas":"ティザン","フルーツティー":"ティザン","ハーブティー":"ティザン","ハーブ":"ティザン","maté":"マテ","mate":"マテ","infusion":"インフュージョン","herbal tea":"インフュージョン"};
+  if (teaTypeVocabulary().indexOf(raw) >= 0) return raw;
+  return Object.prototype.hasOwnProperty.call(aliases, key) ? aliases[key] : '';
 }
-
+function parseTeaTypes(value) {
+  var tags = [], unknown = [];
+  String(value || '').split(/[、,;／|\n]+/).forEach(function(part) {
+    var raw = part.trim(); if (!raw) return;
+    var tag = normalizeTeaType(raw), list = tag ? tags : unknown, item = tag || raw;
+    if (list.indexOf(item) < 0) list.push(item);
+  });
+  return { tags: tags, unknown: unknown };
+}
+function canonicalTeaTypes(value) {
+  var parsed = parseTeaTypes(value);
+  if (parsed.unknown.length) throw new Error('茶種タグ is not in the canonical taxonomy: ' + parsed.unknown.join('、'));
+  return parsed.tags.join('、');
+}
 
 function fillTeaTypes(){
   const e=$('tea');
-
-  const values=new Set(
-    R.flatMap(r=>
-      sp(r['茶種タグ'])
-    )
-    .map(normalizeTeaType)
-    .filter(Boolean)
-  );
-
-  TEA_TYPE_ORDER.forEach(x=>{
-    e.add(new Option(x,x));
-    values.delete(x);
-  });
-
-  [...values]
-    .sort((a,b)=>a.localeCompare(b,'ja'))
-    .forEach(x=>
-      e.add(new Option(x,x))
-    );
+  TEA_TYPE_ORDER.forEach(x=>e.add(new Option(x,x)));
 }
-
 
 function hasAll(value,set){
   const vals=sp(value);
@@ -1297,9 +1260,8 @@ function matches(r){
   }
 
   if($('tea').value){
-    const teaTypes=
-      sp(r['茶種タグ'])
-        .map(normalizeTeaType);
+    const parsedTeaTypes=parseTeaTypes(r['茶種タグ']);
+    const teaTypes=parsedTeaTypes.unknown.length ? [] : parsedTeaTypes.tags;
 
     if(
       !teaTypes.includes(

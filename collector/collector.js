@@ -1079,24 +1079,35 @@ function defaultOfficialCategoryForReference(reference) {
   return isTfbfReference(reference) ? 'ティザン' : '';
 }
 
-function normalizeTeaTypeTagTokenForMaster(token) {
-  const raw = normalizeText(token);
-  const normalized = raw.replace(/™/g, '').toLowerCase();
-  if (/^(?:iced tea|th[ée] glac[ée]e?|cold brew|french summer tea)$/.test(normalized)) return '';
-  if (raw === '紅茶') return '黒茶';
-  if (normalized === 'black tea' || normalized === 'thé noir' || normalized === 'the noir') return '黒茶';
-  if (raw === 'チザン') return 'ティザン';
-  if (normalized === 'tisane' || normalized === 'fruit tea' || normalized === 'fruit teas') return 'ティザン';
-  if (normalized === 'maté' || normalized === 'mate') return 'マテ';
-  return raw;
+// Tea tags have their own grammar. Never split the middle dot used by other taxonomies.
+function teaTypeVocabulary() { return ["黒茶","青茶","緑茶","白茶","黄茶","後発酵茶","プーアル茶","抹茶","ルイボス","ティザン","マテ","インフュージョン"]; }
+function canonicalTeaType(value) {
+  var raw = String(value || '').trim();
+  var key = raw.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ');
+  var aliases = {"紅茶":"黒茶","black tea":"黒茶","thé noir":"黒茶","the noir":"黒茶","smoky tea":"黒茶","smoky teas":"黒茶","oolong":"青茶","烏龍茶":"青茶","ウーロン茶":"青茶","blue tea":"青茶","thé bleu":"青茶","the bleu":"青茶","green tea":"緑茶","thé vert":"緑茶","white tea":"白茶","thé blanc":"白茶","yellow tea":"黄茶","thé jaune":"黄茶","rooibos":"ルイボス","チザン":"ティザン","tisane":"ティザン","fruit tea":"ティザン","fruit teas":"ティザン","フルーツティー":"ティザン","ハーブティー":"ティザン","ハーブ":"ティザン","maté":"マテ","mate":"マテ","infusion":"インフュージョン","herbal tea":"インフュージョン"};
+  if (teaTypeVocabulary().indexOf(raw) >= 0) return raw;
+  return Object.prototype.hasOwnProperty.call(aliases, key) ? aliases[key] : '';
+}
+function parseTeaTypes(value) {
+  var tags = [], unknown = [];
+  String(value || '').split(/[、,;／|\n]+/).forEach(function(part) {
+    var raw = part.trim(); if (!raw) return;
+    var tag = canonicalTeaType(raw), list = tag ? tags : unknown, item = tag || raw;
+    if (list.indexOf(item) < 0) list.push(item);
+  });
+  return { tags: tags, unknown: unknown };
+}
+function assertTeaTypesForMaster(value) {
+  var parsed = parseTeaTypes(value);
+  if (parsed.unknown.length) throw new Error('茶種タグ is not in the canonical taxonomy: ' + parsed.unknown.join('、'));
+  return parsed.tags.join('、');
 }
 
+function normalizeTeaTypeTagTokenForMaster(token) {
+  return canonicalTeaType(token) || String(token || '').trim();
+}
 function normalizeTeaTypeTagsForMaster(value) {
-  const tags = String(value || '')
-    .split(/[、,;／|\n]+/)
-    .map((token) => normalizeTeaTypeTagTokenForMaster(token))
-    .filter(Boolean);
-  return [...new Set(tags)].join('、');
+  return [...new Set(String(value || '').split(/[、,;／|\n]+/).map(normalizeTeaTypeTagTokenForMaster).filter(Boolean))].join('、');
 }
 
 const AROMA_CATEGORY_ORDER = [
@@ -1384,6 +1395,11 @@ function partitionStructuredFactSuggestions(product, suggestions = []) {
 function addStructuredSuggestion(suggestions, product, suggestion) {
   if (!suggestion?.column || !suggestion?.suggested_value) return;
   const normalizedSuggestion = { ...suggestion };
+  if (normalizedSuggestion.column === MASTER_COLUMNS.teaTypeTag) {
+    const parsed = parseTeaTypes(normalizedSuggestion.suggested_value);
+    if (!parsed.tags.length || parsed.unknown.length) return;
+    normalizedSuggestion.suggested_value = parsed.tags.join('、');
+  }
   if (normalizedSuggestion.column === MASTER_COLUMNS.flavorCategory) {
     const normalized = normalizeAromaCategoriesForMaster(normalizedSuggestion.suggested_value, '');
     if (!normalized.categories.length || normalized.unknown.length) return;
