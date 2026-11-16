@@ -30,8 +30,7 @@ aliasはNFKC、前後空白除去、小文字化、連続空白正規化後の�
 
 GASの`mfImageCollectorAssertTeaTypes_()`は未知tokenが1つでもあれば例外。
 structured_fact候補の反映、新規銘柄builder、Master新規行追加、apply planの茶種セル、空欄補完、分類移行・rollback、共通セル更新で適用する。
-既存の管理用`master-audit.gs`もtransaction計画時に同じvalidatorで検証し、未知語をProperties保存・REST transaction前に拒否する。
-このファイルと既存テストはPhase 1開始時点で未追跡だったため、今回追加した茶種ガードと実GASを読み込むテスト準備の差分を既存本体から分離して記録する。既存本体全体を今回の変更として扱わない。
+管理用`master-audit.gs`の茶種ガードはローカル差分として分離済みだが、本番への反映済み実装ではない。現在の本番ではこの管理writerは未接続・無効である（下記の適用条件参照）。既存本体全体を今回の変更として扱わない。
 structured_factの空候補は従来どおり拒否。新規行で茶種未取得の空欄は許容する。
 新規銘柄で明示された未知茶種は、既知カテゴリへのfallbackで隠蔽しない。
 カテゴリからの茶種導出も完全一致・明示複数値のみとし、部分一致は使用しない。
@@ -68,8 +67,29 @@ before/after・理由・rule versionのSHA-1は`structured_fact.normalization.fi
 
 ## ソース管理上の境界
 
-管理API本体と既存テストはPhase 1以前から未追跡のため、その本体を今回のcommitへ取り込まない。茶種ガード関連patchは作業前snapshotから分離して保管し、7ファイルの独立commitからは除外する。本番で管理APIまで保護するには、この限定patchも次工程で別途照合・反映が必要。
+管理API本体と既存テストはPhase 1以前から未追跡のため、その本体を今回のcommitへ取り込まない。茶種ガード関連patchは作業前snapshotから分離して保管し、7ファイルの独立commitからは除外する。有効化する際には正本の追跡・茶種ガード・対応テストを別工程で正式化する。
 mainへのpushはPages自動公開を起こすため、公開変更禁止の今回工程は専用ブランチへpushする。mainへの統合と公開は別途承認後に行う。
+
+## 管理writerの本番適用条件（2026-11-16確認）
+
+`master-audit.gs`は本番と同じApps Scriptプロジェクトのv92ソースに存在する。別プロジェクト・ローカル専用ファイルではない。ただし存在と書込み可能な運用経路は区別する。
+
+- 通常`mfImageCollectorDoPost` / `mfImageCollectorDoGet`から`mfMasterAuditApply_`へ接続するrouteはない。通常apply・Collectorもこのwriterへ接続されていない。
+- 公開診断`mfMasterAuditProductionDryRun()`だけが同writerを呼ぶが、常に`dryRun:true`。今回この本番診断関数は実行していない。
+- 実writeには`dryRun:false`と`MF_MASTER_AUDIT_WRITE_ENABLED='true'`の両方が必要。本番プロパティは未設定、pendingもなし。管理writerを呼ぶインストール型トリガーもない（現在の所有者のトリガー一覧は0件）。
+- このrepoにclasp設定は見つからず、ローカル未追跡ファイルが自動同期される根拠はない。本番保存済みソースを正本として照合する。
+
+この無効・未接続状態を維持する限り、管理API patchは今回の有効なMaster書込み入口の必須変更から外す。これは茶種ガードなしで同writerを有効化してよいという承認ではない。プロパティ設定・新route/triggerの接続・直接管理呼出しの有効化時には、先に正本への茶種ガードとテストの正式化を必須とする。
+
+`tests/tea-type-management-boundary.test.js`で通常GET/POSTの拒否と、実本番関数の無効ゲート/既定previewを確認する。テスト専用fixtureはv92のwriter関数だけの抜粋で、未追跡管理API本体を採用・公開するものではない。`MF_MASTER_AUDIT_TEST_SOURCE`でfresh本番ソース自体にも同じテストを実行できる。
+
+## 並行書込みと旧deployment
+
+2026-11-15 20:00〜20:07のキュー230〜241行は、同プロジェクトの旧Web App v69の`mfImageCollectorCreateTargetDiscoveryRequest`実行時刻に対応する。URL-only legacy依頼で、complete_cardではない。人の操作とブラウザー自動操作のどちらが送信したかはログだけでは未特定。
+
+v69はv92とは別deployment IDであり、v92だけを更新しても旧v69は更新されない。観測されたenqueue経路はMaster/Reviewを書かないが、旧v69には認証付きMaster更新POST routeも残っている。旧URL利用を把握せず全入口が新validatorに保護されたとは扱わない。
+
+Windowsの`MF New Tea Discovery`は毎日09:15、旧checkoutの`collector/run-discovery-once.ps1`から`--discover-new-references --write-back`で稼働し、Reviewへ並行保存し得る。本番反映時はこのタスクの一時無効化と稼働済み処理の終了確認、手動Collector/Review applyの停止、旧bookmark/UI送信の抑止が必要。旧v69の利用停止・archiveまたは更新方針も承認後に確定する。今回これらの処理・設定は一切停止/変更しない。
 
 ## 本番反映の次工程
 
