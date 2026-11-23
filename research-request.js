@@ -25,8 +25,22 @@
       invalid_request_type:'調査依頼の種類が不正です。',schema_required:'受付の準備が整っていません。',busy:'受付が混み合っています。再試行してください。'};
     return messages[reason]||messages[status]||messages.error;
   }
+  const deferredMessages={
+    official_url_missing:'公式商品URLが未登録のため、画像取得は保留です。',
+    official_url_invalid:'画像取得に使える公式商品URLがないため、画像取得は保留です。',
+    invalid_existing_image_url:'既存の画像URLを確認する必要があるため、画像取得は保留です。',
+    operation_id_required:'画像取得は保留です。必要な場合はページを再読み込みしてください。'
+  };
+  function imageDeferred(image) {
+    return image?.status==='deferred' && image.writePerformed===false &&
+      Object.prototype.hasOwnProperty.call(deferredMessages,image.reason);
+  }
   function feedback(result) {
     if(result.status==='dry_run')return {kind:'dry_run',message:'受付内容を検証しました。キューには書き込んでいません。'};
+    if(imageDeferred(result.image)){
+      const base=feedback({...result,image:null});
+      return {...base,message:base.message+'。'+deferredMessages[result.image.reason]};
+    }
     if(result.image && result.image.status==='failed') return {kind:'error',message:'情報調査の受付は確認済みです。画像取得は失敗しました。再依頼できます。'};
     if(result.image && result.image.status!=='not_needed' && result.status!=='recently_completed') return {kind:'done',message:result.image.status==='completed'?'画像取得は完了済みです。':'情報調査の受付を確認しました。画像取得依頼も受け付けました。'};
     if(result.status==='recently_completed')return {kind:'recent',label:result.reason==='completion_history_unverifiable'?'完了履歴の確認が必要':'最近調査済み',
@@ -46,11 +60,12 @@
         headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(config.RESEARCH_DRY_RUN===true?{...body,dryRun:true}:body),signal:controller.signal});
       if(!response.ok)throw new Error('受付サーバーとの通信に失敗しました。');
       const result=await response.json();
+      if(!result || typeof result!=='object' || Array.isArray(result)) throw new Error('受付結果を読み取れませんでした。再試行してください。');
       if(!result.ok || !['queued','already_queued','recently_completed','requeued_after_expiry','dry_run'].includes(result.status)){
         throw new Error(errorMessage(result.status,result.reason));
       }
       if(result.versionKey!==row.VersionKey)throw new Error('受付結果のVersionKeyが一致しません。');
-      if(result.status!=='dry_run' && result.image && result.image.status!=='not_needed' && (result.image.verified!==true || !result.image.job_id || result.image.operation_id!==body.operationId))throw new Error('画像受付結果を確認できません。同じ依頼で再試行してください。');
+      if(result.status!=='dry_run' && result.image && result.image.status!=='not_needed' && !imageDeferred(result.image) && (result.image.verified!==true || !result.image.job_id || result.image.operation_id!==body.operationId))throw new Error('画像受付結果を確認できません。同じ依頼で再試行してください。');
       if(result.status!=='dry_run') {const key=operationKey(row);operations.delete(key);try{if(root.sessionStorage)root.sessionStorage.removeItem('mf-image-intake:'+key);}catch(_){}}
       return result;
     }catch(e){if(e.name==='AbortError'||e.name==='TimeoutError'||e instanceof TypeError)throw new Error('通信に失敗しました。接続を確認して再試行してください。');if(e instanceof SyntaxError)throw new Error('受付結果を読み取れませんでした。再試行してください。');throw e;}
