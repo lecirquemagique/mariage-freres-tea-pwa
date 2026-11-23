@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const root = path.join(__dirname, '..');
 const oldTea = { VersionKey: 'T8307-B01', 'Primary Reference': 'T8307',
   '銘柄名（黒い本）': 'JASMIN GUANG XI', '茶種タグ': '緑茶', '産地・国': '中国',
-  '香味大分類': '花', '香味詳細タグ': 'ジャスミン', '公式掲載状態': '未掲載', '現行ステータス': '終売未確定' };
+  '香味大分類': '花', '香味詳細タグ': 'ジャスミン', '公式掲載状態': '公式掲載終了', '現行ステータス': '終売未確定' };
 const newTea = { ...oldTea, VersionKey: 'T8307-C01', '銘柄名（黒い本）': '',
   '現在の公式名': 'BLANC JASMIN', '茶種タグ': '白茶', '公式掲載状態': '掲載中', '現行ステータス': '販売中' };
 (async () => {
@@ -44,7 +44,7 @@ const newTea = { ...oldTea, VersionKey: 'T8307-C01', '銘柄名（黒い本）':
     assert.equal(await page.locator('#displayScope').inputValue(), 'shopping');
     await page.selectOption('#displayScope', 'past');
     assert.equal(await page.locator('.card').count(), 1);
-    assert.match(await page.locator('#list').innerText(), /公式未掲載/);
+    assert.match(await page.locator('#list').innerText(), /公式掲載終了/);
     assert.equal(await page.locator('#end').count(), 0);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
     await page.selectOption('#displayScope', 'all');

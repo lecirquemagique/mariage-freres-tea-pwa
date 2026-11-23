@@ -1,0 +1,36 @@
+{
+  "plan_only": true,
+  "actual_writes": 0,
+  "requires_separate_production_authorization": true,
+  "spreadsheet_id": "1QPMtFh4-FpeHuhA9ymYVJfwiXiNZhXUcNjgf0lrFO-0",
+  "sheet_title": "銘柄マスター",
+  "sheet_id": 1747235422,
+  "preconditions": {
+    "fresh_metadata_and_celldata_required": true,
+    "expected_grid_columns": 90,
+    "expected_grid_rows": 808,
+    "existing_listing_header": "CJ1 = 公式掲載状態",
+    "expected_evidence_header_absent": "公式掲載根拠／出典",
+    "expected_listing_values": ["掲載中", "未掲載", "未確認", ""],
+    "expected_listing_validation": null,
+    "expected_evidence_column": "CM / 91",
+    "stop_on_any_schema_value_formula_or_validation_drift": true,
+    "snapshot_full_master_and_histories_and_queues": true
+  },
+  "forward_requests_template": [
+    {"appendDimension":{"sheetId":1747235422,"dimension":"COLUMNS","length":1}},
+    {"updateCells":{"range":{"sheetId":1747235422,"startRowIndex":0,"endRowIndex":1,"startColumnIndex":90,"endColumnIndex":91},"rows":[{"values":[{"userEnteredValue":{"stringValue":"公式掲載根拠／出典"}}]}],"fields":"userEnteredValue"}},
+    {"setDataValidation":{"range":{"sheetId":1747235422,"startRowIndex":1,"endRowIndex":808,"startColumnIndex":87,"endColumnIndex":88},"rule":{"condition":{"type":"ONE_OF_LIST","values":[{"userEnteredValue":"未確認"},{"userEnteredValue":"掲載中"},{"userEnteredValue":"公式掲載なし"},{"userEnteredValue":"公式掲載終了"},{"userEnteredValue":"未掲載"}]},"strict":true,"showCustomUi":true}}}
+  ],
+  "idempotency": "If CM1 already has the exact header, do not append or rewrite it. Verify existing cells/formulas/validation and re-plan; never clear the evidence column.",
+  "changed_existing_row_values": [],
+  "changed_header_cells": ["銘柄マスター!CM1"],
+  "changed_validation_only": ["銘柄マスター!CJ2:CJ808"],
+  "new_blank_cells": "銘柄マスター!CM2:CM808; created by column append, no row values are written",
+  "preserved": ["A1:CL808 user-entered values and formulas", "VersionKey", "Primary Reference", "茶種", "香味", "images", "販売状態", "T2215/T935 未確認", "existing legacy 未掲載", "変更履歴", "分類変更履歴", "research/image queues", "Script Properties"],
+  "rollback_requests_template": [
+    {"setDataValidation":{"range":{"sheetId":1747235422,"startRowIndex":1,"endRowIndex":808,"startColumnIndex":87,"endColumnIndex":88}}},
+    {"deleteDimension":{"range":{"sheetId":1747235422,"dimension":"COLUMNS","startIndex":90,"endIndex":91}}}
+  ],
+  "rollback_guards": ["restore original per-cell validation snapshot, not this null template if the baseline changed", "CM may be removed only if its header and position match, every row is still blank, and no downstream references or concurrent edits depend on it", "if CM contains new evidence keep the column and roll back code only", "do not rewrite classification or sales values"]
+}

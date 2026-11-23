@@ -2921,7 +2921,10 @@ function mfImageCollectorGetTeaData_() {
       row[headers[j]] = mfImageCollectorClientValue_(values[i][j]);
       if (row[headers[j]]) hasValue = true;
     }
-    if (hasValue) rows.push(row);
+    if (hasValue) {
+      if (typeof row['公式掲載根拠／出典'] === 'undefined') row['公式掲載根拠／出典'] = '';
+      rows.push(row);
+    }
   }
   return { ok: true, rows: rows, updatedAt: new Date().toISOString() };
 }
@@ -6586,7 +6589,9 @@ function mfImageCollectorEnsureHeader_(sheet, headers, headerName) {
 }
 
 function mfImageCollectorApplyStatusValidation_(sheet, columnNumber, headerName) {
-  var values = headerName === '公式商品ページURL状態'
+  var values = headerName === '公式掲載状態'
+    ? mfImageCollectorOfficialListingAllowed_(sheet.getDataRange().getValues(), columnNumber - 1)
+    : headerName === '公式商品ページURL状態'
     ? ['available', 'not_found', 'pending', 'error']
     : ['available', 'not_available', 'pending', 'error'];
   var rule = SpreadsheetApp.newDataValidation()

@@ -9,7 +9,7 @@ const root = path.join(__dirname, '..');
 const oldTea = { VersionKey: 'T8307-B01', 'Primary Reference': 'T8307',
   '銘柄名（黒い本）': 'JASMIN GUANG XI', '茶種タグ': '緑茶', '産地・国': '中国',
   '産地・地域／茶園': '広西', '香味大分類': '花', '香味詳細タグ': 'ジャスミン',
-  '公式掲載状態': '未掲載', '現行ステータス': '終売未確定' };
+  '公式掲載状態': '公式掲載終了', '現行ステータス': '終売未確定' };
 const newTea = { ...oldTea, VersionKey: 'T8307-C01', '銘柄名（黒い本）': '',
   '現在の公式名': 'BLANC JASMIN', '茶種タグ': '白茶', '産地・地域／茶園': '雲南',
   '公式掲載状態': '掲載中', '現行ステータス': '販売中' };
@@ -25,7 +25,7 @@ for (const [name, row, expected] of [
 ]) test(name, () => assert.deepEqual(['shopping', 'all', 'past'].map(scope => sales.matchesScope(row, scope, true)), expected));
 
 test('Version番号で旧版推定せずPrimaryと掲載状態でバッジ表示', () => {
-  assert.deepEqual(sales.badges(oldTea, [oldTea, newTea]), ['公式未掲載', '旧版']);
+  assert.deepEqual(sales.badges(oldTea, [oldTea, newTea]), ['公式掲載終了', '旧版']);
   assert.deepEqual(sales.badges(newTea, [oldTea, newTea]), ['公式掲載中']);
   assert.equal(sales.isOldVersion(oldTea, [oldTea, { ...newTea, 'Primary Reference': 'TFBF8307' }]), false);
 });

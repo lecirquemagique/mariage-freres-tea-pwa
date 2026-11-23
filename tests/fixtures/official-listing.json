@@ -1,0 +1,28 @@
+{
+  "rows": [
+    {"VersionKey":"T2215-B01","Primary Reference":"T2215","公式掲載状態":"未確認","現行ステータス":"販売中"},
+    {"VersionKey":"T935-B01","Primary Reference":"T935","公式掲載状態":"未確認","現行ステータス":"未確認"},
+    {"VersionKey":"T719-B01","Primary Reference":"T719","公式掲載状態":"掲載中","現行ステータス":"販売中"},
+    {"VersionKey":"T1-B01","Primary Reference":"T1","公式掲載状態":"公式掲載なし","現行ステータス":"終売推定"},
+    {"VersionKey":"T2-B01","Primary Reference":"T2","公式掲載状態":"公式掲載終了","現行ステータス":"販売中"},
+    {"VersionKey":"T3-B01","公式掲載状態":"未掲載","現行ステータス":"終売未確定"},
+    {"VersionKey":"T4-B01","公式掲載状態":"掲載未確認","現行ステータス":"販売中"}
+  ],
+  "negativeObservation": {
+    "version_key":"T2-B01","identity_verified":true,"identity_evidence":"VersionKey・名称・REF・商品説明・販売形態を照合",
+    "checked_at":"2026-11-23","listing":"公式掲載終了","evidence":"全対象市場と旧URL・移転先・別REFを調査したfixture",
+    "source_url":"https://www.mariagefreres.com/fr/fixture-t2.html",
+    "scope_complete":true,"current_listing_found":false,"catalog_checked":true,"product_page_checked":true,
+    "redirects_checked":true,"alternate_references_checked":true,"markets":["JP","FR","EN"],
+    "checks":[
+      {"market":"JP","query":"fixture T2","url":"https://www.mariagefreres.co.jp/","result":"no_matching_product","accessible":true},
+      {"market":"FR","query":"fixture T2","url":"https://www.mariagefreres.com/fr/fixture-t2.html","result":"not_found","accessible":true},
+      {"market":"EN","query":"fixture T2","url":"https://www.mariagefreres.com/en/fixture-t2.html","result":"not_found","accessible":true}
+    ],
+    "matching_history_found":true,"history_identity_verified":true,
+    "previous_url":"https://www.mariagefreres.com/fr/fixture-t2.html",
+    "history_source_url":"https://www.mariagefreres.com/fr/fixture-catalogue.pdf",
+    "history_date":"2023-01-01","history_evidence":"同一Versionの公式旧掲載記録fixture",
+    "old_url_checked":true,"relocation_checked":true
+  }
+}

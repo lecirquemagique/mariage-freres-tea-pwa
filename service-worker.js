@@ -1,4 +1,4 @@
-const CACHE = 'mf-tea-pwa-v1-5-complete-card';
+const CACHE = 'mf-tea-pwa-v1-6-official-listing';
 const CORE = [
   './',
   './index.html',
